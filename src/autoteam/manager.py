@@ -1205,6 +1205,10 @@ def main():
 
     sub.add_parser("sync", help="手动同步认证文件到 CPA")
 
+    api_p = sub.add_parser("api", help="启动 HTTP API 服务器")
+    api_p.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
+    api_p.add_argument("--port", type=int, default=8787, help="监听端口（默认 8787）")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1225,6 +1229,9 @@ def main():
         cmd_cleanup(args.max_seats)
     elif args.command == "sync":
         sync_to_cpa()
+    elif args.command == "api":
+        from autoteam.api import start_server
+        start_server(host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
