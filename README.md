@@ -12,6 +12,8 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-API_&_Web-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Vue](https://img.shields.io/badge/Vue_3-Frontend-4FC08D?style=for-the-badge&logo=vue.js&logoColor=white)](https://vuejs.org)
 
+[![GitHub stars](https://img.shields.io/github/stars/cnitlrt/AutoTeam?style=social)](https://github.com/cnitlrt/AutoTeam)
+
 </div>
 
 ---
