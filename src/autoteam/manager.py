@@ -938,9 +938,13 @@ def cmd_rotate(target_seats=5):
             logger.info("[3/5] 无需移出账号")
 
         # 检查空缺
+        removed_count = len([a for a in all_exhausted if find_account(load_accounts(), a["email"])
+                             and find_account(load_accounts(), a["email"])["status"] == STATUS_STANDBY])
         if not chatgpt or not chatgpt.browser:
             ensure_chatgpt()
-        current_count = get_team_member_count(chatgpt)
+        api_count = get_team_member_count(chatgpt)
+        # API 有缓存延迟，移出后可能返回旧数据，手动修正
+        current_count = max(0, api_count - removed_count) if api_count >= 0 else 0
         vacancies = TARGET - current_count
 
         if vacancies <= 0:
