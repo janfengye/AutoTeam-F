@@ -810,11 +810,14 @@ def cmd_rotate(target_seats=5):
         return mail_client
 
     try:
-        # === Step 2: 移出额度用完的账号 ===
-        if exhausted:
-            print(f"\n=== Step 2: 移出 {len(exhausted)} 个额度用完的账号 ===")
-            api = ensure_chatgpt()
-            for acc in exhausted:
+        # === Step 2: 移出所有额度用完的账号（包括之前已标记为 exhausted 的）===
+        all_accounts = load_accounts()
+        all_exhausted = [a for a in all_accounts if a["status"] == STATUS_EXHAUSTED]
+
+        if all_exhausted:
+            print(f"\n=== Step 2: 移出 {len(all_exhausted)} 个额度用完的账号 ===")
+            ensure_chatgpt()
+            for acc in all_exhausted:
                 email = acc["email"]
                 if not chatgpt.browser:
                     chatgpt.start()
@@ -865,8 +868,8 @@ def cmd_rotate(target_seats=5):
         # === Step 5: 判断是否需要创建新账号 ===
         # 检查当前 active 账号中是否还有额度可用的
         active_accounts = get_active_accounts()
-        active_with_quota = [a for a in active_accounts if a["email"] not in
-                            {e["email"] for e in exhausted}]
+        exhausted_emails = {a["email"] for a in load_accounts() if a["status"] == STATUS_EXHAUSTED}
+        active_with_quota = [a for a in active_accounts if a["email"] not in exhausted_emails]
 
         not_recovered = [a for a in standby_list if not a.get("_quota_recovered")]
 

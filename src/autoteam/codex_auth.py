@@ -526,24 +526,40 @@ def save_auth_file(bundle):
     return str(filepath)
 
 
-def check_codex_quota(access_token):
+def check_codex_quota(access_token, account_id=None):
     """
     检查 Codex 额度是否用完。
+    参考 CPA (CLIProxyAPI) 的实现，需要正确设置请求头才能检查 Team 额度。
     返回 ("ok", None) | ("exhausted", resets_at) | ("auth_error", None)
     """
     import requests
 
+    if not account_id:
+        from autoteam.config import CHATGPT_ACCOUNT_ID
+        account_id = CHATGPT_ACCOUNT_ID
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)",
+        "Originator": "codex-tui",
+        "Connection": "Keep-Alive",
+    }
+    if account_id:
+        headers["Chatgpt-Account-Id"] = account_id
+
     try:
+        # 最小化请求：额度用完时 429 在模型执行前返回，不消耗额度
         resp = requests.post(
             "https://chatgpt.com/backend-api/codex/responses",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             json={
-                "model": "codex-mini",
-                "instructions": "test",
-                "stream": False,
+                "model": "gpt-5",
+                "instructions": "",
+                "stream": True,
+                "store": False,
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "."}]}],
             },
             timeout=30,
         )
@@ -552,27 +568,38 @@ def check_codex_quota(access_token):
         return "auth_error", None
 
     if resp.status_code == 429:
-        try:
-            err = resp.json().get("error", {})
-            if err.get("type") == "usage_limit_reached":
-                resets_at = err.get("resets_at", 0)
-                resets_in = err.get("resets_in_seconds", 0)
-                if resets_at and resets_at > time.time():
-                    recover_time = resets_at
-                elif resets_in:
-                    recover_time = time.time() + resets_in
-                else:
-                    recover_time = time.time() + 18000
-                return "exhausted", recover_time
-        except Exception:
-            pass
-        return "exhausted", time.time() + 18000
+        return _parse_quota_error(resp)
 
     if resp.status_code in (401, 403):
         return "auth_error", None
 
+    # "model is at capacity" 也视为临时不可用（参考 CPA isCodexModelCapacityError）
+    if resp.status_code >= 400:
+        body_text = resp.text[:500].lower()
+        if "at capacity" in body_text:
+            return "exhausted", time.time() + 300  # 5 分钟后重试
+
     # 200 或其他非错误状态码（如 400 参数错误）都说明 token 有效、额度可用
     return "ok", None
+
+
+def _parse_quota_error(resp):
+    """解析 429 响应中的额度限制信息（参考 CPA parseCodexRetryAfter）"""
+    try:
+        err = resp.json().get("error", {})
+        if err.get("type") == "usage_limit_reached":
+            resets_at = err.get("resets_at", 0)
+            resets_in = err.get("resets_in_seconds", 0)
+            # 优先使用 resets_at（绝对时间），CPA 也是这个优先级
+            if resets_at and resets_at > time.time():
+                return "exhausted", resets_at
+            # fallback 到 resets_in_seconds（相对时间）
+            if resets_in:
+                return "exhausted", time.time() + resets_in
+            return "exhausted", time.time() + 18000
+    except Exception:
+        pass
+    return "exhausted", time.time() + 18000
 
 
 def refresh_access_token(refresh_token):
