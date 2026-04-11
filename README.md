@@ -49,15 +49,22 @@ uv run playwright install chromium
 cp .env.example .env   # 复制配置模板，填入实际值
 ```
 
+**`.env` 配置项：**
+
 | 配置项 | 说明 |
 |--------|------|
 | **CloudMail** | 临时邮箱服务地址和凭据 |
 | **ChatGPT** | Team Account ID（从 ChatGPT admin 页面获取），Workspace 名称可自动检测 |
 | **CPA** | CLIProxyAPI 地址和管理密钥 |
-| **session** | ChatGPT 管理员的 `__Secure-next-auth.session-token`（拼接 `.0` 和 `.1`）写入 `session` 文件 |
 | **AUTO_CHECK_THRESHOLD** | 额度低于此百分比触发轮转，默认 `10`（可在 Web 面板修改） |
 | **AUTO_CHECK_INTERVAL** | 巡检间隔（秒），默认 `300`（5 分钟） |
 | **AUTO_CHECK_MIN_LOW** | 至少几个账号低于阈值才触发轮转，默认 `2` |
+
+**文件配置：**
+
+| 文件 | 说明 |
+|------|------|
+| `session` | ChatGPT 管理员的 `__Secure-next-auth.session-token`（拼接 `.0` 和 `.1`） |
 
 ### 使用
 
