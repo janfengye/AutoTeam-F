@@ -268,22 +268,40 @@ def get_task(task_id: str):
 # ---------------------------------------------------------------------------
 
 from autoteam.config import (
-    AUTO_CHECK_INTERVAL, AUTO_CHECK_THRESHOLD, AUTO_CHECK_MIN_LOW,
+    AUTO_CHECK_INTERVAL as _DEFAULT_INTERVAL,
+    AUTO_CHECK_THRESHOLD as _DEFAULT_THRESHOLD,
+    AUTO_CHECK_MIN_LOW as _DEFAULT_MIN_LOW,
 )
 
+# 运行时可修改的巡检配置
+_auto_check_config = {
+    "interval": _DEFAULT_INTERVAL,
+    "threshold": _DEFAULT_THRESHOLD,
+    "min_low": _DEFAULT_MIN_LOW,
+}
 _auto_check_stop = threading.Event()
+_auto_check_restart = threading.Event()  # 配置变更时通知线程重启
 
 
 def _auto_check_loop():
-    """后台巡检线程：每 5 分钟检查额度，多个账号低于阈值时自动轮转"""
+    """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
     from autoteam.accounts import load_accounts, STATUS_ACTIVE
     from autoteam.codex_auth import check_codex_quota
 
-    logger.info("[巡检] 自动巡检已启动，每 %d 分钟检查一次，阈值: %d%% / %d 个账号",
-                AUTO_CHECK_INTERVAL // 60, AUTO_CHECK_THRESHOLD, AUTO_CHECK_MIN_LOW)
+    while not _auto_check_stop.is_set():
+        cfg = _auto_check_config
+        logger.info("[巡检] 等待 %d 分钟后执行下一轮检查（阈值: %d%%, 触发: >=%d 个）",
+                    cfg["interval"] // 60, cfg["threshold"], cfg["min_low"])
 
-    while not _auto_check_stop.wait(AUTO_CHECK_INTERVAL):
+        # 等待 interval 秒，期间可被 restart 或 stop 唤醒
+        _auto_check_restart.clear()
+        if _auto_check_stop.wait(cfg["interval"]):
+            break
+        if _auto_check_restart.is_set():
+            continue  # 配置变更，跳到下一轮重新读取配置
+
         try:
+            cfg = _auto_check_config  # 重新读取
             accounts = load_accounts()
             active = [a for a in accounts if a["status"] == STATUS_ACTIVE
                       and a.get("auth_file") and Path(a["auth_file"]).exists()]
@@ -301,7 +319,7 @@ def _auto_check_loop():
                     status, info = check_codex_quota(access_token)
                     if status == "ok" and isinstance(info, dict):
                         remaining = 100 - info.get("primary_pct", 0)
-                        if remaining < AUTO_CHECK_THRESHOLD:
+                        if remaining < cfg["threshold"]:
                             low_accounts.append((acc["email"], remaining))
                     elif status == "exhausted":
                         low_accounts.append((acc["email"], 0))
@@ -313,7 +331,7 @@ def _auto_check_loop():
                             len(low_accounts),
                             ", ".join(f"{e}({r}%)" for e, r in low_accounts))
 
-            if len(low_accounts) >= AUTO_CHECK_MIN_LOW:
+            if len(low_accounts) >= cfg["min_low"]:
                 # 检查是否有任务在跑
                 if not _playwright_lock.acquire(blocking=False):
                     logger.info("[巡检] 有任务正在执行，跳过本轮自动轮转")
@@ -337,6 +355,30 @@ def _auto_check_loop():
 
         except Exception as e:
             logger.error("[巡检] 巡检异常: %s", e)
+
+
+class AutoCheckConfig(BaseModel):
+    interval: int = 300        # 巡检间隔（秒）
+    threshold: int = 10        # 额度阈值（%）
+    min_low: int = 2           # 触发轮转的最少账号数
+
+
+@app.get("/api/config/auto-check")
+def get_auto_check_config():
+    """获取巡检配置"""
+    return _auto_check_config.copy()
+
+
+@app.put("/api/config/auto-check")
+def set_auto_check_config(cfg: AutoCheckConfig):
+    """修改巡检配置（运行时生效）"""
+    _auto_check_config["interval"] = max(60, cfg.interval)  # 最少 1 分钟
+    _auto_check_config["threshold"] = max(1, min(100, cfg.threshold))
+    _auto_check_config["min_low"] = max(1, cfg.min_low)
+    _auto_check_restart.set()  # 唤醒巡检线程，立即应用新配置
+    logger.info("[巡检] 配置已更新: 间隔=%ds 阈值=%d%% 触发=%d个",
+                _auto_check_config["interval"], _auto_check_config["threshold"], _auto_check_config["min_low"])
+    return _auto_check_config.copy()
 
 
 @app.on_event("startup")

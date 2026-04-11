@@ -32,4 +32,7 @@ export const api = {
 
   getTasks: () => request('GET', '/tasks'),
   getTask: (id) => request('GET', `/tasks/${id}`),
+
+  getAutoCheckConfig: () => request('GET', '/config/auto-check'),
+  setAutoCheckConfig: (cfg) => request('PUT', '/config/auto-check', cfg),
 }

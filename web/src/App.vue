@@ -26,6 +26,9 @@
 
     <!-- Task History -->
     <TaskHistory :tasks="tasks" />
+
+    <!-- Settings -->
+    <Settings />
   </div>
 </template>
 
@@ -35,6 +38,7 @@ import { api } from './api.js'
 import Dashboard from './components/Dashboard.vue'
 import TaskPanel from './components/TaskPanel.vue'
 import TaskHistory from './components/TaskHistory.vue'
+import Settings from './components/Settings.vue'
 
 const status = ref(null)
 const tasks = ref([])
