@@ -28,7 +28,43 @@ app = FastAPI(
 _tasks: dict[str, dict] = {}
 _playwright_lock = threading.Lock()
 _current_task_id: Optional[str] = None
+_admin_login_api = None
+_admin_login_step: Optional[str] = None
+_main_codex_flow = None
+_main_codex_step: Optional[str] = None
 MAX_TASK_HISTORY = 50
+
+
+def _current_busy_detail(default_message: str):
+    if _admin_login_api:
+        return {
+            "message": default_message,
+            "running_task": {
+                "task_id": "admin-login",
+                "command": "admin-login",
+                "started_at": None,
+            },
+        }
+
+    if _main_codex_flow:
+        return {
+            "message": default_message,
+            "running_task": {
+                "task_id": "main-codex-sync",
+                "command": "main-codex-sync",
+                "started_at": None,
+            },
+        }
+
+    running = _tasks.get(_current_task_id, {})
+    return {
+        "message": default_message,
+        "running_task": {
+            "task_id": _current_task_id,
+            "command": running.get("command", "unknown"),
+            "started_at": running.get("started_at"),
+        },
+    }
 
 
 def _prune_tasks():
@@ -68,18 +104,7 @@ def _run_task(task_id: str, func, *args, **kwargs):
 def _start_task(command: str, func, params: dict, *args, **kwargs) -> dict:
     """创建并启动后台任务，返回任务信息"""
     if not _playwright_lock.acquire(blocking=False):
-        running = _tasks.get(_current_task_id, {})
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "有任务正在执行，请等待完成后再试",
-                "running_task": {
-                    "task_id": _current_task_id,
-                    "command": running.get("command", "unknown"),
-                    "started_at": running.get("started_at"),
-                },
-            },
-        )
+        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再试"))
     _playwright_lock.release()
 
     task_id = uuid.uuid4().hex[:12]
@@ -115,14 +140,365 @@ class CleanupParams(BaseModel):
     max_seats: Optional[int] = None
 
 
+class AdminEmailParams(BaseModel):
+    email: str
+
+
+class AdminPasswordParams(BaseModel):
+    password: str
+
+
+class AdminCodeParams(BaseModel):
+    code: str
+
+
+class AdminWorkspaceParams(BaseModel):
+    option_id: str
+
+
 def _sanitize_account(acc: dict) -> dict:
     """脱敏账号信息（去掉 password 等敏感字段）"""
     return {k: v for k, v in acc.items() if k not in ("password", "cloudmail_account_id")}
 
 
+def _admin_status():
+    from autoteam.admin_state import get_admin_state_summary
+
+    status = get_admin_state_summary()
+    status["login_step"] = _admin_login_step
+    status["login_in_progress"] = _admin_login_api is not None
+    if _admin_login_api and _admin_login_step == "workspace_required":
+        status["workspace_options"] = getattr(_admin_login_api, "workspace_options_cache", []) or []
+    else:
+        status["workspace_options"] = []
+    return status
+
+
+def _main_codex_status():
+    return {
+        "in_progress": _main_codex_flow is not None,
+        "step": _main_codex_step,
+    }
+
+
+def _finish_admin_login(completed: dict):
+    global _admin_login_api, _admin_login_step
+    api = _admin_login_api
+    try:
+        info = api.complete_admin_login()
+    finally:
+        if api:
+            api.stop()
+        _admin_login_api = None
+        _admin_login_step = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+    return {"status": "completed", "admin": _admin_status(), "info": info}
+
+
+def _set_pending_admin_login(api, step):
+    global _admin_login_api, _admin_login_step
+    _admin_login_api = api
+    _admin_login_step = step
+    return {"status": step, "admin": _admin_status()}
+
+
+def _finish_main_codex_sync():
+    global _main_codex_flow, _main_codex_step
+    flow = _main_codex_flow
+    try:
+        info = flow.complete()
+    finally:
+        if flow:
+            flow.stop()
+        _main_codex_flow = None
+        _main_codex_step = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+    return {
+        "status": "completed",
+        "message": "主号 Codex 已同步到 CPA",
+        "codex": _main_codex_status(),
+        "info": info,
+    }
+
+
+def _set_pending_main_codex_sync(flow, step):
+    global _main_codex_flow, _main_codex_step
+    _main_codex_flow = flow
+    _main_codex_step = step
+    return {"status": step, "codex": _main_codex_status()}
+
+
 # ---------------------------------------------------------------------------
 # 同步端点
 # ---------------------------------------------------------------------------
+
+
+@app.get("/api/admin/status")
+def get_admin_status():
+    """获取管理员登录状态。"""
+    return _admin_status()
+
+
+@app.get("/api/main-codex/status")
+def get_main_codex_status():
+    """获取主号 Codex 同步状态。"""
+    return _main_codex_status()
+
+
+@app.post("/api/admin/login/start")
+def post_admin_login_start(params: AdminEmailParams):
+    """开始管理员登录流程。"""
+    global _admin_login_api, _admin_login_step
+
+    if _admin_login_api:
+        _admin_login_api.stop()
+        _admin_login_api = None
+        _admin_login_step = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再进行管理员登录"))
+
+    try:
+        from autoteam.chatgpt_api import ChatGPTTeamAPI
+
+        logger.info("[API] 开始管理员登录: %s", params.email.strip())
+        api = ChatGPTTeamAPI()
+        result = api.begin_admin_login(params.email.strip())
+        step = result["step"]
+        logger.info("[API] 管理员登录 start 返回: step=%s detail=%s", step, result.get("detail"))
+        if step == "completed":
+            _admin_login_api = api
+            return _finish_admin_login(result)
+        if step in ("password_required", "code_required", "workspace_required"):
+            return _set_pending_admin_login(api, step)
+        api.stop()
+        _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=result.get("detail") or "无法识别管理员登录步骤")
+    except Exception as exc:
+        logger.exception("[API] 管理员登录 start 失败")
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/admin/login/password")
+def post_admin_login_password(params: AdminPasswordParams):
+    """提交管理员密码。"""
+    global _admin_login_api, _admin_login_step
+    if not _admin_login_api or _admin_login_step != "password_required":
+        raise HTTPException(status_code=409, detail="当前没有等待密码的管理员登录流程")
+
+    try:
+        logger.info("[API] 提交管理员密码 | current_step=%s", _admin_login_step)
+        result = _admin_login_api.submit_admin_password(params.password)
+        step = result["step"]
+        logger.info("[API] 管理员密码提交返回: step=%s detail=%s", step, result.get("detail"))
+        if step == "completed":
+            return _finish_admin_login(result)
+        if step in ("password_required", "code_required", "workspace_required"):
+            _admin_login_step = step
+            return {"status": step, "admin": _admin_status()}
+        raise HTTPException(status_code=400, detail=result.get("detail") or "管理员密码登录失败")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[API] 管理员密码提交失败")
+        _admin_login_api.stop()
+        _admin_login_api = None
+        _admin_login_step = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/admin/login/code")
+def post_admin_login_code(params: AdminCodeParams):
+    """提交管理员验证码。"""
+    global _admin_login_api, _admin_login_step
+    if not _admin_login_api or _admin_login_step != "code_required":
+        raise HTTPException(status_code=409, detail="当前没有等待验证码的管理员登录流程")
+
+    try:
+        logger.info("[API] 提交管理员验证码 | current_step=%s code_len=%d", _admin_login_step, len(params.code.strip()))
+        result = _admin_login_api.submit_admin_code(params.code.strip())
+        step = result["step"]
+        logger.info("[API] 管理员验证码提交返回: step=%s detail=%s", step, result.get("detail"))
+        if step == "completed":
+            return _finish_admin_login(result)
+        if step in ("password_required", "code_required", "workspace_required"):
+            _admin_login_step = step
+            return {"status": step, "admin": _admin_status()}
+        raise HTTPException(status_code=400, detail=result.get("detail") or "管理员验证码登录失败")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[API] 管理员验证码提交失败")
+        _admin_login_api.stop()
+        _admin_login_api = None
+        _admin_login_step = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/admin/login/workspace")
+def post_admin_login_workspace(params: AdminWorkspaceParams):
+    """提交管理员 workspace 选择。"""
+    global _admin_login_api, _admin_login_step
+    if not _admin_login_api or _admin_login_step != "workspace_required":
+        raise HTTPException(status_code=409, detail="当前没有等待组织选择的管理员登录流程")
+
+    try:
+        logger.info("[API] 提交管理员 workspace 选择 | option_id=%s", params.option_id)
+        result = _admin_login_api.select_workspace_option(params.option_id)
+        step = result["step"]
+        logger.info("[API] 管理员 workspace 选择返回: step=%s detail=%s", step, result.get("detail"))
+        if step == "completed":
+            return _finish_admin_login(result)
+        if step in ("password_required", "code_required", "workspace_required"):
+            _admin_login_step = step
+            return {"status": step, "admin": _admin_status()}
+        raise HTTPException(status_code=400, detail=result.get("detail") or "管理员组织选择失败")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[API] 管理员 workspace 选择失败")
+        _admin_login_api.stop()
+        _admin_login_api = None
+        _admin_login_step = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/admin/login/cancel")
+def post_admin_login_cancel():
+    """取消管理员登录流程。"""
+    global _admin_login_api, _admin_login_step
+    if _admin_login_api:
+        _admin_login_api.stop()
+        _admin_login_api = None
+        _admin_login_step = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+    return {"message": "管理员登录已取消", "admin": _admin_status()}
+
+
+@app.post("/api/admin/logout")
+def post_admin_logout():
+    """清除已保存的管理员登录态。"""
+    from autoteam.admin_state import clear_admin_state
+
+    if _admin_login_api:
+        post_admin_login_cancel()
+    clear_admin_state()
+    return {"message": "管理员登录态已清除", "admin": _admin_status()}
+
+
+@app.post("/api/main-codex/start")
+def post_main_codex_start():
+    """开始主号 Codex 登录并同步到 CPA。"""
+    global _main_codex_flow, _main_codex_step
+
+    if _main_codex_flow:
+        _main_codex_flow.stop()
+        _main_codex_flow = None
+        _main_codex_step = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再同步主号 Codex"))
+
+    try:
+        from autoteam.codex_auth import MainCodexSyncFlow
+
+        flow = MainCodexSyncFlow()
+        result = flow.start()
+        step = result["step"]
+        if step == "completed":
+            _main_codex_flow = flow
+            return _finish_main_codex_sync()
+        if step in ("password_required", "code_required"):
+            return _set_pending_main_codex_sync(flow, step)
+        flow.stop()
+        _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=result.get("detail") or "无法识别主号 Codex 登录步骤")
+    except Exception as exc:
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/main-codex/password")
+def post_main_codex_password(params: AdminPasswordParams):
+    """提交主号 Codex 登录密码。"""
+    global _main_codex_flow, _main_codex_step
+    if not _main_codex_flow or _main_codex_step != "password_required":
+        raise HTTPException(status_code=409, detail="当前没有等待密码的主号 Codex 登录流程")
+
+    try:
+        result = _main_codex_flow.submit_password(params.password)
+        step = result["step"]
+        if step == "completed":
+            return _finish_main_codex_sync()
+        if step in ("password_required", "code_required"):
+            _main_codex_step = step
+            return {"status": step, "codex": _main_codex_status()}
+        raise HTTPException(status_code=400, detail=result.get("detail") or "主号 Codex 密码登录失败")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _main_codex_flow.stop()
+        _main_codex_flow = None
+        _main_codex_step = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/main-codex/code")
+def post_main_codex_code(params: AdminCodeParams):
+    """提交主号 Codex 登录验证码。"""
+    global _main_codex_flow, _main_codex_step
+    if not _main_codex_flow or _main_codex_step != "code_required":
+        raise HTTPException(status_code=409, detail="当前没有等待验证码的主号 Codex 登录流程")
+
+    try:
+        result = _main_codex_flow.submit_code(params.code.strip())
+        step = result["step"]
+        if step == "completed":
+            return _finish_main_codex_sync()
+        if step in ("password_required", "code_required"):
+            _main_codex_step = step
+            return {"status": step, "codex": _main_codex_status()}
+        raise HTTPException(status_code=400, detail=result.get("detail") or "主号 Codex 验证码登录失败")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _main_codex_flow.stop()
+        _main_codex_flow = None
+        _main_codex_step = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/main-codex/cancel")
+def post_main_codex_cancel():
+    """取消主号 Codex 登录流程。"""
+    global _main_codex_flow, _main_codex_step
+    if _main_codex_flow:
+        _main_codex_flow.stop()
+        _main_codex_flow = None
+        _main_codex_step = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+    return {"message": "主号 Codex 登录已取消", "codex": _main_codex_status()}
 
 @app.get("/api/accounts")
 def get_accounts():
@@ -145,6 +521,41 @@ def get_standby():
     from autoteam.accounts import get_standby_accounts
     accounts = get_standby_accounts()
     return [_sanitize_account(a) for a in accounts]
+
+
+@app.delete("/api/accounts/{email}")
+def delete_account(email: str):
+    """删除本地管理账号及其关联资源。"""
+    if not _playwright_lock.acquire(blocking=False):
+        running = _tasks.get(_current_task_id, {})
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "有任务正在执行，请等待完成后再删除账号",
+                "running_task": {
+                    "task_id": _current_task_id,
+                    "command": running.get("command", "unknown"),
+                    "started_at": running.get("started_at"),
+                },
+            },
+        )
+
+    try:
+        from autoteam.accounts import load_accounts
+        from autoteam.account_ops import delete_managed_account
+
+        accounts = load_accounts()
+        if not any(a["email"].lower() == email.lower() for a in accounts):
+            raise HTTPException(status_code=404, detail="账号不存在")
+
+        cleanup = delete_managed_account(email)
+        return {
+            "message": "账号删除完成",
+            "deleted_email": email,
+            "cleanup": cleanup,
+        }
+    finally:
+        _playwright_lock.release()
 
 
 @app.get("/api/status")
@@ -189,6 +600,12 @@ def post_sync():
     from autoteam.cpa_sync import sync_to_cpa
     sync_to_cpa()
     return {"message": "同步完成"}
+
+
+@app.post("/api/sync/main-codex")
+def post_sync_main_codex():
+    """兼容旧接口：开始主号 Codex 登录并同步到 CPA。"""
+    return post_main_codex_start()
 
 
 @app.get("/api/cpa/files")

@@ -3,12 +3,20 @@ import autoteam.display  # noqa: F401
 
 import json
 import logging
+import os
+import re
 import time
 import uuid
 from pathlib import Path
+
 from playwright.sync_api import sync_playwright
 
-from autoteam.config import CHATGPT_ACCOUNT_ID
+from autoteam.admin_state import (
+    get_admin_session_token,
+    get_chatgpt_account_id,
+    get_chatgpt_workspace_name,
+    update_admin_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +26,29 @@ SCREENSHOT_DIR = PROJECT_ROOT / "screenshots"
 
 
 class ChatGPTTeamAPI:
-    """通过 Playwright 浏览器内 fetch 调用 ChatGPT 内部 API"""
+    """通过浏览器内 fetch 调用 ChatGPT Team 内部 API。"""
+
+    EMAIL_INPUT_SELECTORS = [
+        'input[name="email"]',
+        'input[id="email-input"]',
+        'input[id="email"]',
+        'input[type="email"]',
+        'input[placeholder*="email" i]',
+        'input[placeholder*="邮箱"]',
+        'input[autocomplete="email"]',
+        'input[autocomplete="username"]',
+    ]
+    PASSWORD_INPUT_SELECTORS = [
+        'input[name="password"]',
+        'input[type="password"]',
+    ]
+    CODE_INPUT_SELECTORS = [
+        'input[name="code"]',
+        'input[placeholder*="验证码"]',
+        'input[placeholder*="code" i]',
+        'input[inputmode="numeric"]',
+        'input[autocomplete="one-time-code"]',
+    ]
 
     def __init__(self):
         self.playwright = None
@@ -26,19 +56,34 @@ class ChatGPTTeamAPI:
         self.context = None
         self.page = None
         self.access_token = None
-        self.account_id = CHATGPT_ACCOUNT_ID
+        self.session_token = None
+        self.account_id = get_chatgpt_account_id()
+        self.workspace_name = get_chatgpt_workspace_name()
         self.oai_device_id = str(uuid.uuid4())
+        self.login_email = None
+        self.login_password = None
+        self.workspace_options_cache = []
 
-    def start(self):
-        """启动浏览器，注入 cookies，获取 access token"""
+    def _visible_locator_in_frames(self, selectors, timeout_ms=5000):
+        selector = ", ".join(selectors)
+        deadline = time.time() + timeout_ms / 1000
+
+        while time.time() < deadline:
+            frames = [self.page.main_frame]
+            frames.extend(frame for frame in self.page.frames if frame != self.page.main_frame)
+            for frame in frames:
+                try:
+                    locator = frame.locator(selector).first
+                    if locator.is_visible(timeout=250):
+                        return locator
+                except Exception:
+                    pass
+            time.sleep(0.2)
+
+        return None
+
+    def _launch_browser(self):
         SCREENSHOT_DIR.mkdir(exist_ok=True)
-
-        # 读取 session cookies
-        session_file = BASE_DIR / "session"
-        if not session_file.exists():
-            raise FileNotFoundError("请先把 ChatGPT session token 写入 ./session 文件")
-        session_token = session_file.read_text().strip()
-
         self.playwright = sync_playwright().start()
         self.browser = self.playwright.chromium.launch(
             headless=False,
@@ -50,28 +95,34 @@ class ChatGPTTeamAPI:
         )
         self.page = self.context.new_page()
 
-        # 先访问 chatgpt.com 过 Cloudflare
-        logger.info("[ChatGPT] 访问 chatgpt.com 过 Cloudflare...")
-        self.page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
-        time.sleep(5)
+    def _log_login_state(self, label):
+        try:
+            body_excerpt = self.page.locator("body").inner_text(timeout=1500)[:300].replace("\n", " ")
+        except Exception:
+            body_excerpt = ""
 
+        logger.info(
+            "[ChatGPT] %s | URL=%s | body=%s",
+            label,
+            self.page.url,
+            body_excerpt,
+        )
+
+    def _wait_for_cloudflare(self):
         for i in range(12):
             html = self.page.content()[:1000].lower()
             if "verify you are human" not in html and "challenge" not in self.page.url:
-                break
+                return
             logger.info("[ChatGPT] 等待 Cloudflare... (%ds)", i * 5)
             time.sleep(5)
 
-        # 注入 session cookie（分片格式）
-        # 检测 token 长度，超过 3800 就分片
+    def _build_session_cookies(self, session_token, domain):
         if len(session_token) > 3800:
-            part0 = session_token[:3800]
-            part1 = session_token[3800:]
-            cookies = [
+            return [
                 {
                     "name": "__Secure-next-auth.session-token.0",
-                    "value": part0,
-                    "domain": "chatgpt.com",
+                    "value": session_token[:3800],
+                    "domain": domain,
                     "path": "/",
                     "httpOnly": True,
                     "secure": True,
@@ -79,34 +130,79 @@ class ChatGPTTeamAPI:
                 },
                 {
                     "name": "__Secure-next-auth.session-token.1",
-                    "value": part1,
-                    "domain": "chatgpt.com",
+                    "value": session_token[3800:],
+                    "domain": domain,
                     "path": "/",
                     "httpOnly": True,
                     "secure": True,
                     "sameSite": "Lax",
                 },
             ]
-        else:
-            cookies = [{
-                "name": "__Secure-next-auth.session-token",
-                "value": session_token,
-                "domain": "chatgpt.com",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "Lax",
-            }]
-
-        # 加上 account cookie
-        cookies.append({
-            "name": "_account",
-            "value": self.account_id,
-            "domain": "chatgpt.com",
+        return [{
+            "name": "__Secure-next-auth.session-token",
+            "value": session_token,
+            "domain": domain,
             "path": "/",
+            "httpOnly": True,
             "secure": True,
             "sameSite": "Lax",
-        })
+        }]
+
+    def _click_auth_button(self, field, labels):
+        label_re = re.compile(rf"^(?:{'|'.join(re.escape(label) for label in labels)})$", re.I)
+        try:
+            form = field.locator("xpath=ancestor::form[1]").first
+            btn = form.get_by_role("button", name=label_re).first
+            if btn.is_visible(timeout=2000):
+                btn.click()
+                return True
+        except Exception:
+            pass
+
+        try:
+            form = field.locator("xpath=ancestor::form[1]").first
+            btn = form.locator('button[type="submit"], input[type="submit"]').first
+            if btn.is_visible(timeout=2000):
+                btn.click()
+                return True
+        except Exception:
+            pass
+
+        try:
+            field.press("Enter")
+            return True
+        except Exception:
+            return False
+
+    def _extract_session_token(self):
+        cookies = self.context.cookies()
+        session_parts = {}
+        session_token = None
+        for cookie in cookies:
+            name = cookie["name"]
+            if name == "__Secure-next-auth.session-token":
+                session_token = cookie["value"]
+            elif name.startswith("__Secure-next-auth.session-token."):
+                suffix = name.rsplit(".", 1)[-1]
+                session_parts[suffix] = cookie["value"]
+
+        if not session_token and session_parts:
+            session_token = "".join(session_parts[k] for k in sorted(session_parts))
+
+        self.session_token = session_token
+        return session_token
+
+    def _inject_session(self, session_token):
+        cookies = self._build_session_cookies(session_token, "chatgpt.com")
+        if self.account_id:
+            cookies.append({
+                "name": "_account",
+                "value": self.account_id,
+                "domain": "chatgpt.com",
+                "path": "/",
+                "secure": True,
+                "sameSite": "Lax",
+            })
         cookies.append({
             "name": "oai-did",
             "value": self.oai_device_id,
@@ -115,30 +211,372 @@ class ChatGPTTeamAPI:
             "secure": True,
             "sameSite": "Lax",
         })
-
         self.context.add_cookies(cookies)
+        self.session_token = session_token
         logger.info("[ChatGPT] 已注入 session cookies")
 
-        # 获取 access token
-        self._fetch_access_token()
+    def _open_login_page(self):
+        self.page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded", timeout=60000)
+        time.sleep(5)
+        self._wait_for_cloudflare()
+        self._log_login_state("打开登录页后")
 
-        # 自动检测 account_id 和 workspace_name（如果未配置）
+        try:
+            login_btn = self.page.locator('button:has-text("登录"), button:has-text("Log in")').first
+            if login_btn.is_visible(timeout=3000):
+                login_btn.click()
+                time.sleep(2)
+                self._log_login_state("点击登录按钮后")
+        except Exception:
+            pass
+
+    def _list_workspace_options(self):
+        url = (self.page.url or "").lower()
+        if "workspace" not in url and "organization" not in url:
+            return []
+
+        logger.info("[ChatGPT] 检测到 workspace 选择页，开始收集组织候选 | URL=%s", self.page.url)
+        try:
+            self.page.screenshot(path=str(SCREENSHOT_DIR / "admin_login_workspace_before_select.png"), full_page=True)
+        except Exception:
+            pass
+
+        candidates = []
+        seen_texts = set()
+        exclude_keywords = (
+            "personal account",
+            "personal",
+            "个人账户",
+            "个人账号",
+            "free",
+            "免费",
+            "new organization",
+            "新组织",
+            "create organization",
+            "创建组织",
+        )
+
+        for selector in ('button', '[role="button"]', 'a', '[role="option"]'):
+            try:
+                for loc in self.page.locator(selector).all():
+                    try:
+                        if not loc.is_visible(timeout=200):
+                            continue
+                        text = loc.inner_text(timeout=500).strip()
+                    except Exception:
+                        continue
+
+                    if not text or text in seen_texts:
+                        continue
+                    seen_texts.add(text)
+
+                    text_l = text.lower()
+                    if len(text) > 80:
+                        continue
+                    kind = "fallback" if any(key in text_l for key in exclude_keywords) else "preferred"
+                    candidates.append({
+                        "id": str(len(candidates)),
+                        "label": text,
+                        "kind": kind,
+                    })
+            except Exception:
+                pass
+
+        logger.info("[ChatGPT] workspace 候选数: %d | candidates=%s", len(candidates), [c["label"] for c in candidates])
+        self.workspace_options_cache = candidates
+        return candidates
+
+    def list_workspace_options(self):
+        if self.workspace_options_cache:
+            return self.workspace_options_cache
+        return self._list_workspace_options()
+
+    def select_workspace_option(self, option_id):
+        options = self._list_workspace_options()
+        for option in options:
+            if option["id"] != str(option_id):
+                continue
+
+            label = option["label"]
+            # 重新按同样顺序扫描并点击对应索引
+            current_options = []
+            seen_texts = set()
+            for selector in ('button', '[role="button"]', 'a', '[role="option"]'):
+                try:
+                    for loc in self.page.locator(selector).all():
+                        try:
+                            if not loc.is_visible(timeout=200):
+                                continue
+                            text = loc.inner_text(timeout=500).strip()
+                        except Exception:
+                            continue
+                        if not text or text in seen_texts or len(text) > 80:
+                            continue
+                        seen_texts.add(text)
+                        current_options.append((str(len(current_options)), text, loc))
+                except Exception:
+                    pass
+
+            for cur_id, cur_label, loc in current_options:
+                if cur_id == str(option_id):
+                    logger.info("[ChatGPT] 用户选择 workspace: %s", cur_label)
+                    loc.click()
+                    time.sleep(3)
+                    self.workspace_options_cache = []
+                    self._log_login_state("选择 workspace 后")
+                    step, detail = self._detect_login_step()
+                    logger.info("[ChatGPT] 选择 workspace 后结果: %s | detail=%s", step, detail)
+                    return {"step": step, "detail": detail}
+
+            raise RuntimeError(f"未找到可点击的 workspace 选项: {label}")
+
+        raise RuntimeError(f"无效的 workspace 选项: {option_id}")
+
+    def _detect_login_step(self):
+        if "accounts.google.com" in self.page.url:
+            logger.warning("[ChatGPT] 登录步骤检测: 误跳转 Google | URL=%s", self.page.url)
+            return "error", "误跳转到了 Google 登录"
+
+        if "workspace" in (self.page.url or "").lower() or "organization" in (self.page.url or "").lower():
+            logger.info("[ChatGPT] 登录步骤检测: workspace 页面 | URL=%s", self.page.url)
+            return "workspace_required", None
+
+        if "email-verification" in self.page.url:
+            logger.info("[ChatGPT] 登录步骤检测: code_required | URL=%s", self.page.url)
+            return "code_required", None
+
+        if self._visible_locator_in_frames(self.CODE_INPUT_SELECTORS, timeout_ms=1200):
+            logger.info("[ChatGPT] 登录步骤检测: code_required | URL=%s", self.page.url)
+            return "code_required", None
+
+        if self._visible_locator_in_frames(self.PASSWORD_INPUT_SELECTORS, timeout_ms=1200):
+            logger.info("[ChatGPT] 登录步骤检测: password_required | URL=%s", self.page.url)
+            return "password_required", None
+
+        session_token = self._extract_session_token()
+        if session_token:
+            logger.info("[ChatGPT] 登录步骤检测: completed(session) | URL=%s", self.page.url)
+            return "completed", None
+
+        if "chatgpt.com" in self.page.url and "auth" not in self.page.url:
+            logger.info("[ChatGPT] 登录步骤检测: completed(chatgpt) | URL=%s", self.page.url)
+            return "completed", None
+
+        logger.info("[ChatGPT] 登录步骤检测: unknown | URL=%s", self.page.url)
+        return "unknown", self.page.url
+
+    def begin_admin_login(self, email):
+        self.login_email = email
+        if not self.browser:
+            self._launch_browser()
+
+        logger.info("[ChatGPT] 开始管理员登录: %s", email)
+        self.page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+        time.sleep(5)
+        self._wait_for_cloudflare()
+        self._log_login_state("进入 chatgpt.com 后")
+        self._open_login_page()
+
+        step, detail = self._detect_login_step()
+        if step == "workspace_required":
+            self._list_workspace_options()
+        if step in ("password_required", "code_required", "workspace_required", "completed", "error"):
+            logger.info("[ChatGPT] 管理员登录初始步骤: %s | detail=%s", step, detail)
+            return {"step": step, "detail": detail}
+
+        email_input = self._visible_locator_in_frames(self.EMAIL_INPUT_SELECTORS, timeout_ms=15000)
+        if not email_input:
+            try:
+                self.page.screenshot(path=str(SCREENSHOT_DIR / "admin_login_missing_email.png"), full_page=True)
+            except Exception:
+                pass
+            body_excerpt = ""
+            try:
+                body_excerpt = self.page.locator("body").inner_text(timeout=2000)[:300]
+            except Exception:
+                pass
+            raise RuntimeError(f"未找到管理员邮箱输入框，当前 URL: {self.page.url}，页面片段: {body_excerpt}")
+
+        email_input.fill(email)
+        time.sleep(0.5)
+        self._click_auth_button(email_input, ["Continue", "继续"])
+        time.sleep(3)
+        self._log_login_state("管理员邮箱提交后")
+
+        step, detail = self._detect_login_step()
+        if step == "workspace_required":
+            self._list_workspace_options()
+        logger.info("[ChatGPT] 管理员邮箱提交结果: %s | detail=%s", step, detail)
+        return {"step": step, "detail": detail}
+
+    def submit_admin_password(self, password):
+        self.login_password = password
+        password_input = self._visible_locator_in_frames(self.PASSWORD_INPUT_SELECTORS, timeout_ms=5000)
+        if not password_input:
+            raise RuntimeError("当前不是密码输入步骤")
+
+        logger.info("[ChatGPT] 提交管理员密码前 | URL=%s", self.page.url)
+        password_input.fill(password)
+        time.sleep(0.5)
+        self._click_auth_button(password_input, ["Continue", "继续", "Log in"])
+        time.sleep(8)
+        self._log_login_state("管理员密码提交后")
+
+        step, detail = self._detect_login_step()
+        if step == "workspace_required":
+            self._list_workspace_options()
+        logger.info("[ChatGPT] 管理员密码提交结果: %s | detail=%s", step, detail)
+        return {"step": step, "detail": detail}
+
+    def submit_admin_code(self, code):
+        code_input = self._visible_locator_in_frames(self.CODE_INPUT_SELECTORS, timeout_ms=5000)
+        if not code_input and "email-verification" not in self.page.url:
+            raise RuntimeError("当前不是验证码输入步骤")
+
+        logger.info("[ChatGPT] 提交管理员验证码前 | URL=%s | code_len=%d", self.page.url, len(code))
+        try:
+            self.page.screenshot(path=str(SCREENSHOT_DIR / "admin_login_code_before_submit.png"), full_page=True)
+        except Exception:
+            pass
+        code_input.fill(code)
+        time.sleep(0.5)
+        self._click_auth_button(code_input, ["Continue", "继续", "Verify"])
+        time.sleep(8)
+        try:
+            self.page.screenshot(path=str(SCREENSHOT_DIR / "admin_login_code_after_submit.png"), full_page=True)
+        except Exception:
+            pass
+        self._log_login_state("管理员验证码提交后")
+
+        step, detail = self._detect_login_step()
+        if step == "workspace_required":
+            self._list_workspace_options()
+        logger.info("[ChatGPT] 管理员验证码提交结果: %s | detail=%s", step, detail)
+        return {"step": step, "detail": detail}
+
+    def _guess_account_info(self):
+        try:
+            data = self.page.evaluate('''async () => {
+                const out = {};
+                for (const path of ['/backend-api/accounts', '/backend-api/me', '/api/auth/session']) {
+                    try {
+                        const resp = await fetch(path);
+                        out[path] = { status: resp.status, data: await resp.json() };
+                    } catch (e) {
+                        out[path] = { error: String(e) };
+                    }
+                }
+                return out;
+            }''')
+        except Exception:
+            data = {}
+
+        candidates = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                account_id = node.get("account_id") or node.get("id")
+                name = node.get("workspace_name") or node.get("name") or node.get("display_name")
+                if isinstance(account_id, str) and len(account_id) >= 8:
+                    candidates.append({
+                        "account_id": account_id,
+                        "workspace_name": name or "",
+                        "type": str(node.get("type", "")),
+                    })
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(data)
+
+        chosen = None
+        for cand in candidates:
+            if cand["workspace_name"] and cand["workspace_name"].lower() not in ("personal",):
+                chosen = cand
+                break
+        if not chosen and candidates:
+            chosen = candidates[0]
+
+        try:
+            self.page.goto("https://chatgpt.com/admin", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(5)
+            dom_name = self.page.evaluate('''() => {
+                const headings = document.querySelectorAll('h1, h2, h3, [class*="title"], [class*="name"]');
+                for (const h of headings) {
+                    const text = h.textContent.trim();
+                    if (text && text.length < 50 && text.length > 1
+                        && !["常规", "成员", "设置", "General", "Members", "Settings"].includes(text)) {
+                        return text;
+                    }
+                }
+                return null;
+            }''')
+        except Exception:
+            dom_name = None
+
+        account_id = (chosen or {}).get("account_id") or self.account_id
+        workspace_name = (chosen or {}).get("workspace_name") or dom_name or self.workspace_name
+        return account_id, workspace_name
+
+    def complete_admin_login(self):
+        session_token = self._extract_session_token()
+        if not session_token:
+            raise RuntimeError("管理员登录成功后未提取到 session token")
+
+        self._fetch_access_token()
+        account_id, workspace_name = self._guess_account_info()
+        if account_id:
+            self.account_id = account_id
+        if workspace_name:
+            self.workspace_name = workspace_name
+
+        payload = dict(
+            email=self.login_email or "",
+            session_token=session_token,
+            account_id=self.account_id,
+            workspace_name=self.workspace_name,
+        )
+        if self.login_password:
+            payload["password"] = self.login_password
+
+        update_admin_state(**payload)
+
+        logger.info("[ChatGPT] 管理员登录状态已保存")
+        return {
+            "email": self.login_email or "",
+            "account_id": self.account_id,
+            "workspace_name": self.workspace_name,
+            "session_len": len(session_token),
+        }
+
+    def start(self):
+        """用已保存的管理员 session 启动 Team API 客户端。"""
+        session_token = get_admin_session_token()
+        self.account_id = get_chatgpt_account_id()
+        self.workspace_name = get_chatgpt_workspace_name()
+        if not session_token:
+            raise FileNotFoundError("请先完成管理员登录")
+        if not self.account_id:
+            raise RuntimeError("缺少已保存的 workspace/account ID，请重新完成管理员登录")
+
+        self._launch_browser()
+        logger.info("[ChatGPT] 访问 chatgpt.com 过 Cloudflare...")
+        self.page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+        time.sleep(5)
+        self._wait_for_cloudflare()
+        self._inject_session(session_token)
+        self._fetch_access_token()
         self._auto_detect_workspace()
 
     def _auto_detect_workspace(self):
-        """自动获取 workspace 名称（需要 CHATGPT_ACCOUNT_ID 已配置）"""
-        from autoteam import config
+        if self.workspace_name:
+            return self.workspace_name
+        if not self.account_id:
+            logger.warning("[ChatGPT] 未能自动获取 workspace 名称：account_id 缺失")
+            return ""
 
-        if config.CHATGPT_WORKSPACE_NAME:
-            return  # 已配置
-
-        if not config.CHATGPT_ACCOUNT_ID:
-            logger.warning("[ChatGPT] 请在 .env 中配置 CHATGPT_ACCOUNT_ID")
-            return
-
-        # 用 account_id 调 API 获取 workspace 信息
-        result = self._api_fetch("GET", f"/backend-api/accounts/{self.account_id}/invites")
-        # invites 接口不返回名称，换用 settings
         result = self.page.evaluate('''async (accountId) => {
             try {
                 const resp = await fetch("/backend-api/accounts/" + accountId + "/settings", {
@@ -149,23 +587,18 @@ class ChatGPTTeamAPI:
         }''', self.account_id)
 
         if result and result.get("workspace_name"):
-            config.CHATGPT_WORKSPACE_NAME = result["workspace_name"]
-            logger.info("[ChatGPT] 自动检测到 workspace 名称: %s", result['workspace_name'])
-            return
+            self.workspace_name = result["workspace_name"]
+            update_admin_state(workspace_name=self.workspace_name, account_id=self.account_id)
+            logger.info("[ChatGPT] 自动检测到 workspace 名称: %s", self.workspace_name)
+            return self.workspace_name
 
-        # fallback: 从 admin 页面提取 workspace 名称
         try:
             self.page.goto("https://chatgpt.com/admin", wait_until="domcontentloaded", timeout=30000)
-            import time as _t
-            _t.sleep(5)
-            # workspace 名称通常是 admin 页面侧边栏中的大标题
+            time.sleep(5)
             name = self.page.evaluate('''() => {
-                // 找侧边栏或页面标题中的 workspace 名称
-                // admin 页面结构：侧边栏有 workspace 名称作为标题
                 const headings = document.querySelectorAll('h1, h2, h3, [class*="title"], [class*="name"]');
                 for (const h of headings) {
                     const text = h.textContent.trim();
-                    // 跳过通用标题
                     if (text && text.length < 50 && text.length > 1
                         && !["常规", "成员", "设置", "General", "Members", "Settings"].includes(text)) {
                         return text;
@@ -174,23 +607,23 @@ class ChatGPTTeamAPI:
                 return null;
             }''')
             if name:
-                config.CHATGPT_WORKSPACE_NAME = name
+                self.workspace_name = name
+                update_admin_state(workspace_name=self.workspace_name, account_id=self.account_id)
                 logger.info("[ChatGPT] 自动检测到 workspace 名称: %s", name)
-                return
+                return name
         except Exception:
             pass
 
-        logger.warning("[ChatGPT] 未能自动获取 workspace 名称，请在 .env 中配置 CHATGPT_WORKSPACE_NAME")
+        logger.warning("[ChatGPT] 未能自动获取 workspace 名称")
+        return ""
 
     def _fetch_access_token(self):
-        """通过浏览器 fetch 获取 access token"""
         result = self.page.evaluate('''async () => {
             try {
                 const resp = await fetch("/api/auth/session");
                 const data = await resp.json();
                 return { ok: true, data: data };
             } catch(e) {
-                // session 接口可能不返回 token，试 /backend-api/me
                 return { ok: false, error: e.message };
             }
         }''')
@@ -200,51 +633,23 @@ class ChatGPTTeamAPI:
             logger.info("[ChatGPT] 已获取 access token")
             return
 
-        # 尝试通过 sentinel chat requirements 获取 token
-        # 先试试 /backend-api/sentinel/chat-requirements
-        result2 = self.page.evaluate('''async () => {
-            try {
-                const resp = await fetch("/backend-api/sentinel/chat-requirements", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({})
-                });
-                return { status: resp.status, text: await resp.text() };
-            } catch(e) {
-                return { error: e.message };
-            }
-        }''')
-
-        # 如果以上都拿不到，用 session 文件里可能有的 bearer token
         bearer_file = BASE_DIR / "bearer_token"
         if bearer_file.exists():
             self.access_token = bearer_file.read_text().strip()
             logger.info("[ChatGPT] 从 bearer_token 文件加载 access token")
             return
 
-        # 最后手段：导航到 chatgpt.com 让前端 JS 获取 token，然后从 localStorage 读取
         logger.info("[ChatGPT] 尝试通过页面获取 access token...")
         self.page.goto("https://chatgpt.com/", wait_until="networkidle", timeout=60000)
         time.sleep(10)
 
         token = self.page.evaluate('''() => {
-            // 尝试多种方式
             try {
                 const keys = Object.keys(localStorage);
                 for (const key of keys) {
                     const val = localStorage.getItem(key);
                     if (val && val.includes("eyJ") && val.length > 500) {
                         return val;
-                    }
-                }
-            } catch(e) {}
-
-            // 尝试从 cookie 读取
-            try {
-                const cookies = document.cookie.split(";");
-                for (const c of cookies) {
-                    if (c.trim().startsWith("oai-sc=")) {
-                        return null; // not the right one
                     }
                 }
             } catch(e) {}
@@ -258,7 +663,6 @@ class ChatGPTTeamAPI:
             logger.warning("[ChatGPT] 未能获取 access token，将尝试无 token 调用")
 
     def _api_fetch(self, method, path, body=None):
-        """在浏览器内用 fetch 调用 ChatGPT API"""
         headers_js = {
             "Content-Type": "application/json",
             "chatgpt-account-id": self.account_id,
@@ -280,14 +684,12 @@ class ChatGPTTeamAPI:
             }
         }'''
 
-        result = self.page.evaluate(
+        return self.page.evaluate(
             js_code,
             [method, f"https://chatgpt.com{path}", headers_js, json.dumps(body) if body else None],
         )
-        return result
 
     def invite_member(self, email, seat_type="usage_based"):
-        """邀请邮箱加入 Team。新账号用 usage_based 绕过限制，旧账号用 default。"""
         path = f"/backend-api/accounts/{self.account_id}/invites"
         body = {
             "email_addresses": [email],
@@ -301,7 +703,6 @@ class ChatGPTTeamAPI:
 
         status = result["status"]
         resp_body = result["body"]
-
         logger.info("[ChatGPT] 响应状态: %d", status)
 
         try:
@@ -311,7 +712,6 @@ class ChatGPTTeamAPI:
             data = resp_body
             logger.debug("[ChatGPT] 响应内容: %s", resp_body[:500])
 
-        # 新账号用 usage_based 绕过后，需要改回 default
         if status == 200 and seat_type == "usage_based" and isinstance(data, dict):
             invites = data.get("account_invites", [])
             for inv in invites:
@@ -322,7 +722,6 @@ class ChatGPTTeamAPI:
         return status, data
 
     def _update_invite_seat_type(self, invite_id, seat_type):
-        """修改 pending invite 的 seat_type"""
         path = f"/backend-api/accounts/{self.account_id}/invites/{invite_id}"
         body = {"seat_type": seat_type}
 
@@ -335,7 +734,6 @@ class ChatGPTTeamAPI:
             logger.error("[ChatGPT] 修改 seat_type 失败: %d %s", result['status'], result['body'][:200])
 
     def list_invites(self):
-        """获取当前邀请列表"""
         path = f"/backend-api/accounts/{self.account_id}/invites"
         result = self._api_fetch("GET", path)
         try:
@@ -344,7 +742,6 @@ class ChatGPTTeamAPI:
             return result["body"]
 
     def stop(self):
-        """关闭浏览器"""
         try:
             if self.browser:
                 self.browser.close()
@@ -356,4 +753,6 @@ class ChatGPTTeamAPI:
         except Exception:
             pass
         self.browser = None
+        self.context = None
+        self.page = None
         self.playwright = None

@@ -1,12 +1,15 @@
 <template>
   <div class="mt-6 bg-gray-900 border border-gray-800 rounded-xl p-4">
     <h2 class="text-lg font-semibold text-white mb-4">操作</h2>
+    <div v-if="!adminReady" class="mb-4 px-4 py-3 rounded-lg text-sm border bg-amber-500/10 text-amber-300 border-amber-500/20">
+      需要先在下方“管理员登录”里完成主号登录，管理操作才会开放。
+    </div>
     <div class="flex flex-wrap gap-3">
       <button v-for="action in actions" :key="action.key"
         @click="execute(action)"
-        :disabled="!!runningTask"
+        :disabled="disabled"
         class="px-4 py-2 rounded-lg text-sm font-medium transition border"
-        :class="runningTask
+        :class="disabled
           ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
           : `${action.style} hover:opacity-80`">
         {{ action.label }}
@@ -18,7 +21,7 @@
       <label class="text-sm text-gray-400">{{ paramLabel }}:</label>
       <input v-model.number="paramValue" type="number" min="1" max="20"
         class="w-20 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-white focus:outline-none focus:border-blue-500" />
-      <button @click="confirmAction"
+      <button @click="confirmAction" :disabled="disabled"
         class="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition">
         确认执行
       </button>
@@ -36,11 +39,15 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { api } from '../api.js'
 
 const props = defineProps({
   runningTask: Object,
+  adminStatus: {
+    type: Object,
+    default: null,
+  },
 })
 const emit = defineEmits(['task-started', 'refresh'])
 
@@ -59,8 +66,11 @@ const paramValue = ref(5)
 const pendingAction = ref(null)
 const message = ref('')
 const messageClass = ref('')
+const adminReady = computed(() => !!props.adminStatus?.configured)
+const disabled = computed(() => !!props.runningTask || !adminReady.value)
 
 async function execute(action) {
+  if (disabled.value) return
   message.value = ''
   if (action.needParam) {
     pendingAction.value = action

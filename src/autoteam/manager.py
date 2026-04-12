@@ -21,6 +21,7 @@ import autoteam.display  # noqa: F401 — 自动设置虚拟显示器
 import sys
 import os
 import json
+import getpass
 import logging
 import time
 from pathlib import Path
@@ -30,13 +31,15 @@ from autoteam.accounts import (
     get_active_accounts, get_standby_accounts, get_next_reusable_account,
     STATUS_ACTIVE, STATUS_EXHAUSTED, STATUS_STANDBY, STATUS_PENDING,
 )
+from autoteam.admin_state import get_chatgpt_account_id, get_admin_state_summary
 from autoteam.chatgpt_api import ChatGPTTeamAPI
 from autoteam.cloudmail import CloudMailClient
+from autoteam.account_ops import delete_managed_account, fetch_team_state
 from autoteam.codex_auth import (
     login_codex_via_browser, save_auth_file, check_codex_quota,
-    refresh_access_token,
+    refresh_access_token, _click_primary_auth_button, _is_google_redirect,
+    MainCodexSyncFlow,
 )
-from autoteam.config import CHATGPT_ACCOUNT_ID
 from autoteam.cpa_sync import sync_to_cpa
 
 logger = logging.getLogger(__name__)
@@ -46,6 +49,7 @@ MAIL_TIMEOUT = int(os.environ.get("MAIL_TIMEOUT", "180"))
 
 def sync_account_states(chatgpt_api=None):
     """根据 Team 实际成员列表同步本地账号状态"""
+    account_id = get_chatgpt_account_id()
     accounts = load_accounts()
     if not accounts:
         return
@@ -62,7 +66,7 @@ def sync_account_states(chatgpt_api=None):
             return
 
     try:
-        path = f"/backend-api/accounts/{CHATGPT_ACCOUNT_ID}/users"
+        path = f"/backend-api/accounts/{account_id}/users"
         result = chatgpt_api._api_fetch("GET", path)
         if result["status"] != 200:
             return
@@ -266,6 +270,62 @@ def cmd_check():
         threshold = AUTO_CHECK_THRESHOLD
 
     accounts = load_accounts()
+
+    pending_accounts = [a for a in accounts if a["status"] == STATUS_PENDING]
+    if pending_accounts:
+        logger.info("[检查] 对账 %d 个 pending 账号...", len(pending_accounts))
+        chatgpt = None
+        mail_client = None
+        deleted_pending = 0
+        try:
+            chatgpt = ChatGPTTeamAPI()
+            chatgpt.start()
+            members, invites = fetch_team_state(chatgpt)
+            team_emails = {(m.get("email", "") or "").lower() for m in members}
+            invite_emails = {
+                ((inv.get("email_address") or inv.get("email") or "")).lower()
+                for inv in invites
+            }
+
+            for acc in pending_accounts:
+                email = acc["email"]
+                email_l = email.lower()
+
+                if email_l in team_emails:
+                    logger.info("[检查] pending 账号已在 Team 中，转为 active: %s", email)
+                    update_account(email, status=STATUS_ACTIVE)
+                    continue
+
+                if email_l in invite_emails:
+                    logger.info("[检查] pending 账号仍存在远端邀请，保留: %s", email)
+                    continue
+
+                logger.warning("[检查] pending 账号为失败孤儿，删除: %s", email)
+                if mail_client is None:
+                    mail_client = CloudMailClient()
+                    mail_client.login()
+                delete_managed_account(
+                    email,
+                    remove_remote=True,
+                    remove_cloudmail=True,
+                    sync_cpa_after=False,
+                    chatgpt_api=chatgpt,
+                    mail_client=mail_client,
+                    remote_state=(members, invites),
+                )
+                deleted_pending += 1
+        except Exception as exc:
+            logger.warning("[检查] pending 对账失败，跳过本轮清理: %s", exc)
+        finally:
+            if chatgpt and chatgpt.browser:
+                chatgpt.stop()
+
+        if deleted_pending:
+            logger.info("[检查] 已删除 %d 个失败 pending 账号", deleted_pending)
+            sync_to_cpa()
+
+        accounts = load_accounts()
+
     all_active = [a for a in accounts if a["status"] == STATUS_ACTIVE]
 
     # 区分：有认证文件的 vs 无认证文件的
@@ -412,8 +472,9 @@ def cmd_check():
 
 def remove_from_team(chatgpt_api, email):
     """将账号从 Team 中移除"""
+    account_id = get_chatgpt_account_id()
     # 先获取成员列表找到 user_id
-    path = f"/backend-api/accounts/{CHATGPT_ACCOUNT_ID}/users"
+    path = f"/backend-api/accounts/{account_id}/users"
     result = chatgpt_api._api_fetch("GET", path)
 
     if result["status"] != 200:
@@ -441,7 +502,7 @@ def remove_from_team(chatgpt_api, email):
         return True
 
     # 删除成员
-    delete_path = f"/backend-api/accounts/{CHATGPT_ACCOUNT_ID}/users/{target_user_id}"
+    delete_path = f"/backend-api/accounts/{account_id}/users/{target_user_id}"
     result = chatgpt_api._api_fetch("DELETE", delete_path)
 
     if result["status"] in (200, 204):
@@ -511,7 +572,8 @@ def _check_pending_invites(chatgpt_api, mail_client):
     """
     import uuid
 
-    result = chatgpt_api._api_fetch("GET", f"/backend-api/accounts/{CHATGPT_ACCOUNT_ID}/invites")
+    account_id = get_chatgpt_account_id()
+    result = chatgpt_api._api_fetch("GET", f"/backend-api/accounts/{account_id}/invites")
     if result["status"] != 200:
         return []
 
@@ -562,23 +624,27 @@ def _check_pending_invites(chatgpt_api, mail_client):
     return completed
 
 
-def create_account_direct(mail_client):
-    """
-    直接注册模式（域名已配置自动加入 workspace，不需要邀请）。
-    流程：创建邮箱 → 注册 ChatGPT → 自动加入 workspace → Codex 登录
-    """
-    from autoteam.invite import register_with_invite, screenshot
+def _is_email_in_team(email):
+    """检查邮箱是否已实际进入 Team。"""
+    chatgpt = None
+    try:
+        chatgpt = ChatGPTTeamAPI()
+        chatgpt.start()
+        members, _ = fetch_team_state(chatgpt)
+        return any((m.get("email", "") or "").lower() == email.lower() for m in members)
+    except Exception as exc:
+        logger.warning("[直接注册] 检查 Team 成员失败: %s", exc)
+        return False
+    finally:
+        if chatgpt and chatgpt.browser:
+            chatgpt.stop()
+
+
+def _register_direct_once(mail_client, email, password):
+    """执行一次直接注册，返回是否完成注册并进入 Team。"""
+    from autoteam.invite import screenshot
     from playwright.sync_api import sync_playwright
-    import uuid
 
-    # Step 1: 创建临时邮箱
-    account_id, email = mail_client.create_temp_email()
-    password = f"Tmp_{uuid.uuid4().hex[:12]}!"
-
-    # Step 2: 记录账号
-    add_account(email, password, cloudmail_account_id=account_id)
-
-    # Step 3: 直接去 ChatGPT 注册页面
     logger.info("[直接注册] %s", email)
     signup_url = "https://chatgpt.com/auth/login"
 
@@ -596,7 +662,6 @@ def create_account_direct(mail_client):
         page.goto(signup_url, wait_until="domcontentloaded", timeout=60000)
         time.sleep(5)
 
-        # 等待 Cloudflare
         for i in range(12):
             html = page.content()[:2000].lower()
             if "verify you are human" not in html and "challenge" not in page.url:
@@ -606,9 +671,10 @@ def create_account_direct(mail_client):
 
         screenshot(page, "direct_01_login_page.png")
 
-        # 点击注册
         try:
-            signup_btn = page.locator('button:has-text("注册"), button:has-text("Sign up"), a:has-text("Sign up"), a:has-text("注册")').first
+            signup_btn = page.locator(
+                'button:has-text("注册"), button:has-text("Sign up"), a:has-text("Sign up"), a:has-text("注册")'
+            ).first
             if signup_btn.is_visible(timeout=5000):
                 signup_btn.click()
                 time.sleep(3)
@@ -617,35 +683,62 @@ def create_account_direct(mail_client):
 
         screenshot(page, "direct_02_signup.png")
 
-        # 输入邮箱
         logger.info("[直接注册] 输入邮箱: %s", email)
-        email_input = page.locator('input[name="email"], input[type="email"]').first
         try:
-            if email_input.is_visible(timeout=5000):
+            for attempt in range(2):
+                email_input = page.locator('input[name="email"], input[type="email"]').first
+                if not email_input.is_visible(timeout=5000):
+                    break
+
                 email_input.fill(email)
                 time.sleep(0.5)
-                page.locator('button:has-text("Continue"), button:has-text("继续"), button[type="submit"]').first.click()
+                _click_primary_auth_button(page, email_input, ["Continue", "继续"])
                 time.sleep(3)
+
+                if not _is_google_redirect(page):
+                    break
+
+                screenshot(page, f"direct_03_google_redirect_attempt{attempt+1}.png")
+                logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
+                page.go_back(wait_until="domcontentloaded", timeout=30000)
+                time.sleep(2)
         except Exception:
             pass
 
         screenshot(page, "direct_03_after_email.png")
+        if _is_google_redirect(page):
+            logger.warning("[直接注册] 邮箱步骤仍停留在 Google 登录页")
+            browser.close()
+            return False
 
-        # 输入密码
-        pwd_input = page.locator('input[type="password"]').first
         try:
-            if pwd_input.is_visible(timeout=5000):
+            for attempt in range(2):
+                pwd_input = page.locator('input[type="password"]').first
+                if not pwd_input.is_visible(timeout=5000):
+                    break
+
                 logger.info("[直接注册] 设置密码")
                 pwd_input.fill(password)
                 time.sleep(0.5)
-                page.locator('button:has-text("Continue"), button:has-text("继续"), button[type="submit"]').first.click()
+                _click_primary_auth_button(page, pwd_input, ["Continue", "继续", "Log in"])
                 time.sleep(5)
+
+                if not _is_google_redirect(page):
+                    break
+
+                screenshot(page, f"direct_04_google_redirect_attempt{attempt+1}.png")
+                logger.warning("[直接注册] 密码步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
+                page.go_back(wait_until="domcontentloaded", timeout=30000)
+                time.sleep(2)
         except Exception:
             pass
 
         screenshot(page, "direct_04_after_password.png")
+        if _is_google_redirect(page):
+            logger.warning("[直接注册] 密码步骤仍停留在 Google 登录页")
+            browser.close()
+            return False
 
-        # 等待验证码
         code_input = None
         try:
             code_input = page.locator('input[name="code"], input[placeholder*="验证码"], input[placeholder*="code" i]').first
@@ -656,6 +749,7 @@ def create_account_direct(mail_client):
 
         if code_input:
             import re
+
             logger.info("[直接注册] 等待验证码...")
             verification_code = None
             start_t = time.time()
@@ -677,24 +771,22 @@ def create_account_direct(mail_client):
                 logger.info("[直接注册] 输入验证码: %s", verification_code)
                 code_input.fill(verification_code)
                 time.sleep(0.5)
-                page.locator('button:has-text("Continue"), button:has-text("继续"), button[type="submit"]').first.click()
+                _click_primary_auth_button(page, code_input, ["Continue", "继续"])
                 time.sleep(8)
             else:
                 logger.error("[直接注册] 未收到验证码")
                 browser.close()
-                return None
+                return False
 
         screenshot(page, "direct_05_after_code.png")
         logger.info("[直接注册] 当前 URL: %s", page.url)
 
-        # 填写个人信息（全名 + 年龄/生日）
         name_input = page.locator('input[name="name"]').first
         try:
             if name_input.is_visible(timeout=5000):
                 name_input.fill("User")
                 time.sleep(0.5)
 
-                # 自适应年龄/生日
                 spinbuttons = page.locator('[role="spinbutton"]').all()
                 if len(spinbuttons) >= 3:
                     try:
@@ -717,7 +809,7 @@ def create_account_direct(mail_client):
                     except Exception:
                         pass
 
-                page.locator('button:has-text("完成帐户创建"), button:has-text("Continue"), button:has-text("继续"), button[type="submit"]').first.click()
+                _click_primary_auth_button(page, name_input, ["完成帐户创建", "Continue", "继续"])
                 time.sleep(8)
         except Exception:
             pass
@@ -725,7 +817,6 @@ def create_account_direct(mail_client):
         screenshot(page, "direct_06_after_profile.png")
         logger.info("[直接注册] 当前 URL: %s", page.url)
 
-        # 可能需要选择 workspace 或自动加入
         try:
             join_btn = page.locator('button:has-text("Accept"), button:has-text("Join"), button:has-text("加入")').first
             if join_btn.is_visible(timeout=5000):
@@ -736,18 +827,52 @@ def create_account_direct(mail_client):
 
         screenshot(page, "direct_07_final.png")
 
-        # 检查结果
         current_url = page.url
-        success = "chatgpt.com" in current_url and "auth" not in current_url
+        success = "chatgpt.com" in current_url and "auth" not in current_url and not _is_google_redirect(page)
         if success:
             logger.info("[直接注册] 注册成功并已加入 workspace!")
         else:
             logger.warning("[直接注册] 注册可能未完成，URL: %s", current_url)
 
         browser.close()
+        return success
+
+
+def create_account_direct(mail_client):
+    """
+    直接注册模式（域名已配置自动加入 workspace，不需要邀请）。
+    流程：创建邮箱 → 注册 ChatGPT → 自动加入 workspace → Codex 登录
+    """
+    import uuid
+
+    account_id, email = mail_client.create_temp_email()
+    password = f"Tmp_{uuid.uuid4().hex[:12]}!"
+
+    success = False
+    for attempt in range(3):
+        logger.info("[直接注册] 开始第 %d/3 次注册尝试: %s", attempt + 1, email)
+        success = _register_direct_once(mail_client, email, password)
+        if success:
+            break
+
+        if _is_email_in_team(email):
+            logger.info("[直接注册] 远端确认账号已在 Team 中，视为注册成功: %s", email)
+            success = True
+            break
+
+        if attempt < 2:
+            logger.warning("[直接注册] 注册失败且账号不在 Team 中，60 秒后重试: %s", email)
+            time.sleep(60)
 
     if not success:
+        logger.error("[直接注册] 连续 3 次注册失败，删除临时账号: %s", email)
+        try:
+            mail_client.delete_account(account_id)
+        except Exception as exc:
+            logger.warning("[直接注册] 删除失败临时邮箱异常: %s", exc)
         return None
+
+    add_account(email, password, cloudmail_account_id=account_id)
 
     # Step 4: Codex 登录
     bundle = login_codex_via_browser(email, password, mail_client=mail_client)
@@ -1118,9 +1243,140 @@ def cmd_add():
             chatgpt.stop()
 
 
+def cmd_admin_login(email=None):
+    """交互式完成管理员登录并保存到 state.json。"""
+    email = (email or "").strip()
+    if not email:
+        email = input("管理员邮箱: ").strip()
+
+    if not email:
+        logger.error("[管理员登录] 邮箱不能为空")
+        return None
+
+    chatgpt = ChatGPTTeamAPI()
+
+    try:
+        logger.info("[管理员登录] 开始: %s", email)
+        result = chatgpt.begin_admin_login(email)
+        step = result.get("step")
+
+        while True:
+            if step == "completed":
+                info = chatgpt.complete_admin_login()
+                logger.info("[管理员登录] 登录完成: %s", info.get("email") or email)
+                if info.get("account_id"):
+                    logger.info("[管理员登录] Workspace ID: %s", info["account_id"])
+                if info.get("workspace_name"):
+                    logger.info("[管理员登录] Workspace 名称: %s", info["workspace_name"])
+                return info
+
+            if step == "password_required":
+                password = getpass.getpass("管理员密码（留空取消）: ")
+                if not password:
+                    logger.warning("[管理员登录] 已取消")
+                    return None
+                result = chatgpt.submit_admin_password(password)
+                step = result.get("step")
+                continue
+
+            if step == "code_required":
+                code = input("邮箱验证码（留空取消）: ").strip()
+                if not code:
+                    logger.warning("[管理员登录] 已取消")
+                    return None
+                result = chatgpt.submit_admin_code(code)
+                step = result.get("step")
+                continue
+
+            if step == "workspace_required":
+                options = chatgpt.list_workspace_options()
+                if not options:
+                    raise RuntimeError("当前需要选择组织，但未获取到可选项")
+
+                logger.info("[管理员登录] 请选择要进入的 workspace:")
+                for idx, option in enumerate(options, 1):
+                    suffix = " [推荐]" if option.get("kind") == "preferred" else ""
+                    logger.info("[管理员登录]   %d. %s%s", idx, option["label"], suffix)
+
+                choice = input("选择序号（留空取消）: ").strip()
+                if not choice:
+                    logger.warning("[管理员登录] 已取消")
+                    return None
+                if not choice.isdigit():
+                    raise RuntimeError(f"无效的序号: {choice}")
+
+                selected_index = int(choice) - 1
+                if selected_index < 0 or selected_index >= len(options):
+                    raise RuntimeError(f"序号超出范围: {choice}")
+
+                result = chatgpt.select_workspace_option(options[selected_index]["id"])
+                step = result.get("step")
+                continue
+
+            detail = result.get("detail") or "无法识别管理员登录步骤"
+            raise RuntimeError(detail)
+
+    except KeyboardInterrupt:
+        logger.warning("[管理员登录] 已中断")
+        return None
+    finally:
+        chatgpt.stop()
+
+
+def cmd_main_codex_sync():
+    """交互式同步主号 Codex 认证到 CPA。"""
+    state = get_admin_state_summary()
+    if not state.get("session_present") or not state.get("email"):
+        logger.error("[主号 Codex] 缺少管理员登录态，请先执行 admin-login")
+        return None
+
+    flow = MainCodexSyncFlow()
+    try:
+        logger.info("[主号 Codex] 开始同步: %s", state.get("email"))
+        result = flow.start()
+        step = result.get("step")
+
+        while True:
+            if step == "completed":
+                info = flow.complete()
+                logger.info("[主号 Codex] 同步完成: %s", info.get("email") or state.get("email"))
+                if info.get("plan_type"):
+                    logger.info("[主号 Codex] Plan: %s", info["plan_type"])
+                if info.get("auth_file"):
+                    logger.info("[主号 Codex] Auth 文件: %s", info["auth_file"])
+                return info
+
+            if step == "password_required":
+                password = getpass.getpass("主号密码（留空取消）: ")
+                if not password:
+                    logger.warning("[主号 Codex] 已取消")
+                    return None
+                result = flow.submit_password(password)
+                step = result.get("step")
+                continue
+
+            if step == "code_required":
+                code = input("主号验证码（留空取消）: ").strip()
+                if not code:
+                    logger.warning("[主号 Codex] 已取消")
+                    return None
+                result = flow.submit_code(code)
+                step = result.get("step")
+                continue
+
+            detail = result.get("detail") or "无法识别主号 Codex 登录步骤"
+            raise RuntimeError(detail)
+    except KeyboardInterrupt:
+        logger.warning("[主号 Codex] 已中断")
+        return None
+    finally:
+        flow.stop()
+
+
 def get_team_member_count(chatgpt_api):
     """获取当前 Team 成员数"""
-    path = f"/backend-api/accounts/{CHATGPT_ACCOUNT_ID}/users"
+    account_id = get_chatgpt_account_id()
+    path = f"/backend-api/accounts/{account_id}/users"
     result = chatgpt_api._api_fetch("GET", path)
     if result["status"] != 200:
         return -1
@@ -1188,6 +1444,7 @@ def cmd_fill(target=5):
 
 def cmd_cleanup(max_seats=None):
     """清理多余的 Team 成员，只移除本地 accounts.json 中管理的账号"""
+    account_id = get_chatgpt_account_id()
     accounts = load_accounts()
     local_emails = {a["email"].lower() for a in accounts}
 
@@ -1200,7 +1457,7 @@ def cmd_cleanup(max_seats=None):
 
     try:
         # 获取当前成员列表
-        path = f"/backend-api/accounts/{CHATGPT_ACCOUNT_ID}/users"
+        path = f"/backend-api/accounts/{account_id}/users"
         result = chatgpt._api_fetch("GET", path)
 
         if result["status"] != 200:
@@ -1258,7 +1515,7 @@ def cmd_cleanup(max_seats=None):
             email = m.get("email", "")
             user_id = m.get("user_id") or m.get("id")
 
-            delete_path = f"/backend-api/accounts/{CHATGPT_ACCOUNT_ID}/users/{user_id}"
+            delete_path = f"/backend-api/accounts/{account_id}/users/{user_id}"
             result = chatgpt._api_fetch("DELETE", delete_path)
 
             if result["status"] in (200, 204):
@@ -1268,7 +1525,7 @@ def cmd_cleanup(max_seats=None):
                 logger.error("[清理] 移除 %s 失败: %d", email, result['status'])
 
         # 取消 pending invites 中本地管理的
-        inv_result = chatgpt._api_fetch("GET", f"/backend-api/accounts/{CHATGPT_ACCOUNT_ID}/invites")
+        inv_result = chatgpt._api_fetch("GET", f"/backend-api/accounts/{account_id}/invites")
         if inv_result["status"] == 200:
             inv_data = json.loads(inv_result["body"])
             invites = inv_data if isinstance(inv_data, list) else inv_data.get("invites", inv_data.get("account_invites", []))
@@ -1277,7 +1534,7 @@ def cmd_cleanup(max_seats=None):
                 inv_id = inv.get("id")
                 if inv_email in local_emails and inv_id:
                     del_result = chatgpt._api_fetch("DELETE",
-                        f"/backend-api/accounts/{CHATGPT_ACCOUNT_ID}/invites/{inv_id}")
+                        f"/backend-api/accounts/{account_id}/invites/{inv_id}")
                     if del_result["status"] in (200, 204):
                         logger.info("[清理] 已取消邀请 %s", inv_email)
 
@@ -1302,6 +1559,9 @@ def main():
     rotate_p = sub.add_parser("rotate", help="智能轮转（检查额度 → 移出 → 复用旧号 → 万不得已才创建新号）")
     rotate_p.add_argument("target", type=int, nargs="?", default=5, help="目标成员数（默认 5）")
     sub.add_parser("add", help="手动添加一个新账号")
+    admin_login_p = sub.add_parser("admin-login", help="交互式完成管理员主号登录")
+    admin_login_p.add_argument("--email", help="管理员邮箱；不传则运行时交互输入")
+    sub.add_parser("main-codex-sync", help="交互式同步主号 Codex 到 CPA")
 
     fill_p = sub.add_parser("fill", help="补满 Team 成员到指定数量")
     fill_p.add_argument("target", type=int, nargs="?", default=5, help="目标成员数（默认 5）")
@@ -1329,6 +1589,10 @@ def main():
         cmd_rotate(args.target)
     elif args.command == "add":
         cmd_add()
+    elif args.command == "admin-login":
+        cmd_admin_login(args.email)
+    elif args.command == "main-codex-sync":
+        cmd_main_codex_sync()
     elif args.command == "fill":
         cmd_fill(args.target)
     elif args.command == "cleanup":

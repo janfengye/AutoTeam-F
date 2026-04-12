@@ -125,3 +125,24 @@ def sync_to_cpa():
     final_cpa = list_cpa_files()
     final_local_managed = [f for f in final_cpa if f.get("email", "").lower() in local_emails]
     logger.info("[CPA] CPA 中本地管理: %d, 本地 active: %d", len(final_local_managed), len(active_files))
+
+
+def sync_main_codex_to_cpa(filepath):
+    """同步主号 Codex 认证文件到 CPA。"""
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"主号认证文件不存在: {filepath}")
+
+    name = filepath.name
+    existing = {item.get("name"): item for item in list_cpa_files()}
+
+    for old_name in existing:
+        if old_name and old_name.startswith("codex-main-"):
+            logger.info("[CPA] 删除旧主号文件: %s", old_name)
+            delete_from_cpa(old_name)
+
+    if not upload_to_cpa(filepath):
+        raise RuntimeError(f"上传主号认证文件失败: {name}")
+
+    logger.info("[CPA] 主号 Codex 已同步: %s", name)
+    return {"uploaded": name}
