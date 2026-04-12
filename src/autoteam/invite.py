@@ -16,14 +16,16 @@ ChatGPT Team 自动邀请 + 注册工具
     python invite.py
 """
 
-import sys
-import os
 import logging
-import time
+import os
 import re
-from autoteam.cloudmail import CloudMailClient
-from autoteam.chatgpt_api import ChatGPTTeamAPI
+import sys
+import time
+
 from playwright.sync_api import sync_playwright
+
+from autoteam.chatgpt_api import ChatGPTTeamAPI
+from autoteam.cloudmail import CloudMailClient
 
 logger = logging.getLogger(__name__)
 
@@ -84,37 +86,50 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
     logger.info("[注册] 当前 URL: %s", page.url)
 
     # 可能需要点击 Sign up
-    find_and_click(page, [
-        'button:has-text("Sign up")',
-        'a:has-text("Sign up")',
-        'button:has-text("Create account")',
-        'a:has-text("Create account")',
-        'button:has-text("注册")',
-    ], "注册按钮", timeout=5000)
+    find_and_click(
+        page,
+        [
+            'button:has-text("Sign up")',
+            'a:has-text("Sign up")',
+            'button:has-text("Create account")',
+            'a:has-text("Create account")',
+            'button:has-text("注册")',
+        ],
+        "注册按钮",
+        timeout=5000,
+    )
     time.sleep(3)
     screenshot(page, "reg_02_signup.png")
 
     # 输入邮箱
     logger.info("[注册] 输入邮箱: %s", email)
-    email_input = find_visible(page, [
-        'input[name="email"]',
-        'input[type="email"]',
-        'input[placeholder*="email" i]',
-        'input[id="email"]',
-        '#email-input',
-        'input[autocomplete="email"]',
-    ], "邮箱输入框")
+    email_input = find_visible(
+        page,
+        [
+            'input[name="email"]',
+            'input[type="email"]',
+            'input[placeholder*="email" i]',
+            'input[id="email"]',
+            "#email-input",
+            'input[autocomplete="email"]',
+        ],
+        "邮箱输入框",
+    )
 
     if email_input:
         email_input.fill(email)
         time.sleep(1)
 
         # 点击 Continue
-        find_and_click(page, [
-            'button:has-text("Continue")',
-            'button:has-text("继续")',
-            'button[type="submit"]',
-        ], "继续按钮")
+        find_and_click(
+            page,
+            [
+                'button:has-text("Continue")',
+                'button:has-text("继续")',
+                'button[type="submit"]',
+            ],
+            "继续按钮",
+        )
         time.sleep(5)
         screenshot(page, "reg_03_after_email.png")
     else:
@@ -122,25 +137,35 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
         screenshot(page, "reg_03_no_email_input.png")
 
     # 可能需要输入密码（注册流程）
-    pwd_input = find_visible(page, [
-        'input[name="password"]',
-        'input[type="password"]',
-        'input[id="password"]',
-    ], "密码输入框", timeout=5000)
+    pwd_input = find_visible(
+        page,
+        [
+            'input[name="password"]',
+            'input[type="password"]',
+            'input[id="password"]',
+        ],
+        "密码输入框",
+        timeout=5000,
+    )
 
     if pwd_input:
         if not password:
             import uuid
+
             password = f"Tmp_{uuid.uuid4().hex[:12]}!"
         logger.info("[注册] 设置密码: %s", password)
         pwd_input.fill(password)
         time.sleep(1)
 
-        find_and_click(page, [
-            'button:has-text("Continue")',
-            'button:has-text("继续")',
-            'button[type="submit"]',
-        ], "继续按钮")
+        find_and_click(
+            page,
+            [
+                'button:has-text("Continue")',
+                'button:has-text("继续")',
+                'button[type="submit"]',
+            ],
+            "继续按钮",
+        )
         time.sleep(5)
         screenshot(page, "reg_04_after_password.png")
 
@@ -161,7 +186,7 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
                 if "openai" in sender or "chatgpt" in sender:
                     text = em.get("text", "") or em.get("content", "")
                     # 提取 6 位验证码
-                    code_match = re.search(r'\b(\d{6})\b', text)
+                    code_match = re.search(r"\b(\d{6})\b", text)
                     if code_match:
                         verification_code = code_match.group(1)
                         logger.info("[CloudMail] 收到验证码: %s", verification_code)
@@ -192,13 +217,17 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
                 single_inputs[i].fill(char)
                 time.sleep(0.2)
     else:
-        code_input = find_visible(page, [
-            'input[name="code"]',
-            'input[placeholder*="code" i]',
-            'input[placeholder*="验证" i]',
-            'input[type="text"]',
-            'input[inputmode="numeric"]',
-        ], "验证码输入框")
+        code_input = find_visible(
+            page,
+            [
+                'input[name="code"]',
+                'input[placeholder*="code" i]',
+                'input[placeholder*="验证" i]',
+                'input[type="text"]',
+                'input[inputmode="numeric"]',
+            ],
+            "验证码输入框",
+        )
         if code_input:
             code_input.fill(verification_code)
         else:
@@ -209,24 +238,33 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
     time.sleep(1)
 
     # 点击确认
-    find_and_click(page, [
-        'button:has-text("Continue")',
-        'button:has-text("Verify")',
-        'button:has-text("Submit")',
-        'button[type="submit"]',
-    ], "确认按钮")
+    find_and_click(
+        page,
+        [
+            'button:has-text("Continue")',
+            'button:has-text("Verify")',
+            'button:has-text("Submit")',
+            'button[type="submit"]',
+        ],
+        "确认按钮",
+    )
 
     time.sleep(8)
     screenshot(page, "reg_06_after_code.png")
     logger.info("[注册] 当前 URL: %s", page.url)
 
     # 填写个人信息（全名 + 生日/年龄）
-    name_input = find_visible(page, [
-        'input[name="name"]',
-        'input[placeholder*="name" i]',
-        'input[id="name"]',
-        'input[placeholder*="全名" i]',
-    ], "名字输入框", timeout=5000)
+    name_input = find_visible(
+        page,
+        [
+            'input[name="name"]',
+            'input[placeholder*="name" i]',
+            'input[id="name"]',
+            'input[placeholder*="全名" i]',
+        ],
+        "名字输入框",
+        timeout=5000,
+    )
 
     if name_input:
         name_input.fill("User")
@@ -238,7 +276,7 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
     if len(spinbuttons) >= 3:
         # 类型 A：React Aria DateField（年/月/日 spinbutton）
         try:
-            page.locator('text=生日日期').click()
+            page.locator("text=生日日期").click()
             time.sleep(0.5)
         except Exception:
             pass
@@ -251,38 +289,52 @@ def register_with_invite(page, invite_link, email, mail_client, password=None):
         filled_age = True
     else:
         # 类型 B：普通年龄数字输入框
-        age_input = find_visible(page, [
-            'input[name="age"]',
-            'input[id="age"]',
-            'input[placeholder*="age" i]',
-            'input[placeholder*="年龄" i]',
-            'input[type="number"]',
-        ], "年龄输入框", timeout=3000)
+        age_input = find_visible(
+            page,
+            [
+                'input[name="age"]',
+                'input[id="age"]',
+                'input[placeholder*="age" i]',
+                'input[placeholder*="年龄" i]',
+                'input[type="number"]',
+            ],
+            "年龄输入框",
+            timeout=3000,
+        )
         if age_input:
             age_input.fill("25")
             logger.info("[注册] 填入年龄: 25")
             filled_age = True
 
     if name_input or filled_age:
-        find_and_click(page, [
-            'button:has-text("完成帐户创建")',
-            'button:has-text("Complete")',
-            'button:has-text("Continue")',
-            'button:has-text("Agree")',
-            'button[type="submit"]',
-        ], "完成按钮")
+        find_and_click(
+            page,
+            [
+                'button:has-text("完成帐户创建")',
+                'button:has-text("Complete")',
+                'button:has-text("Continue")',
+                'button:has-text("Agree")',
+                'button[type="submit"]',
+            ],
+            "完成按钮",
+        )
         time.sleep(8)
         screenshot(page, "reg_07_after_profile.png")
 
     # 可能需要接受条款 / 加入 workspace
-    find_and_click(page, [
-        'button:has-text("Accept")',
-        'button:has-text("Agree")',
-        'button:has-text("Join")',
-        'button:has-text("Join workspace")',
-        'button:has-text("加入")',
-        'button:has-text("Accept invite")',
-    ], "加入/接受按钮", timeout=5000)
+    find_and_click(
+        page,
+        [
+            'button:has-text("Accept")',
+            'button:has-text("Agree")',
+            'button:has-text("Join")',
+            'button:has-text("Join workspace")',
+            'button:has-text("加入")',
+            'button:has-text("Accept invite")',
+        ],
+        "加入/接受按钮",
+        timeout=5000,
+    )
     time.sleep(5)
     screenshot(page, "reg_08_final.png")
 

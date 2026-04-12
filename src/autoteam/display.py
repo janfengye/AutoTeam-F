@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 if not os.environ.get("DISPLAY"):
     try:
         from xvfbwrapper import Xvfb
+
         _vdisplay = Xvfb(width=1280, height=800)
         _vdisplay.start()
     except ImportError:

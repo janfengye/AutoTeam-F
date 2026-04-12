@@ -1,9 +1,7 @@
 """ChatGPT Team API 客户端 - 通过 Playwright 绕过 Cloudflare 调用内部 API"""
-import autoteam.display  # noqa: F401
 
 import json
 import logging
-import os
 import re
 import time
 import uuid
@@ -11,6 +9,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
+import autoteam.display  # noqa: F401
 from autoteam.admin_state import (
     get_admin_session_token,
     get_chatgpt_account_id,
@@ -138,15 +137,17 @@ class ChatGPTTeamAPI:
                     "sameSite": "Lax",
                 },
             ]
-        return [{
-            "name": "__Secure-next-auth.session-token",
-            "value": session_token,
-            "domain": domain,
-            "path": "/",
-            "httpOnly": True,
-            "secure": True,
-            "sameSite": "Lax",
-        }]
+        return [
+            {
+                "name": "__Secure-next-auth.session-token",
+                "value": session_token,
+                "domain": domain,
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "Lax",
+            }
+        ]
 
     def _click_auth_button(self, field, labels):
         label_re = re.compile(rf"^(?:{'|'.join(re.escape(label) for label in labels)})$", re.I)
@@ -195,22 +196,26 @@ class ChatGPTTeamAPI:
     def _inject_session(self, session_token):
         cookies = self._build_session_cookies(session_token, "chatgpt.com")
         if self.account_id:
-            cookies.append({
-                "name": "_account",
-                "value": self.account_id,
+            cookies.append(
+                {
+                    "name": "_account",
+                    "value": self.account_id,
+                    "domain": "chatgpt.com",
+                    "path": "/",
+                    "secure": True,
+                    "sameSite": "Lax",
+                }
+            )
+        cookies.append(
+            {
+                "name": "oai-did",
+                "value": self.oai_device_id,
                 "domain": "chatgpt.com",
                 "path": "/",
                 "secure": True,
                 "sameSite": "Lax",
-            })
-        cookies.append({
-            "name": "oai-did",
-            "value": self.oai_device_id,
-            "domain": "chatgpt.com",
-            "path": "/",
-            "secure": True,
-            "sameSite": "Lax",
-        })
+            }
+        )
         self.context.add_cookies(cookies)
         self.session_token = session_token
         logger.info("[ChatGPT] 已注入 session cookies")
@@ -256,7 +261,7 @@ class ChatGPTTeamAPI:
             "创建组织",
         )
 
-        for selector in ('button', '[role="button"]', 'a', '[role="option"]'):
+        for selector in ("button", '[role="button"]', "a", '[role="option"]'):
             try:
                 for loc in self.page.locator(selector).all():
                     try:
@@ -274,11 +279,13 @@ class ChatGPTTeamAPI:
                     if len(text) > 80:
                         continue
                     kind = "fallback" if any(key in text_l for key in exclude_keywords) else "preferred"
-                    candidates.append({
-                        "id": str(len(candidates)),
-                        "label": text,
-                        "kind": kind,
-                    })
+                    candidates.append(
+                        {
+                            "id": str(len(candidates)),
+                            "label": text,
+                            "kind": kind,
+                        }
+                    )
             except Exception:
                 pass
 
@@ -301,7 +308,7 @@ class ChatGPTTeamAPI:
             # 重新按同样顺序扫描并点击对应索引
             current_options = []
             seen_texts = set()
-            for selector in ('button', '[role="button"]', 'a', '[role="option"]'):
+            for selector in ("button", '[role="button"]', "a", '[role="option"]'):
                 try:
                     for loc in self.page.locator(selector).all():
                         try:
@@ -456,7 +463,7 @@ class ChatGPTTeamAPI:
 
     def _guess_account_info(self):
         try:
-            data = self.page.evaluate('''async () => {
+            data = self.page.evaluate("""async () => {
                 const out = {};
                 for (const path of ['/backend-api/accounts', '/backend-api/me', '/api/auth/session']) {
                     try {
@@ -467,7 +474,7 @@ class ChatGPTTeamAPI:
                     }
                 }
                 return out;
-            }''')
+            }""")
         except Exception:
             data = {}
 
@@ -478,11 +485,13 @@ class ChatGPTTeamAPI:
                 account_id = node.get("account_id") or node.get("id")
                 name = node.get("workspace_name") or node.get("name") or node.get("display_name")
                 if isinstance(account_id, str) and len(account_id) >= 8:
-                    candidates.append({
-                        "account_id": account_id,
-                        "workspace_name": name or "",
-                        "type": str(node.get("type", "")),
-                    })
+                    candidates.append(
+                        {
+                            "account_id": account_id,
+                            "workspace_name": name or "",
+                            "type": str(node.get("type", "")),
+                        }
+                    )
                 for value in node.values():
                     walk(value)
             elif isinstance(node, list):
@@ -502,7 +511,7 @@ class ChatGPTTeamAPI:
         try:
             self.page.goto("https://chatgpt.com/admin", wait_until="domcontentloaded", timeout=30000)
             time.sleep(5)
-            dom_name = self.page.evaluate('''() => {
+            dom_name = self.page.evaluate("""() => {
                 const headings = document.querySelectorAll('h1, h2, h3, [class*="title"], [class*="name"]');
                 for (const h of headings) {
                     const text = h.textContent.trim();
@@ -512,7 +521,7 @@ class ChatGPTTeamAPI:
                     }
                 }
                 return null;
-            }''')
+            }""")
         except Exception:
             dom_name = None
 
@@ -577,14 +586,17 @@ class ChatGPTTeamAPI:
             logger.warning("[ChatGPT] 未能自动获取 workspace 名称：account_id 缺失")
             return ""
 
-        result = self.page.evaluate('''async (accountId) => {
+        result = self.page.evaluate(
+            """async (accountId) => {
             try {
                 const resp = await fetch("/backend-api/accounts/" + accountId + "/settings", {
                     headers: { "chatgpt-account-id": accountId }
                 });
                 return await resp.json();
             } catch(e) { return null; }
-        }''', self.account_id)
+        }""",
+            self.account_id,
+        )
 
         if result and result.get("workspace_name"):
             self.workspace_name = result["workspace_name"]
@@ -595,7 +607,7 @@ class ChatGPTTeamAPI:
         try:
             self.page.goto("https://chatgpt.com/admin", wait_until="domcontentloaded", timeout=30000)
             time.sleep(5)
-            name = self.page.evaluate('''() => {
+            name = self.page.evaluate("""() => {
                 const headings = document.querySelectorAll('h1, h2, h3, [class*="title"], [class*="name"]');
                 for (const h of headings) {
                     const text = h.textContent.trim();
@@ -605,7 +617,7 @@ class ChatGPTTeamAPI:
                     }
                 }
                 return null;
-            }''')
+            }""")
             if name:
                 self.workspace_name = name
                 update_admin_state(workspace_name=self.workspace_name, account_id=self.account_id)
@@ -618,7 +630,7 @@ class ChatGPTTeamAPI:
         return ""
 
     def _fetch_access_token(self):
-        result = self.page.evaluate('''async () => {
+        result = self.page.evaluate("""async () => {
             try {
                 const resp = await fetch("/api/auth/session");
                 const data = await resp.json();
@@ -626,7 +638,7 @@ class ChatGPTTeamAPI:
             } catch(e) {
                 return { ok: false, error: e.message };
             }
-        }''')
+        }""")
 
         if result.get("ok") and "accessToken" in result.get("data", {}):
             self.access_token = result["data"]["accessToken"]
@@ -643,7 +655,7 @@ class ChatGPTTeamAPI:
         self.page.goto("https://chatgpt.com/", wait_until="networkidle", timeout=60000)
         time.sleep(10)
 
-        token = self.page.evaluate('''() => {
+        token = self.page.evaluate("""() => {
             try {
                 const keys = Object.keys(localStorage);
                 for (const key of keys) {
@@ -654,7 +666,7 @@ class ChatGPTTeamAPI:
                 }
             } catch(e) {}
             return null;
-        }''')
+        }""")
 
         if token:
             self.access_token = token
@@ -672,7 +684,7 @@ class ChatGPTTeamAPI:
         if self.access_token:
             headers_js["authorization"] = f"Bearer {self.access_token}"
 
-        js_code = '''async ([method, url, headers, body]) => {
+        js_code = """async ([method, url, headers, body]) => {
             try {
                 const opts = { method, headers };
                 if (body) opts.body = body;
@@ -682,7 +694,7 @@ class ChatGPTTeamAPI:
             } catch(e) {
                 return { status: 0, body: e.message };
             }
-        }'''
+        }"""
 
         return self.page.evaluate(
             js_code,
@@ -731,7 +743,7 @@ class ChatGPTTeamAPI:
         if result["status"] == 200:
             logger.info("[ChatGPT] seat_type 已改为 %s", seat_type)
         else:
-            logger.error("[ChatGPT] 修改 seat_type 失败: %d %s", result['status'], result['body'][:200])
+            logger.error("[ChatGPT] 修改 seat_type 失败: %d %s", result["status"], result["body"][:200])
 
     def list_invites(self):
         path = f"/backend-api/accounts/{self.account_id}/invites"

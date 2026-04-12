@@ -8,10 +8,10 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 ACCOUNTS_FILE = PROJECT_ROOT / "accounts.json"
 
 # 账号状态
-STATUS_ACTIVE = "active"        # 在 team 中，额度可用
+STATUS_ACTIVE = "active"  # 在 team 中，额度可用
 STATUS_EXHAUSTED = "exhausted"  # 在 team 中，额度用完
-STATUS_STANDBY = "standby"      # 已移出 team，等待额度恢复
-STATUS_PENDING = "pending"      # 已邀请，等待注册完成
+STATUS_STANDBY = "standby"  # 已移出 team，等待额度恢复
+STATUS_PENDING = "pending"  # 已邀请，等待注册完成
 
 
 def load_accounts():
@@ -40,17 +40,19 @@ def add_account(email, password, cloudmail_account_id=None):
     if find_account(accounts, email):
         return  # 已存在
 
-    accounts.append({
-        "email": email,
-        "password": password,
-        "cloudmail_account_id": cloudmail_account_id,
-        "status": STATUS_PENDING,
-        "auth_file": None,          # CPA 认证文件路径
-        "quota_exhausted_at": None,  # 额度用完的时间
-        "quota_resets_at": None,     # 额度恢复时间
-        "created_at": time.time(),
-        "last_active_at": None,
-    })
+    accounts.append(
+        {
+            "email": email,
+            "password": password,
+            "cloudmail_account_id": cloudmail_account_id,
+            "status": STATUS_PENDING,
+            "auth_file": None,  # CPA 认证文件路径
+            "quota_exhausted_at": None,  # 额度用完的时间
+            "quota_resets_at": None,  # 额度恢复时间
+            "created_at": time.time(),
+            "last_active_at": None,
+        }
+    )
     save_accounts(accounts)
 
 

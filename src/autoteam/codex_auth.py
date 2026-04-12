@@ -1,18 +1,19 @@
 """Codex 认证管理 - OAuth 登录、token 管理、保存 CPA 兼容认证文件"""
-import autoteam.display  # noqa: F401
 
-import json
-import hashlib
-import logging
-import time
 import base64
+import hashlib
+import json
+import logging
 import os
 import re
 import secrets
+import time
 import urllib.parse
 from pathlib import Path
+
 from playwright.sync_api import sync_playwright
 
+import autoteam.display  # noqa: F401
 from autoteam.admin_state import (
     get_admin_email,
     get_admin_password,
@@ -39,9 +40,7 @@ CODEX_REDIRECT_URI = f"http://localhost:{CODEX_CALLBACK_PORT}/auth/callback"
 def _generate_pkce():
     """生成 PKCE code_verifier 和 code_challenge"""
     verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
-    challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(verifier.encode()).digest()
-    ).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     return verifier, challenge
 
 
@@ -83,13 +82,17 @@ def _exchange_auth_code(auth_code, code_verifier, fallback_email=None):
 
     import requests
 
-    resp = requests.post(CODEX_TOKEN_URL, data={
-        "grant_type": "authorization_code",
-        "client_id": CODEX_CLIENT_ID,
-        "code": auth_code,
-        "redirect_uri": CODEX_REDIRECT_URI,
-        "code_verifier": code_verifier,
-    }, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    resp = requests.post(
+        CODEX_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": CODEX_CLIENT_ID,
+            "code": auth_code,
+            "redirect_uri": CODEX_REDIRECT_URI,
+            "code_verifier": code_verifier,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
 
     if resp.status_code != 200:
         logger.error("[Codex] Token 交换失败: %d %s", resp.status_code, resp.text[:200])
@@ -216,21 +219,26 @@ def login_codex_via_browser(email, password, mail_client=None):
         # === Step 0: 先登录 ChatGPT 并切换到 Team workspace ===
         # 登录前就注入 _account cookie，引导登录流程进入 Team workspace
         if chatgpt_account_id:
-            context.add_cookies([{
-                "name": "_account",
-                "value": chatgpt_account_id,
-                "domain": "chatgpt.com",
-                "path": "/",
-                "secure": True,
-                "sameSite": "Lax",
-            }, {
-                "name": "_account",
-                "value": chatgpt_account_id,
-                "domain": "auth.openai.com",
-                "path": "/",
-                "secure": True,
-                "sameSite": "Lax",
-            }])
+            context.add_cookies(
+                [
+                    {
+                        "name": "_account",
+                        "value": chatgpt_account_id,
+                        "domain": "chatgpt.com",
+                        "path": "/",
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                    {
+                        "name": "_account",
+                        "value": chatgpt_account_id,
+                        "domain": "auth.openai.com",
+                        "path": "/",
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                ]
+            )
             logger.debug("[Codex] 登录前已注入 _account cookie = %s", chatgpt_account_id)
 
         logger.info("[Codex] 先登录 ChatGPT 选择 Team workspace...")
@@ -239,7 +247,7 @@ def login_codex_via_browser(email, password, mail_client=None):
         time.sleep(5)
 
         # Cloudflare
-        for i in range(12):
+        for _i in range(12):
             if "verify you are human" not in _page.content()[:2000].lower():
                 break
             time.sleep(5)
@@ -278,13 +286,14 @@ def login_codex_via_browser(email, password, mail_client=None):
             ci = _page.locator('input[name="code"]').first
             if ci.is_visible(timeout=5000) and mail_client:
                 import re as _re2
+
                 logger.info("[Codex] ChatGPT 登录需要验证码...")
                 otp = None
                 t0 = time.time()
                 while time.time() - t0 < 120:
                     for em in mail_client.search_emails_by_recipient(email, size=10):
                         text = em.get("text", "") or em.get("content", "")
-                        m = _re2.search(r'\b(\d{6})\b', text)
+                        m = _re2.search(r"\b(\d{6})\b", text)
                         if m:
                             otp = m.group(1)
                             break
@@ -379,7 +388,7 @@ def login_codex_via_browser(email, password, mail_client=None):
                 if not _is_google_redirect(page):
                     break
 
-                _screenshot(page, f"codex_02_google_redirect_attempt{attempt+1}.png")
+                _screenshot(page, f"codex_02_google_redirect_attempt{attempt + 1}.png")
                 logger.warning("[Codex] 邮箱步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
                 page.go_back(wait_until="domcontentloaded", timeout=30000)
                 time.sleep(2)
@@ -402,7 +411,7 @@ def login_codex_via_browser(email, password, mail_client=None):
                 if not _is_google_redirect(page):
                     break
 
-                _screenshot(page, f"codex_03_google_redirect_attempt{attempt+1}.png")
+                _screenshot(page, f"codex_03_google_redirect_attempt{attempt + 1}.png")
                 logger.warning("[Codex] 密码步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
                 page.go_back(wait_until="domcontentloaded", timeout=30000)
                 time.sleep(2)
@@ -414,7 +423,9 @@ def login_codex_via_browser(email, password, mail_client=None):
         _screenshot(page, "codex_03b_check_otp.png")
         code_input = None
         try:
-            code_input = page.locator('input[name="code"], input[placeholder*="验证码"], input[placeholder*="code" i]').first
+            code_input = page.locator(
+                'input[name="code"], input[placeholder*="验证码"], input[placeholder*="code" i]'
+            ).first
             if not code_input.is_visible(timeout=5000):
                 code_input = None
         except Exception:
@@ -423,6 +434,7 @@ def login_codex_via_browser(email, password, mail_client=None):
         if code_input and mail_client:
             logger.info("[Codex] 需要登录验证码，从 CloudMail 获取...")
             import re as _re
+
             start_t = time.time()
             otp_code = None
             while time.time() - start_t < 120:
@@ -432,7 +444,7 @@ def login_codex_via_browser(email, password, mail_client=None):
                     if "invited" in subj or "invitation" in subj:
                         continue
                     text = em.get("text", "") or em.get("content", "")
-                    match = _re.search(r'\b(\d{6})\b', text)
+                    match = _re.search(r"\b(\d{6})\b", text)
                     if match:
                         otp_code = match.group(1)
                         break
@@ -444,7 +456,9 @@ def login_codex_via_browser(email, password, mail_client=None):
                 logger.info("[Codex] 获取到验证码: %s", otp_code)
                 code_input.fill(otp_code)
                 time.sleep(0.5)
-                page.locator('button:has-text("Continue"), button:has-text("继续"), button[type="submit"]').first.click()
+                page.locator(
+                    'button:has-text("Continue"), button:has-text("继续"), button[type="submit"]'
+                ).first.click()
                 time.sleep(5)
                 _screenshot(page, "codex_03c_after_otp.png")
             else:
@@ -465,7 +479,7 @@ def login_codex_via_browser(email, password, mail_client=None):
                 if len(spinbuttons) >= 3:
                     # 类型 A：React Aria DateField
                     try:
-                        page.locator('text=生日日期').click()
+                        page.locator("text=生日日期").click()
                         time.sleep(0.5)
                     except Exception:
                         pass
@@ -486,7 +500,9 @@ def login_codex_via_browser(email, password, mail_client=None):
                         logger.warning("[Codex] 未找到年龄/生日输入框")
 
                 time.sleep(0.5)
-                page.locator('button:has-text("继续"), button:has-text("Continue"), button:has-text("完成帐户创建"), button[type="submit"]').first.click()
+                page.locator(
+                    'button:has-text("继续"), button:has-text("Continue"), button:has-text("完成帐户创建"), button[type="submit"]'
+                ).first.click()
                 time.sleep(5)
                 _screenshot(page, "codex_03d_after_aboutyou.png")
                 logger.info("[Codex] about-you 完成，当前 URL: %s", page.url)
@@ -498,11 +514,11 @@ def login_codex_via_browser(email, password, mail_client=None):
             if auth_code:
                 break
 
-            _screenshot(page, f"codex_04_step{step+1}_before.png")
+            _screenshot(page, f"codex_04_step{step + 1}_before.png")
 
             # 在任何页面中，如果有 workspace/组织选择，先选 Team
             try:
-                page_text = page.inner_text("body")[:1000]
+                _ = page.inner_text("body")[:1000]  # noqa: F841 — trigger page load
 
                 # 选择 Team workspace（用配置的名称精确匹配）
                 workspace_name = get_chatgpt_workspace_name()
@@ -518,7 +534,7 @@ def login_codex_via_browser(email, password, mail_client=None):
 
                 # Organization 页面的下拉选择
                 if "organization" in page.url:
-                    dropdown = page.locator('[aria-expanded], [aria-haspopup]').first
+                    dropdown = page.locator("[aria-expanded], [aria-haspopup]").first
                     if dropdown.is_visible(timeout=2000):
                         dropdown.click()
                         time.sleep(1)
@@ -541,13 +557,14 @@ def login_codex_via_browser(email, password, mail_client=None):
                 otp_input = page.locator('input[name="code"], input[inputmode="numeric"]').first
                 if otp_input.is_visible(timeout=2000) and mail_client:
                     import re as _re3
+
                     logger.info("[Codex] 需要邮箱验证码 (step %d)...", step + 1)
                     otp = None
                     t0 = time.time()
                     while time.time() - t0 < 120:
                         for em in mail_client.search_emails_by_recipient(email, size=10):
                             text = em.get("text", "") or em.get("content", "")
-                            m = _re3.search(r'\b(\d{6})\b', text)
+                            m = _re3.search(r"\b(\d{6})\b", text)
                             if m:
                                 otp = m.group(1)
                                 break
@@ -557,7 +574,9 @@ def login_codex_via_browser(email, password, mail_client=None):
                     if otp:
                         otp_input.fill(otp)
                         time.sleep(0.5)
-                        page.locator('button[type="submit"], button:has-text("Continue"), button:has-text("继续")').first.click()
+                        page.locator(
+                            'button[type="submit"], button:has-text("Continue"), button:has-text("继续")'
+                        ).first.click()
                         time.sleep(5)
                         logger.info("[Codex] 已输入验证码: %s", otp)
                         continue  # 重新循环检查下一个页面
@@ -565,12 +584,14 @@ def login_codex_via_browser(email, password, mail_client=None):
                 pass
 
             try:
-                consent_btn = page.locator('button:has-text("继续"), button:has-text("Continue"), button:has-text("Allow")').first
+                consent_btn = page.locator(
+                    'button:has-text("继续"), button:has-text("Continue"), button:has-text("Allow")'
+                ).first
                 if consent_btn.is_visible(timeout=5000):
                     logger.info("[Codex] 点击同意/继续按钮 (step %d)...", step + 1)
                     consent_btn.click()
                     time.sleep(5)
-                    _screenshot(page, f"codex_04_consent_{step+1}.png")
+                    _screenshot(page, f"codex_04_consent_{step + 1}.png")
                 else:
                     break
             except Exception:
@@ -627,55 +648,61 @@ def login_codex_via_session():
             return None
         cookies = []
         if len(session_token) > 3800:
-            cookies.extend([
-                {
-                    "name": "__Secure-next-auth.session-token.0",
-                    "value": session_token[:3800],
-                    "domain": "auth.openai.com",
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                    "sameSite": "Lax",
-                },
-                {
-                    "name": "__Secure-next-auth.session-token.1",
-                    "value": session_token[3800:],
-                    "domain": "auth.openai.com",
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                    "sameSite": "Lax",
-                },
-            ])
+            cookies.extend(
+                [
+                    {
+                        "name": "__Secure-next-auth.session-token.0",
+                        "value": session_token[:3800],
+                        "domain": "auth.openai.com",
+                        "path": "/",
+                        "httpOnly": True,
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                    {
+                        "name": "__Secure-next-auth.session-token.1",
+                        "value": session_token[3800:],
+                        "domain": "auth.openai.com",
+                        "path": "/",
+                        "httpOnly": True,
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                ]
+            )
         else:
-            cookies.append({
-                "name": "__Secure-next-auth.session-token",
-                "value": session_token,
-                "domain": "auth.openai.com",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "Lax",
-            })
+            cookies.append(
+                {
+                    "name": "__Secure-next-auth.session-token",
+                    "value": session_token,
+                    "domain": "auth.openai.com",
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "Lax",
+                }
+            )
 
-        cookies.extend([
-            {
-                "name": "_account",
-                "value": chatgpt.account_id,
-                "domain": "auth.openai.com",
-                "path": "/",
-                "secure": True,
-                "sameSite": "Lax",
-            },
-            {
-                "name": "oai-did",
-                "value": chatgpt.oai_device_id,
-                "domain": "auth.openai.com",
-                "path": "/",
-                "secure": True,
-                "sameSite": "Lax",
-            },
-        ])
+        cookies.extend(
+            [
+                {
+                    "name": "_account",
+                    "value": chatgpt.account_id,
+                    "domain": "auth.openai.com",
+                    "path": "/",
+                    "secure": True,
+                    "sameSite": "Lax",
+                },
+                {
+                    "name": "oai-did",
+                    "value": chatgpt.oai_device_id,
+                    "domain": "auth.openai.com",
+                    "path": "/",
+                    "secure": True,
+                    "sameSite": "Lax",
+                },
+            ]
+        )
         chatgpt.context.add_cookies(cookies)
         page = chatgpt.context.new_page()
 
@@ -874,55 +901,63 @@ class MainCodexSyncFlow:
     def _inject_auth_cookies(self):
         cookies = []
         if len(self.session_token) > 3800:
-            cookies.extend([
-                {
-                    "name": "__Secure-next-auth.session-token.0",
-                    "value": self.session_token[:3800],
-                    "domain": "auth.openai.com",
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                    "sameSite": "Lax",
-                },
-                {
-                    "name": "__Secure-next-auth.session-token.1",
-                    "value": self.session_token[3800:],
-                    "domain": "auth.openai.com",
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                    "sameSite": "Lax",
-                },
-            ])
+            cookies.extend(
+                [
+                    {
+                        "name": "__Secure-next-auth.session-token.0",
+                        "value": self.session_token[:3800],
+                        "domain": "auth.openai.com",
+                        "path": "/",
+                        "httpOnly": True,
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                    {
+                        "name": "__Secure-next-auth.session-token.1",
+                        "value": self.session_token[3800:],
+                        "domain": "auth.openai.com",
+                        "path": "/",
+                        "httpOnly": True,
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                ]
+            )
         else:
-            cookies.append({
-                "name": "__Secure-next-auth.session-token",
-                "value": self.session_token,
-                "domain": "auth.openai.com",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "Lax",
-            })
+            cookies.append(
+                {
+                    "name": "__Secure-next-auth.session-token",
+                    "value": self.session_token,
+                    "domain": "auth.openai.com",
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "Lax",
+                }
+            )
 
         if self.account_id:
-            cookies.append({
-                "name": "_account",
-                "value": self.account_id,
+            cookies.append(
+                {
+                    "name": "_account",
+                    "value": self.account_id,
+                    "domain": "auth.openai.com",
+                    "path": "/",
+                    "secure": True,
+                    "sameSite": "Lax",
+                }
+            )
+
+        cookies.append(
+            {
+                "name": "oai-did",
+                "value": self.chatgpt.oai_device_id,
                 "domain": "auth.openai.com",
                 "path": "/",
                 "secure": True,
                 "sameSite": "Lax",
-            })
-
-        cookies.append({
-            "name": "oai-did",
-            "value": self.chatgpt.oai_device_id,
-            "domain": "auth.openai.com",
-            "path": "/",
-            "secure": True,
-            "sameSite": "Lax",
-        })
+            }
+        )
         self.chatgpt.context.add_cookies(cookies)
 
     def _click_workspace_or_consent(self):
@@ -1166,12 +1201,16 @@ def refresh_access_token(refresh_token):
     """刷新 access token"""
     import requests
 
-    resp = requests.post(CODEX_TOKEN_URL, data={
-        "grant_type": "refresh_token",
-        "client_id": CODEX_CLIENT_ID,
-        "refresh_token": refresh_token,
-        "scope": "openid profile email",
-    }, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    resp = requests.post(
+        CODEX_TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "client_id": CODEX_CLIENT_ID,
+            "refresh_token": refresh_token,
+            "scope": "openid profile email",
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
 
     if resp.status_code != 200:
         logger.error("[Codex] Token 刷新失败: %d", resp.status_code)

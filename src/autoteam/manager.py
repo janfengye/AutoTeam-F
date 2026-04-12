@@ -18,27 +18,39 @@ import autoteam.display  # noqa: F401 — 自动设置虚拟显示器
     python manager.py status    # 查看所有账号状态
 """
 
-import sys
-import os
-import json
 import getpass
+import json
 import logging
+import os
+import sys
 import time
 from pathlib import Path
 
+from autoteam.account_ops import delete_managed_account, fetch_team_state
 from autoteam.accounts import (
-    load_accounts, save_accounts, find_account, add_account, update_account,
-    get_active_accounts, get_standby_accounts, get_next_reusable_account,
-    STATUS_ACTIVE, STATUS_EXHAUSTED, STATUS_STANDBY, STATUS_PENDING,
+    STATUS_ACTIVE,
+    STATUS_EXHAUSTED,
+    STATUS_PENDING,
+    STATUS_STANDBY,
+    add_account,
+    find_account,
+    get_next_reusable_account,
+    get_standby_accounts,
+    load_accounts,
+    save_accounts,
+    update_account,
 )
-from autoteam.admin_state import get_chatgpt_account_id, get_admin_state_summary
+from autoteam.admin_state import get_admin_state_summary, get_chatgpt_account_id
 from autoteam.chatgpt_api import ChatGPTTeamAPI
 from autoteam.cloudmail import CloudMailClient
-from autoteam.account_ops import delete_managed_account, fetch_team_state
 from autoteam.codex_auth import (
-    login_codex_via_browser, save_auth_file, check_codex_quota,
-    refresh_access_token, _click_primary_auth_button, _is_google_redirect,
     MainCodexSyncFlow,
+    _click_primary_auth_button,
+    _is_google_redirect,
+    check_codex_quota,
+    login_codex_via_browser,
+    refresh_access_token,
+    save_auth_file,
 )
 from autoteam.cpa_sync import sync_to_cpa
 
@@ -80,6 +92,7 @@ def sync_account_states(chatgpt_api=None):
 
     # 对照更新状态
     from autoteam.config import CLOUDMAIL_DOMAIN
+
     domain_suffix = CLOUDMAIL_DOMAIN.lstrip("@") if CLOUDMAIL_DOMAIN else ""
 
     changed = False
@@ -100,17 +113,19 @@ def sync_account_states(chatgpt_api=None):
     if domain_suffix:
         for email in team_emails:
             if domain_suffix in email and email not in local_email_set:
-                accounts.append({
-                    "email": email,
-                    "password": "",
-                    "cloudmail_account_id": None,
-                    "status": STATUS_ACTIVE,
-                    "auth_file": None,
-                    "quota_exhausted_at": None,
-                    "quota_resets_at": None,
-                    "created_at": time.time(),
-                    "last_active_at": None,
-                })
+                accounts.append(
+                    {
+                        "email": email,
+                        "password": "",
+                        "cloudmail_account_id": None,
+                        "status": STATUS_ACTIVE,
+                        "auth_file": None,
+                        "quota_exhausted_at": None,
+                        "quota_resets_at": None,
+                        "created_at": time.time(),
+                        "last_active_at": None,
+                    }
+                )
                 changed = True
                 logger.info("[同步] 发现 Team 中新成员: %s（已添加到本地）", email)
 
@@ -167,8 +182,16 @@ def _print_status_table(accounts, quota_cache=None):
             w_val = 100 - qi.get("weekly_pct", 0)
             p_pct = Text(f"{p_val}%", style="green" if p_val > 30 else "yellow" if p_val > 0 else "red")
             w_pct = Text(f"{w_val}%", style="green" if w_val > 30 else "yellow" if w_val > 0 else "red")
-            p_reset = time.strftime("%m-%d %H:%M", time.localtime(qi["primary_resets_at"])) if qi.get("primary_resets_at") else "-"
-            w_reset = time.strftime("%m-%d %H:%M", time.localtime(qi["weekly_resets_at"])) if qi.get("weekly_resets_at") else "-"
+            p_reset = (
+                time.strftime("%m-%d %H:%M", time.localtime(qi["primary_resets_at"]))
+                if qi.get("primary_resets_at")
+                else "-"
+            )
+            w_reset = (
+                time.strftime("%m-%d %H:%M", time.localtime(qi["weekly_resets_at"]))
+                if qi.get("weekly_resets_at")
+                else "-"
+            )
         else:
             p_pct = Text("-", style="dim")
             w_pct = Text("-", style="dim")
@@ -176,9 +199,13 @@ def _print_status_table(accounts, quota_cache=None):
             w_reset = "-"
 
         table.add_row(
-            str(idx), email, status_text,
-            p_pct, w_pct,
-            Text(p_reset, style="dim"), Text(w_reset, style="dim"),
+            str(idx),
+            email,
+            status_text,
+            p_pct,
+            w_pct,
+            Text(p_reset, style="dim"),
+            Text(w_reset, style="dim"),
         )
 
     console.print()
@@ -208,7 +235,9 @@ def cmd_status():
 
     # active 账号实时查询额度
     quota_cache = {}
-    active_count = sum(1 for a in accounts if a["status"] == STATUS_ACTIVE and a.get("auth_file") and Path(a["auth_file"]).exists())
+    active_count = sum(
+        1 for a in accounts if a["status"] == STATUS_ACTIVE and a.get("auth_file") and Path(a["auth_file"]).exists()
+    )
     if active_count:
         logger.info("[状态] 查询 %d 个 active 账号额度...", active_count)
     for acc in accounts:
@@ -261,10 +290,12 @@ def _check_and_refresh(acc):
 
 def cmd_check():
     """只检查 active 账号的额度，无认证文件或 auth_error 的自动重新登录 Codex"""
-    from autoteam.config import CLOUDMAIL_DOMAIN, AUTO_CHECK_THRESHOLD
+    from autoteam.config import AUTO_CHECK_THRESHOLD, CLOUDMAIL_DOMAIN
+
     # API 运行时配置优先（前端可修改）
     try:
         from autoteam.api import _auto_check_config
+
         threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
     except ImportError:
         threshold = AUTO_CHECK_THRESHOLD
@@ -282,10 +313,7 @@ def cmd_check():
             chatgpt.start()
             members, invites = fetch_team_state(chatgpt)
             team_emails = {(m.get("email", "") or "").lower() for m in members}
-            invite_emails = {
-                ((inv.get("email_address") or inv.get("email") or "")).lower()
-                for inv in invites
-            }
+            invite_emails = {(inv.get("email_address") or inv.get("email") or "").lower() for inv in invites}
 
             for acc in pending_accounts:
                 email = acc["email"]
@@ -366,23 +394,32 @@ def cmd_check():
                     # 低于阈值视为用完
                     if p_remain < threshold:
                         resets_at = p_reset or (time.time() + 18000)
-                        logger.warning("[%s] 5h剩余 %d%% < %d%%，标记为 exhausted (重置 %s)",
-                                       email, p_remain, threshold, p_time)
-                        update_account(email,
+                        logger.warning(
+                            "[%s] 5h剩余 %d%% < %d%%，标记为 exhausted (重置 %s)", email, p_remain, threshold, p_time
+                        )
+                        update_account(
+                            email,
                             status=STATUS_EXHAUSTED,
                             quota_exhausted_at=time.time(),
                             quota_resets_at=resets_at,
                         )
                         exhausted_list.append(acc)
                     else:
-                        logger.info("[%s] 额度可用 - 5h剩余: %d%% (重置 %s) | 周剩余: %d%% (重置 %s)",
-                                    email, p_remain, p_time, w_remain, w_time)
+                        logger.info(
+                            "[%s] 额度可用 - 5h剩余: %d%% (重置 %s) | 周剩余: %d%% (重置 %s)",
+                            email,
+                            p_remain,
+                            p_time,
+                            w_remain,
+                            w_time,
+                        )
                 else:
                     logger.info("[%s] 额度可用", email)
             elif status_str == "exhausted":
                 resets_at = info
                 logger.warning("[%s] 额度已用完", email)
-                update_account(email,
+                update_account(
+                    email,
                     status=STATUS_EXHAUSTED,
                     quota_exhausted_at=time.time(),
                     quota_resets_at=resets_at,
@@ -398,9 +435,11 @@ def cmd_check():
                         p_remain = 100 - lq.get("primary_pct", 0)
                         if p_remain < threshold:
                             resets_at = p_resets or (time.time() + 18000)
-                            logger.warning("[%s] token 失效，历史额度 %d%% < %d%%，直接标记 exhausted",
-                                           email, p_remain, threshold)
-                            update_account(email,
+                            logger.warning(
+                                "[%s] token 失效，历史额度 %d%% < %d%%，直接标记 exhausted", email, p_remain, threshold
+                            )
+                            update_account(
+                                email,
                                 status=STATUS_EXHAUSTED,
                                 quota_exhausted_at=time.time(),
                                 quota_resets_at=resets_at,
@@ -416,7 +455,7 @@ def cmd_check():
     if no_auth_list:
         logger.info("[检查] 发现 %d 个 active 账号无认证文件，需要登录 Codex:", len(no_auth_list))
         for a in no_auth_list:
-            logger.info("[检查]   %s", a['email'])
+            logger.info("[检查]   %s", a["email"])
         auth_error_list.extend(no_auth_list)
 
     # auth_error + 无认证文件的统一重新登录 Codex
@@ -434,10 +473,10 @@ def cmd_check():
                 update_account(email, auth_file=auth_file)
                 logger.info("[%s] token 已更新", email)
                 # 重新检查额度
-                status_str, info = _check_and_refresh(
-                    find_account(load_accounts(), email))
+                status_str, info = _check_and_refresh(find_account(load_accounts(), email))
                 if status_str == "exhausted":
-                    update_account(email,
+                    update_account(
+                        email,
                         status=STATUS_EXHAUSTED,
                         quota_exhausted_at=time.time(),
                         quota_resets_at=info,
@@ -450,7 +489,8 @@ def cmd_check():
                     if p_remain < threshold:
                         resets_at = info.get("primary_resets_at") or (time.time() + 18000)
                         logger.warning("[%s] 5h剩余 %d%% < %d%%，标记为 exhausted", email, p_remain, threshold)
-                        update_account(email,
+                        update_account(
+                            email,
                             status=STATUS_EXHAUSTED,
                             quota_exhausted_at=time.time(),
                             quota_resets_at=resets_at,
@@ -478,7 +518,7 @@ def remove_from_team(chatgpt_api, email):
     result = chatgpt_api._api_fetch("GET", path)
 
     if result["status"] != 200:
-        logger.error("[Team] 获取成员列表失败: %d", result['status'])
+        logger.error("[Team] 获取成员列表失败: %d", result["status"])
         return False
 
     try:
@@ -509,7 +549,7 @@ def remove_from_team(chatgpt_api, email):
         logger.info("[Team] 已将 %s 移出 Team", email)
         return True
     else:
-        logger.error("[Team] 移除 %s 失败: %d %s", email, result['status'], result['body'][:200])
+        logger.error("[Team] 移除 %s 失败: %d %s", email, result["status"], result["body"][:200])
         return False
 
 
@@ -531,8 +571,9 @@ def invite_to_team(chatgpt_api, email, seat_type="default"):
 
 def _complete_registration(email, password, invite_link, mail_client):
     """完成注册 + Codex 登录（从已有邀请链接继续）"""
-    from autoteam.invite import register_with_invite
     from playwright.sync_api import sync_playwright
+
+    from autoteam.invite import register_with_invite
 
     logger.info("[注册] 开始注册 %s...", email)
     with sync_playwright() as p:
@@ -642,8 +683,9 @@ def _is_email_in_team(email):
 
 def _register_direct_once(mail_client, email, password):
     """执行一次直接注册，返回是否完成注册并进入 Team。"""
-    from autoteam.invite import screenshot
     from playwright.sync_api import sync_playwright
+
+    from autoteam.invite import screenshot
 
     logger.info("[直接注册] %s", email)
     signup_url = "https://chatgpt.com/auth/login"
@@ -698,7 +740,7 @@ def _register_direct_once(mail_client, email, password):
                 if not _is_google_redirect(page):
                     break
 
-                screenshot(page, f"direct_03_google_redirect_attempt{attempt+1}.png")
+                screenshot(page, f"direct_03_google_redirect_attempt{attempt + 1}.png")
                 logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
                 page.go_back(wait_until="domcontentloaded", timeout=30000)
                 time.sleep(2)
@@ -726,7 +768,7 @@ def _register_direct_once(mail_client, email, password):
                 if not _is_google_redirect(page):
                     break
 
-                screenshot(page, f"direct_04_google_redirect_attempt{attempt+1}.png")
+                screenshot(page, f"direct_04_google_redirect_attempt{attempt + 1}.png")
                 logger.warning("[直接注册] 密码步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
                 page.go_back(wait_until="domcontentloaded", timeout=30000)
                 time.sleep(2)
@@ -741,7 +783,9 @@ def _register_direct_once(mail_client, email, password):
 
         code_input = None
         try:
-            code_input = page.locator('input[name="code"], input[placeholder*="验证码"], input[placeholder*="code" i]').first
+            code_input = page.locator(
+                'input[name="code"], input[placeholder*="验证码"], input[placeholder*="code" i]'
+            ).first
             if not code_input.is_visible(timeout=5000):
                 code_input = None
         except Exception:
@@ -757,7 +801,7 @@ def _register_direct_once(mail_client, email, password):
                 emails = mail_client.search_emails_by_recipient(email, size=10)
                 for em in emails:
                     text = em.get("text", "") or em.get("content", "")
-                    match = re.search(r'\b(\d{6})\b', text)
+                    match = re.search(r"\b(\d{6})\b", text)
                     if match:
                         verification_code = match.group(1)
                         break
@@ -790,7 +834,7 @@ def _register_direct_once(mail_client, email, password):
                 spinbuttons = page.locator('[role="spinbutton"]').all()
                 if len(spinbuttons) >= 3:
                     try:
-                        page.locator('text=生日日期').click()
+                        page.locator("text=生日日期").click()
                         time.sleep(0.5)
                     except Exception:
                         pass
@@ -912,8 +956,9 @@ def reinvite_account(chatgpt_api, mail_client, acc):
     恢复 standby 账号 — 直接登录（域名自动加入 workspace，不需要邀请）。
     登录后自动回到 workspace，然后刷新 Codex token。
     """
-    from autoteam.invite import screenshot
     from playwright.sync_api import sync_playwright
+
+    from autoteam.invite import screenshot
 
     email = acc["email"]
     password = acc.get("password", "")
@@ -940,7 +985,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         time.sleep(5)
 
         # Cloudflare
-        for i in range(12):
+        for _i in range(12):
             html = page.content()[:2000].lower()
             if "verify you are human" not in html and "challenge" not in page.url:
                 break
@@ -961,7 +1006,9 @@ def reinvite_account(chatgpt_api, mail_client, acc):
             if email_input.is_visible(timeout=5000):
                 email_input.fill(email)
                 time.sleep(0.5)
-                page.locator('button:has-text("Continue"), button:has-text("继续"), button[type="submit"]').first.click()
+                page.locator(
+                    'button:has-text("Continue"), button:has-text("继续"), button[type="submit"]'
+                ).first.click()
                 time.sleep(3)
         except Exception:
             pass
@@ -972,7 +1019,9 @@ def reinvite_account(chatgpt_api, mail_client, acc):
             if pwd_input.is_visible(timeout=5000):
                 pwd_input.fill(password)
                 time.sleep(0.5)
-                page.locator('button:has-text("Continue"), button:has-text("继续"), button[type="submit"]').first.click()
+                page.locator(
+                    'button:has-text("Continue"), button:has-text("继续"), button[type="submit"]'
+                ).first.click()
                 time.sleep(8)
         except Exception:
             pass
@@ -988,6 +1037,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
 
         if code_input and mail_client:
             import re
+
             logger.info("[轮转] 等待登录验证码...")
             otp = None
             start_t = time.time()
@@ -998,7 +1048,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                     if "invited" in subj:
                         continue
                     text = em.get("text", "") or em.get("content", "")
-                    match = re.search(r'\b(\d{6})\b', text)
+                    match = re.search(r"\b(\d{6})\b", text)
                     if match:
                         otp = match.group(1)
                         break
@@ -1009,7 +1059,9 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 logger.info("[轮转] 输入验证码: %s", otp)
                 code_input.fill(otp)
                 time.sleep(0.5)
-                page.locator('button:has-text("Continue"), button:has-text("继续"), button[type="submit"]').first.click()
+                page.locator(
+                    'button:has-text("Continue"), button:has-text("继续"), button[type="submit"]'
+                ).first.click()
                 time.sleep(5)
 
         screenshot(page, "reinvite_final.png")
@@ -1059,8 +1111,10 @@ def cmd_rotate(target_seats=5):
     TARGET = target_seats
 
     from autoteam.config import AUTO_CHECK_THRESHOLD
+
     try:
         from autoteam.api import _auto_check_config
+
         threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
     except ImportError:
         threshold = AUTO_CHECK_THRESHOLD
@@ -1086,7 +1140,7 @@ def cmd_rotate(target_seats=5):
     sync_account_states()
 
     logger.info("[2/5] 检查额度...")
-    exhausted = cmd_check()
+    cmd_check()
 
     try:
         # 移出所有 exhausted 账号（包括之前已标记的）
@@ -1107,8 +1161,14 @@ def cmd_rotate(target_seats=5):
             logger.info("[3/5] 无需移出账号")
 
         # 检查空缺
-        removed_count = len([a for a in all_exhausted if find_account(load_accounts(), a["email"])
-                             and find_account(load_accounts(), a["email"])["status"] == STATUS_STANDBY])
+        removed_count = len(
+            [
+                a
+                for a in all_exhausted
+                if find_account(load_accounts(), a["email"])
+                and find_account(load_accounts(), a["email"])["status"] == STATUS_STANDBY
+            ]
+        )
         if not chatgpt or not chatgpt.browser:
             ensure_chatgpt()
         api_count = get_team_member_count(chatgpt)
@@ -1461,7 +1521,7 @@ def cmd_cleanup(max_seats=None):
         result = chatgpt._api_fetch("GET", path)
 
         if result["status"] != 200:
-            logger.error("[清理] 获取成员列表失败: %d", result['status'])
+            logger.error("[清理] 获取成员列表失败: %d", result["status"])
             return
 
         data = json.loads(result["body"])
@@ -1482,10 +1542,10 @@ def cmd_cleanup(max_seats=None):
 
         logger.info("[清理] 手动添加的成员: %d", len(external_members))
         for m in external_members:
-            logger.info("[清理]   %s (%s)", m.get('email'), m.get('role'))
+            logger.info("[清理]   %s (%s)", m.get("email"), m.get("role"))
         logger.info("[清理] 本地管理的成员: %d", len(local_members))
         for m in local_members:
-            logger.info("[清理]   %s (%s)", m.get('email'), m.get('role'))
+            logger.info("[清理]   %s (%s)", m.get("email"), m.get("role"))
 
         # 确定要移除的数量
         if max_seats is None:
@@ -1496,19 +1556,25 @@ def cmd_cleanup(max_seats=None):
             return
 
         # 从本地管理的账号中选择要移除的（优先移除额度已用完的）
-        removable = sorted(local_members, key=lambda m: (
-            # 额度用完的优先移除
-            0 if find_account(accounts, m.get("email", "")) and
-                 find_account(accounts, m.get("email", "")).get("status") == STATUS_EXHAUSTED else 1,
-            # 其次按创建时间，旧的优先
-            find_account(accounts, m.get("email", "")).get("created_at", 0) if
-                find_account(accounts, m.get("email", "")) else 0,
-        ))
+        removable = sorted(
+            local_members,
+            key=lambda m: (
+                # 额度用完的优先移除
+                0
+                if find_account(accounts, m.get("email", ""))
+                and find_account(accounts, m.get("email", "")).get("status") == STATUS_EXHAUSTED
+                else 1,
+                # 其次按创建时间，旧的优先
+                find_account(accounts, m.get("email", "")).get("created_at", 0)
+                if find_account(accounts, m.get("email", ""))
+                else 0,
+            ),
+        )
 
         to_remove = removable[:to_remove_count]
         logger.info("[清理] 需要移除 %d 个本地账号:", len(to_remove))
         for m in to_remove:
-            logger.info("[清理]   %s", m.get('email'))
+            logger.info("[清理]   %s", m.get("email"))
 
         # 执行移除
         for m in to_remove:
@@ -1522,19 +1588,20 @@ def cmd_cleanup(max_seats=None):
                 logger.info("[清理] 已移除 %s", email)
                 update_account(email, status=STATUS_STANDBY)
             else:
-                logger.error("[清理] 移除 %s 失败: %d", email, result['status'])
+                logger.error("[清理] 移除 %s 失败: %d", email, result["status"])
 
         # 取消 pending invites 中本地管理的
         inv_result = chatgpt._api_fetch("GET", f"/backend-api/accounts/{account_id}/invites")
         if inv_result["status"] == 200:
             inv_data = json.loads(inv_result["body"])
-            invites = inv_data if isinstance(inv_data, list) else inv_data.get("invites", inv_data.get("account_invites", []))
+            invites = (
+                inv_data if isinstance(inv_data, list) else inv_data.get("invites", inv_data.get("account_invites", []))
+            )
             for inv in invites:
                 inv_email = inv.get("email_address", "").lower()
                 inv_id = inv.get("id")
                 if inv_email in local_emails and inv_id:
-                    del_result = chatgpt._api_fetch("DELETE",
-                        f"/backend-api/accounts/{account_id}/invites/{inv_id}")
+                    del_result = chatgpt._api_fetch("DELETE", f"/backend-api/accounts/{account_id}/invites/{inv_id}")
                     if del_result["status"] in (200, 204):
                         logger.info("[清理] 已取消邀请 %s", inv_email)
 
@@ -1601,6 +1668,7 @@ def main():
         sync_to_cpa()
     elif args.command == "api":
         from autoteam.api import start_server
+
         start_server(host=args.host, port=args.port)
 
 

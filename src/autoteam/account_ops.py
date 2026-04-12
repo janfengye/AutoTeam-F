@@ -83,9 +83,7 @@ def delete_managed_account(
                     chatgpt_api = own_chatgpt
                 members, invites = fetch_team_state(chatgpt_api)
 
-            member_matches = [
-                m for m in members if (m.get("email", "") or "").lower() == email_l
-            ]
+            member_matches = [m for m in members if (m.get("email", "") or "").lower() == email_l]
             for member in member_matches:
                 user_id = member.get("user_id") or member.get("id")
                 if not user_id:

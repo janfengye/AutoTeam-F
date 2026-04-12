@@ -6,10 +6,9 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -27,11 +26,11 @@ app = FastAPI(
 
 _tasks: dict[str, dict] = {}
 _playwright_lock = threading.Lock()
-_current_task_id: Optional[str] = None
+_current_task_id: str | None = None
 _admin_login_api = None
-_admin_login_step: Optional[str] = None
+_admin_login_step: str | None = None
 _main_codex_flow = None
-_main_codex_step: Optional[str] = None
+_main_codex_step: str | None = None
 MAX_TASK_HISTORY = 50
 
 
@@ -132,12 +131,13 @@ def _start_task(command: str, func, params: dict, *args, **kwargs) -> dict:
 # 响应模型
 # ---------------------------------------------------------------------------
 
+
 class TaskParams(BaseModel):
     target: int = 5
 
 
 class CleanupParams(BaseModel):
-    max_seats: Optional[int] = None
+    max_seats: int | None = None
 
 
 class AdminEmailParams(BaseModel):
@@ -260,7 +260,9 @@ def post_admin_login_start(params: AdminEmailParams):
             _playwright_lock.release()
 
     if not _playwright_lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再进行管理员登录"))
+        raise HTTPException(
+            status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再进行管理员登录")
+        )
 
     try:
         from autoteam.chatgpt_api import ChatGPTTeamAPI
@@ -412,7 +414,9 @@ def post_main_codex_start():
             _playwright_lock.release()
 
     if not _playwright_lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再同步主号 Codex"))
+        raise HTTPException(
+            status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再同步主号 Codex")
+        )
 
     try:
         from autoteam.codex_auth import MainCodexSyncFlow
@@ -500,10 +504,12 @@ def post_main_codex_cancel():
             _playwright_lock.release()
     return {"message": "主号 Codex 登录已取消", "codex": _main_codex_status()}
 
+
 @app.get("/api/accounts")
 def get_accounts():
     """获取所有账号列表"""
     from autoteam.accounts import load_accounts
+
     accounts = load_accounts()
     return [_sanitize_account(a) for a in accounts]
 
@@ -512,6 +518,7 @@ def get_accounts():
 def get_active():
     """获取活跃账号"""
     from autoteam.accounts import get_active_accounts
+
     return [_sanitize_account(a) for a in get_active_accounts()]
 
 
@@ -519,6 +526,7 @@ def get_active():
 def get_standby():
     """获取待命账号"""
     from autoteam.accounts import get_standby_accounts
+
     accounts = get_standby_accounts()
     return [_sanitize_account(a) for a in accounts]
 
@@ -541,8 +549,8 @@ def delete_account(email: str):
         )
 
     try:
-        from autoteam.accounts import load_accounts
         from autoteam.account_ops import delete_managed_account
+        from autoteam.accounts import load_accounts
 
         accounts = load_accounts()
         if not any(a["email"].lower() == email.lower() for a in accounts):
@@ -561,7 +569,7 @@ def delete_account(email: str):
 @app.get("/api/status")
 def get_status():
     """获取所有账号状态 + active 账号实时额度"""
-    from autoteam.accounts import load_accounts, STATUS_ACTIVE, STATUS_EXHAUSTED, STATUS_STANDBY, STATUS_PENDING
+    from autoteam.accounts import STATUS_ACTIVE, STATUS_EXHAUSTED, STATUS_PENDING, STATUS_STANDBY, load_accounts
     from autoteam.codex_auth import check_codex_quota
 
     accounts = load_accounts()
@@ -598,6 +606,7 @@ def get_status():
 def post_sync():
     """同步认证文件到 CPA"""
     from autoteam.cpa_sync import sync_to_cpa
+
     sync_to_cpa()
     return {"message": "同步完成"}
 
@@ -612,12 +621,14 @@ def post_sync_main_codex():
 def get_cpa_files():
     """获取 CPA 中的认证文件列表"""
     from autoteam.cpa_sync import list_cpa_files
+
     return list_cpa_files()
 
 
 # ---------------------------------------------------------------------------
 # 后台任务端点
 # ---------------------------------------------------------------------------
+
 
 @app.post("/api/tasks/check", status_code=202)
 def post_check():
@@ -636,6 +647,7 @@ def post_check():
 def post_rotate(params: TaskParams = TaskParams()):
     """智能轮转（后台执行）"""
     from autoteam.manager import cmd_rotate
+
     task = _start_task("rotate", cmd_rotate, {"target": params.target}, params.target)
     return task
 
@@ -644,6 +656,7 @@ def post_rotate(params: TaskParams = TaskParams()):
 def post_add():
     """添加新账号（后台执行）"""
     from autoteam.manager import cmd_add
+
     task = _start_task("add", cmd_add, {})
     return task
 
@@ -652,6 +665,7 @@ def post_add():
 def post_fill(params: TaskParams = TaskParams()):
     """补满 Team 成员（后台执行）"""
     from autoteam.manager import cmd_fill
+
     task = _start_task("fill", cmd_fill, {"target": params.target}, params.target)
     return task
 
@@ -660,6 +674,7 @@ def post_fill(params: TaskParams = TaskParams()):
 def post_cleanup(params: CleanupParams = CleanupParams()):
     """清理多余成员（后台执行）"""
     from autoteam.manager import cmd_cleanup
+
     task = _start_task("cleanup", cmd_cleanup, {"max_seats": params.max_seats}, params.max_seats)
     return task
 
@@ -686,8 +701,12 @@ def get_task(task_id: str):
 
 from autoteam.config import (
     AUTO_CHECK_INTERVAL as _DEFAULT_INTERVAL,
-    AUTO_CHECK_THRESHOLD as _DEFAULT_THRESHOLD,
+)
+from autoteam.config import (
     AUTO_CHECK_MIN_LOW as _DEFAULT_MIN_LOW,
+)
+from autoteam.config import (
+    AUTO_CHECK_THRESHOLD as _DEFAULT_THRESHOLD,
 )
 
 # 运行时可修改的巡检配置
@@ -702,13 +721,17 @@ _auto_check_restart = threading.Event()  # 配置变更时通知线程重启
 
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
-    from autoteam.accounts import load_accounts, STATUS_ACTIVE
+    from autoteam.accounts import STATUS_ACTIVE, load_accounts
     from autoteam.codex_auth import check_codex_quota
 
     while not _auto_check_stop.is_set():
         cfg = _auto_check_config
-        logger.info("[巡检] 等待 %d 分钟后执行下一轮检查（阈值: %d%%, 触发: >=%d 个）",
-                    cfg["interval"] // 60, cfg["threshold"], cfg["min_low"])
+        logger.info(
+            "[巡检] 等待 %d 分钟后执行下一轮检查（阈值: %d%%, 触发: >=%d 个）",
+            cfg["interval"] // 60,
+            cfg["threshold"],
+            cfg["min_low"],
+        )
 
         # 等待 interval 秒，期间可被 restart 或 stop 唤醒
         _auto_check_restart.clear()
@@ -720,8 +743,11 @@ def _auto_check_loop():
         try:
             cfg = _auto_check_config  # 重新读取
             accounts = load_accounts()
-            active = [a for a in accounts if a["status"] == STATUS_ACTIVE
-                      and a.get("auth_file") and Path(a["auth_file"]).exists()]
+            active = [
+                a
+                for a in accounts
+                if a["status"] == STATUS_ACTIVE and a.get("auth_file") and Path(a["auth_file"]).exists()
+            ]
 
             if not active:
                 continue
@@ -744,9 +770,9 @@ def _auto_check_loop():
                     pass
 
             if low_accounts:
-                logger.info("[巡检] %d 个账号额度不足: %s",
-                            len(low_accounts),
-                            ", ".join(f"{e}({r}%)" for e, r in low_accounts))
+                logger.info(
+                    "[巡检] %d 个账号额度不足: %s", len(low_accounts), ", ".join(f"{e}({r}%)" for e, r in low_accounts)
+                )
 
             if len(low_accounts) >= cfg["min_low"]:
                 # 检查是否有任务在跑
@@ -756,13 +782,15 @@ def _auto_check_loop():
                 _playwright_lock.release()
 
                 # 将低于阈值的账号标记为 exhausted，rotate 会自动移出并补充
-                from autoteam.accounts import update_account, STATUS_EXHAUSTED
+                from autoteam.accounts import STATUS_EXHAUSTED, update_account
+
                 for email, remaining in low_accounts:
                     logger.info("[巡检] %s 剩余 %d%%，标记为 exhausted", email, remaining)
                     update_account(email, status=STATUS_EXHAUSTED, quota_exhausted_at=time.time())
 
                 logger.info("[巡检] 触发自动轮转...")
                 from autoteam.manager import cmd_rotate
+
                 try:
                     _start_task("auto-rotate", cmd_rotate, {"target": 5, "trigger": "auto-check"}, 5)
                 except Exception as e:
@@ -775,9 +803,9 @@ def _auto_check_loop():
 
 
 class AutoCheckConfig(BaseModel):
-    interval: int = 300        # 巡检间隔（秒）
-    threshold: int = 10        # 额度阈值（%）
-    min_low: int = 2           # 触发轮转的最少账号数
+    interval: int = 300  # 巡检间隔（秒）
+    threshold: int = 10  # 额度阈值（%）
+    min_low: int = 2  # 触发轮转的最少账号数
 
 
 @app.get("/api/config/auto-check")
@@ -793,8 +821,12 @@ def set_auto_check_config(cfg: AutoCheckConfig):
     _auto_check_config["threshold"] = max(1, min(100, cfg.threshold))
     _auto_check_config["min_low"] = max(1, cfg.min_low)
     _auto_check_restart.set()  # 唤醒巡检线程，立即应用新配置
-    logger.info("[巡检] 配置已更新: 间隔=%ds 阈值=%d%% 触发=%d个",
-                _auto_check_config["interval"], _auto_check_config["threshold"], _auto_check_config["min_low"])
+    logger.info(
+        "[巡检] 配置已更新: 间隔=%ds 阈值=%d%% 触发=%d个",
+        _auto_check_config["interval"],
+        _auto_check_config["threshold"],
+        _auto_check_config["min_low"],
+    )
     return _auto_check_config.copy()
 
 
@@ -832,6 +864,7 @@ if DIST_DIR.exists():
 
 class _QuietAccessLog(logging.Filter):
     """过滤前端轮询产生的高频访问日志"""
+
     _quiet_paths = ("/api/status", "/api/tasks", "/api/config/auto-check")
 
     def filter(self, record):
@@ -842,6 +875,7 @@ class _QuietAccessLog(logging.Filter):
 def start_server(host: str = "0.0.0.0", port: int = 8787):
     """启动 API 服务器"""
     import uvicorn
+
     # 过滤轮询日志，避免刷屏
     logging.getLogger("uvicorn.access").addFilter(_QuietAccessLog())
     logger.info("[API] 启动 AutoTeam API 服务器 http://%s:%d", host, port)

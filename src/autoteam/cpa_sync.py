@@ -1,10 +1,11 @@
 """CPA (CLIProxyAPI) 认证文件同步 - 保持本地 codex 认证文件与 CPA 一致"""
 
-import json
 import logging
-import requests
 from pathlib import Path
-from autoteam.config import CPA_URL, CPA_KEY
+
+import requests
+
+from autoteam.config import CPA_KEY, CPA_URL
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ def sync_to_cpa():
     - active 且 CPA 没有 → 上传
     - CPA 有但不是 active（或本地已删除）→ 从 CPA 删除
     """
-    from autoteam.accounts import load_accounts, save_accounts, STATUS_ACTIVE
+    from autoteam.accounts import STATUS_ACTIVE, load_accounts, save_accounts
 
     accounts = load_accounts()
     local_emails = {a["email"].lower() for a in accounts}

@@ -4,10 +4,16 @@ import logging
 import re
 import time
 import uuid
+
 import requests
+
 from autoteam.config import (
-    CLOUDMAIL_BASE_URL, CLOUDMAIL_EMAIL, CLOUDMAIL_PASSWORD,
-    CLOUDMAIL_DOMAIN, EMAIL_POLL_INTERVAL, EMAIL_POLL_TIMEOUT,
+    CLOUDMAIL_BASE_URL,
+    CLOUDMAIL_DOMAIN,
+    CLOUDMAIL_EMAIL,
+    CLOUDMAIL_PASSWORD,
+    EMAIL_POLL_INTERVAL,
+    EMAIL_POLL_TIMEOUT,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,10 +45,13 @@ class CloudMailClient:
 
     def login(self):
         """登录 CloudMail，获取 JWT token"""
-        resp = self._post("/login", {
-            "email": CLOUDMAIL_EMAIL,
-            "password": CLOUDMAIL_PASSWORD,
-        })
+        resp = self._post(
+            "/login",
+            {
+                "email": CLOUDMAIL_EMAIL,
+                "password": CLOUDMAIL_PASSWORD,
+            },
+        )
         if resp["code"] != 200:
             raise Exception(f"CloudMail 登录失败: {resp.get('message')}")
         self.token = resp["data"]["token"]
@@ -65,25 +74,31 @@ class CloudMailClient:
 
     def search_emails_by_recipient(self, to_email, size=10):
         """通过 admin API 按收件人搜索所有邮件（不受 accountId 限制）"""
-        resp = self._get("/allEmail/list", {
-            "emailId": 0,
-            "size": size,
-            "timeSort": 0,  # newest first
-            "accountEmail": to_email,
-        })
+        resp = self._get(
+            "/allEmail/list",
+            {
+                "emailId": 0,
+                "size": size,
+                "timeSort": 0,  # newest first
+                "accountEmail": to_email,
+            },
+        )
         if resp["code"] != 200:
             return []
         return resp["data"].get("list", [])
 
     def list_emails(self, account_id, size=10):
         """获取指定账户的收件列表"""
-        resp = self._get("/email/list", {
-            "accountId": account_id,
-            "type": 1,  # receive
-            "size": size,
-            "emailId": 0,
-            "timeSort": 0,  # newest first
-        })
+        resp = self._get(
+            "/email/list",
+            {
+                "accountId": account_id,
+                "type": 1,  # receive
+                "size": size,
+                "emailId": 0,
+                "timeSort": 0,  # newest first
+            },
+        )
         if resp["code"] != 200:
             return []
         return resp["data"].get("list", [])
