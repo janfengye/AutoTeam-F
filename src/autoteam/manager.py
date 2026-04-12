@@ -1648,6 +1648,12 @@ def main():
         parser.print_help()
         sys.exit(0)
 
+    # 首次启动检查必填配置（api 命令在 start_server 里单独处理）
+    if args.command not in ("api",):
+        from autoteam.setup_wizard import check_and_setup
+
+        check_and_setup(interactive=True)
+
     if args.command == "status":
         cmd_status()
     elif args.command == "check":
