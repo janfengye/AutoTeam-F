@@ -552,6 +552,20 @@ def login_codex_via_browser(email, password, mail_client=None):
             except Exception:
                 pass
 
+            # 处理密码页面（可能在 consent 流程中出现）
+            try:
+                pwd_field = page.locator('input[name="password"], input[type="password"]').first
+                if pwd_field.is_visible(timeout=2000) and password:
+                    logger.info("[Codex] 需要重新输入密码 (step %d)...", step + 1)
+                    pwd_field.fill(password)
+                    time.sleep(0.5)
+                    _click_primary_auth_button(page, pwd_field, ["Continue", "继续", "Log in"])
+                    time.sleep(5)
+                    _screenshot(page, f"codex_04_password_{step + 1}.png")
+                    continue
+            except Exception:
+                pass
+
             # 处理邮箱验证码页面（可能在 consent 流程中出现）
             try:
                 otp_input = page.locator('input[name="code"], input[inputmode="numeric"]').first
