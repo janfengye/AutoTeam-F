@@ -130,13 +130,17 @@ def login_codex_via_browser(email, password, mail_client=None):
         except Exception:
             pass
 
-        # 输入邮箱
+        # 输入邮箱（避免误点 Google/Microsoft 第三方登录按钮）
         try:
-            ei = _page.locator('input[name="email"], input[type="email"]').first
+            ei = _page.locator('input[name="email"], input[id="email-input"], input[id="email"]').first
             if ei.is_visible(timeout=5000):
                 ei.fill(email)
                 time.sleep(0.5)
-                _page.locator('button:has-text("Continue"), button:has-text("继续"), button[type="submit"]').first.click()
+                submit = ei.locator("xpath=ancestor::form//button[contains(text(),'Continue') or contains(text(),'继续') or @type='submit']").first
+                if submit.is_visible(timeout=3000):
+                    submit.click()
+                else:
+                    _page.locator('button:has-text("Continue"), button:has-text("继续")').last.click()
                 time.sleep(3)
         except Exception:
             pass
@@ -147,7 +151,11 @@ def login_codex_via_browser(email, password, mail_client=None):
             if pi.is_visible(timeout=5000):
                 pi.fill(password)
                 time.sleep(0.5)
-                _page.locator('button:has-text("Continue"), button:has-text("继续"), button[type="submit"]').first.click()
+                submit = pi.locator("xpath=ancestor::form//button[contains(text(),'Continue') or contains(text(),'继续') or @type='submit']").first
+                if submit.is_visible(timeout=3000):
+                    submit.click()
+                else:
+                    _page.locator('button:has-text("Continue"), button:has-text("继续")').last.click()
                 time.sleep(8)
         except Exception:
             pass
@@ -242,14 +250,19 @@ def login_codex_via_browser(email, password, mail_client=None):
         time.sleep(3)
         _screenshot(page, "codex_01_auth_page.png")
 
-        # 输入邮箱
-        email_input = page.locator('input[name="email"], input[type="email"], input[id="email"]').first
+        # 输入邮箱（注意避免点到 Google/Microsoft/Apple 第三方登录按钮）
+        email_input = page.locator('input[name="email"], input[id="email-input"], input[id="email"]').first
         try:
             if email_input.is_visible(timeout=5000):
                 email_input.fill(email)
                 time.sleep(0.5)
-                # 点 Continue
-                page.locator('button:has-text("Continue"), button[type="submit"]').first.click()
+                # 点邮箱表单的 Continue，用邮箱输入框的父 form 内定位避免误点第三方登录
+                submit_btn = email_input.locator("xpath=ancestor::form//button[contains(text(),'Continue') or @type='submit']").first
+                if submit_btn.is_visible(timeout=3000):
+                    submit_btn.click()
+                else:
+                    # fallback: 页面上最后一个 Continue 按钮（第三方登录按钮在上方）
+                    page.locator('button:has-text("Continue")').last.click()
                 time.sleep(3)
                 _screenshot(page, "codex_02_after_email.png")
         except Exception:
@@ -261,7 +274,12 @@ def login_codex_via_browser(email, password, mail_client=None):
             if pwd_input.is_visible(timeout=5000):
                 pwd_input.fill(password)
                 time.sleep(0.5)
-                page.locator('button:has-text("Continue"), button:has-text("Log in"), button[type="submit"]').first.click()
+                # 同样用父 form 内定位
+                submit_btn = pwd_input.locator("xpath=ancestor::form//button[contains(text(),'Continue') or contains(text(),'Log in') or @type='submit']").first
+                if submit_btn.is_visible(timeout=3000):
+                    submit_btn.click()
+                else:
+                    page.locator('button:has-text("Continue"), button:has-text("Log in")').last.click()
                 time.sleep(5)
                 _screenshot(page, "codex_03_after_password.png")
         except Exception:

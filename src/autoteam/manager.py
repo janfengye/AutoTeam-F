@@ -1034,12 +1034,14 @@ def cmd_rotate(target_seats=5):
                                 p_resets = lq.get("primary_resets_at", 0)
                                 if p_resets and time.time() >= p_resets:
                                     logger.info("[4/5] %s 的 5h 重置时间已过，视为额度已恢复", email)
+                                    quota_ok = True
                                 else:
                                     p_remain = 100 - lq.get("primary_pct", 0)
                                     if p_remain < threshold:
                                         logger.info("[4/5] 跳过 %s（上次额度 %d%% < %d%%）", email, p_remain, threshold)
                                         skipped.append(acc)
                                         continue
+                                    quota_ok = True
                 except Exception:
                     pass
 
