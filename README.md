@@ -55,17 +55,20 @@ cp .env.example .env   # 复制配置模板，填入实际值
 | 配置项 | 说明 |
 |--------|------|
 | **CloudMail** | 临时邮箱服务地址和凭据 |
-| **ChatGPT** | Team Account ID（从 ChatGPT admin 页面获取），Workspace 名称可自动检测 |
 | **CPA** | CLIProxyAPI 地址和管理密钥 |
 | **AUTO_CHECK_THRESHOLD** | 额度低于此百分比触发轮转，默认 `10`（可在 Web 面板修改） |
 | **AUTO_CHECK_INTERVAL** | 巡检间隔（秒），默认 `300`（5 分钟） |
 | **AUTO_CHECK_MIN_LOW** | 至少几个账号低于阈值才触发轮转，默认 `2` |
 
-**文件配置：**
+管理员登录改为首次启动后在 Web 页面内完成，系统会自动保存：
 
-| 文件 | 说明 |
-|------|------|
-| `session` | ChatGPT 管理员的 `__Secure-next-auth.session-token`（拼接 `.0` 和 `.1`） |
+- 主号邮箱
+- session token
+- 主号密码（仅当登录流程要求输入密码时保存，供主号 Codex 同步复用）
+- Workspace / account ID
+- workspace 名称
+
+以上信息统一写入项目根目录下的 `state.json` 文件，不再额外保存 `session`。
 
 ### 使用
 
@@ -75,6 +78,8 @@ uv run autoteam <command> [args]
 
 | 命令 | 说明 |
 |------|------|
+| `admin-login [--email]` | 交互式完成管理员主号登录，按提示输入邮箱、密码或验证码 |
+| `main-codex-sync` | 交互式同步主号 Codex 到 CPA，按提示输入密码或验证码 |
 | `status` | 查看所有账号状态（自动同步 Team 实际成员） |
 | `check` | 检查 active 账号额度，低于阈值标记 exhausted，token 失效按历史额度判断 |
 | `rotate [N]` | 智能轮转：检查额度 → 移出低于阈值的 → 验证旧号额度后复用 → 补满到 N 个（默认 5） |
@@ -89,6 +94,25 @@ uv run autoteam <command> [args]
 ```bash
 uv run autoteam rotate
 ```
+
+首次配置管理员主号也可以直接用命令行：
+
+```bash
+uv run autoteam admin-login
+uv run autoteam admin-login --email you@example.com
+uv run autoteam main-codex-sync
+```
+
+### 主号 Codex Sync
+
+`main-codex-sync` 用于把管理员主号的 Codex 登录态单独同步到 CPA。
+
+- 前置条件：先完成 `admin-login`，让系统拿到主号邮箱、session token、workspace/account ID
+- 交互方式：命令行或 Web 都可以发起；如果流程要求密码或邮箱验证码，会继续提示输入
+- 同步结果：成功后会生成 `auths/codex-main-*.json`，并立即推送到 CPA
+- 作用范围：这是主号专用的 Codex 认证，不会加入账号轮转池，也不会写入普通子号的账号列表
+
+普通的 `sync` 只是把当前已有的认证文件重新推送到 CPA；`main-codex-sync` 则是在需要时重新完成一次主号 Codex 登录，并把新的主号认证同步过去。
 
 ### HTTP API
 
@@ -111,7 +135,20 @@ uv run autoteam api --port 9000   # 自定义端口
 | GET | `/api/accounts` | 所有账号列表 |
 | GET | `/api/accounts/active` | 活跃账号 |
 | GET | `/api/accounts/standby` | 待命账号 |
+| GET | `/api/admin/status` | 当前管理员登录状态 |
+| POST | `/api/admin/login/start` | 开始管理员登录 `{"email":"admin@example.com"}` |
+| POST | `/api/admin/login/password` | 提交密码 `{"password":"..."}` |
+| POST | `/api/admin/login/code` | 提交邮箱验证码 `{"code":"123456"}` |
+| POST | `/api/admin/login/workspace` | 提交组织选择 `{"option_id":"0"}` |
+| POST | `/api/admin/login/cancel` | 取消正在进行的管理员登录 |
+| POST | `/api/admin/logout` | 清除已保存的管理员登录态 |
+| GET | `/api/main-codex/status` | 当前主号 Codex 同步状态 |
+| POST | `/api/main-codex/start` | 开始主号 Codex 同步 |
+| POST | `/api/main-codex/password` | 提交主号密码 `{"password":"..."}` |
+| POST | `/api/main-codex/code` | 提交主号验证码 `{"code":"123456"}` |
+| POST | `/api/main-codex/cancel` | 取消正在进行的主号 Codex 同步 |
 | POST | `/api/sync` | 同步认证文件到 CPA |
+| POST | `/api/sync/main-codex` | 兼容旧接口，等价于 `/api/main-codex/start` |
 | GET | `/api/cpa/files` | CPA 认证文件列表 |
 | GET | `/api/config/auto-check` | 获取巡检配置 |
 | PUT | `/api/config/auto-check` | 修改巡检配置（运行时生效） |
@@ -153,12 +190,13 @@ curl http://localhost:8787/api/tasks/a1b2c3d4e5f6
 
 **面板功能：**
 
+- **管理员登录** — 首次启动直接输入主号邮箱，按页面提示继续提交密码或邮箱验证码，成功后自动保存登录态
 - **Dashboard** — 账号统计卡片（活跃/待命/用完/总计）+ 账号表格（实时额度、颜色标签、重置时间）
-- **操作面板** — 一键执行轮转、检查额度、补满、添加、清理、同步 CPA，任务执行中自动禁用按钮
+- **操作面板** — 一键执行轮转、检查额度、补满、添加、清理、同步 CPA、同步主号 Codex；未完成管理员登录时自动禁用
 - **任务历史** — 所有任务记录，实时状态跟踪（等待中/执行中/已完成/失败），耗时统计
 - **巡检设置** — 可视化配置巡检间隔、额度阈值、触发账号数，修改后运行时立即生效
 
-面板每 10 分钟自动刷新数据，有任务执行时切换为 30 秒轮询，任务完成后自动恢复。
+面板每 10 分钟自动刷新数据，有任务执行或管理员登录进行中时切换为 10 秒轮询，结束后自动恢复。
 
 **前端开发（可选）：**
 

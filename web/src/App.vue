@@ -7,9 +7,13 @@
         <p class="text-sm text-gray-400 mt-1">ChatGPT Team 账号自动轮转管理</p>
       </div>
       <div class="flex items-center gap-3">
-        <span v-if="runningTask" class="flex items-center gap-2 text-sm text-yellow-400">
+        <span v-if="busyTask" class="flex items-center gap-2 text-sm text-yellow-400">
           <span class="animate-spin inline-block w-4 h-4 border-2 border-yellow-400 border-t-transparent rounded-full"></span>
-          {{ runningTask.command }} 执行中...
+          {{ busyTask.command === 'admin-login'
+            ? '管理员登录中...'
+            : busyTask.command === 'main-codex-sync'
+              ? '主号 Codex 同步中...'
+              : `${busyTask.command} 执行中...` }}
         </span>
         <button @click="refresh" :disabled="loading"
           class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-sm rounded-lg border border-gray-700 transition disabled:opacity-50">
@@ -19,21 +23,21 @@
     </header>
 
     <!-- Dashboard -->
-    <Dashboard :status="status" :loading="loading" />
+    <Dashboard :status="status" :loading="loading" :running-task="busyTask" :admin-status="adminStatus" @refresh="refresh" />
 
     <!-- Task Panel -->
-    <TaskPanel :running-task="runningTask" @task-started="onTaskStarted" @refresh="refresh" />
+    <TaskPanel :running-task="busyTask" :admin-status="adminStatus" @task-started="onTaskStarted" @refresh="refresh" />
 
     <!-- Task History -->
     <TaskHistory :tasks="tasks" />
 
     <!-- Settings -->
-    <Settings />
+    <Settings :admin-status="adminStatus" :codex-status="codexStatus" @refresh="refresh" @admin-progress="onAdminProgress" />
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { api } from './api.js'
 import Dashboard from './components/Dashboard.vue'
 import TaskPanel from './components/TaskPanel.vue'
@@ -41,18 +45,36 @@ import TaskHistory from './components/TaskHistory.vue'
 import Settings from './components/Settings.vue'
 
 const status = ref(null)
+const adminStatus = ref(null)
+const codexStatus = ref(null)
 const tasks = ref([])
 const loading = ref(false)
 const runningTask = ref(null)
+const busyTask = computed(() => {
+  if (adminStatus.value?.login_in_progress) {
+    return { command: 'admin-login' }
+  }
+  if (codexStatus.value?.in_progress) {
+    return { command: 'main-codex-sync' }
+  }
+  return runningTask.value
+})
 
 let pollTimer = null
 
 async function refresh() {
   loading.value = true
   try {
-    const [s, t] = await Promise.all([api.getStatus(), api.getTasks()])
+    const [s, t, admin, codex] = await Promise.all([
+      api.getStatus(),
+      api.getTasks(),
+      api.getAdminStatus(),
+      api.getMainCodexStatus(),
+    ])
     status.value = s
     tasks.value = t
+    adminStatus.value = admin
+    codexStatus.value = codex
     runningTask.value = t.find(t => t.status === 'running' || t.status === 'pending') || null
   } catch (e) {
     console.error('刷新失败:', e)
@@ -67,12 +89,17 @@ function onTaskStarted() {
   refresh()
 }
 
+function onAdminProgress() {
+  startPolling(10000)
+  refresh()
+}
+
 function startPolling(interval = 600000) {
   stopPolling()
   pollTimer = setInterval(async () => {
     await refresh()
     // 如果没有运行中的任务，降回慢轮询
-    if (!runningTask.value && interval < 600000) {
+    if (!busyTask.value && interval < 600000) {
       startPolling(600000)
     }
   }, interval)

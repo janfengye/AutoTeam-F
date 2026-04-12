@@ -23,7 +23,6 @@ CLOUDMAIL_DOMAIN = os.environ.get("CLOUDMAIL_DOMAIN", "")
 
 # ChatGPT Team 配置
 CHATGPT_ACCOUNT_ID = os.environ.get("CHATGPT_ACCOUNT_ID", "")
-CHATGPT_WORKSPACE_NAME = os.environ.get("CHATGPT_WORKSPACE_NAME", "")
 
 # CPA (CLIProxyAPI) 配置
 CPA_URL = os.environ.get("CPA_URL", "")

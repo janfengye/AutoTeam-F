@@ -14,6 +14,12 @@
       <div class="px-4 py-3 border-b border-gray-800">
         <h2 class="text-lg font-semibold text-white">账号列表</h2>
       </div>
+      <div v-if="message" class="mx-4 mt-4 px-4 py-3 rounded-lg text-sm border" :class="messageClass">
+        {{ message }}
+      </div>
+      <div v-if="!adminReady" class="mx-4 mt-4 px-4 py-3 rounded-lg text-sm border bg-amber-500/10 text-amber-300 border-amber-500/20">
+        未完成管理员登录，删除账号按钮已禁用。
+      </div>
       <div class="overflow-x-auto">
         <table class="w-full text-sm">
           <thead>
@@ -25,6 +31,7 @@
               <th class="px-4 py-3 font-medium text-right">周 剩余</th>
               <th class="px-4 py-3 font-medium">5h 重置</th>
               <th class="px-4 py-3 font-medium">周 重置</th>
+              <th class="px-4 py-3 font-medium text-right">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -47,6 +54,17 @@
               </td>
               <td class="px-4 py-3 text-gray-400 text-xs">{{ quotaReset(acc, 'primary') }}</td>
               <td class="px-4 py-3 text-gray-400 text-xs">{{ quotaReset(acc, 'weekly') }}</td>
+              <td class="px-4 py-3 text-right">
+                <button
+                  @click="removeAccount(acc.email)"
+                  :disabled="deleteDisabled || deletingEmail === acc.email"
+                  class="px-3 py-1.5 rounded-lg text-xs font-medium border transition"
+                  :class="deleteDisabled || deletingEmail === acc.email
+                    ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
+                    : 'bg-rose-600/10 text-rose-400 border-rose-500/30 hover:bg-rose-600/20'">
+                  {{ deletingEmail === acc.email ? '删除中...' : '删除' }}
+                </button>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -64,12 +82,25 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
+import { api } from '../api.js'
 
 const props = defineProps({
   status: Object,
   loading: Boolean,
+  runningTask: Object,
+  adminStatus: {
+    type: Object,
+    default: null,
+  },
 })
+const emit = defineEmits(['refresh'])
+
+const deletingEmail = ref('')
+const message = ref('')
+const messageClass = ref('')
+const adminReady = computed(() => !!props.adminStatus?.configured)
+const deleteDisabled = computed(() => !!props.runningTask || !adminReady.value)
 
 const cards = computed(() => {
   if (!props.status) return []
@@ -130,5 +161,29 @@ function pctColor(val) {
   if (val > 30) return 'text-green-400'
   if (val > 0) return 'text-yellow-400'
   return 'text-red-400'
+}
+
+async function removeAccount(email) {
+  if (deleteDisabled.value) return
+
+  const ok = window.confirm(`确认删除账号 ${email}？\n这会同时清理本地记录、CPA、Team/Invite 和 CloudMail。`)
+  if (!ok) return
+
+  deletingEmail.value = email
+  message.value = ''
+  try {
+    const result = await api.deleteAccount(email)
+    message.value = result.message || `已删除 ${email}`
+    messageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
+    emit('refresh')
+  } catch (e) {
+    message.value = e.message
+    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+  } finally {
+    deletingEmail.value = ''
+    setTimeout(() => {
+      message.value = ''
+    }, 8000)
+  }
 }
 </script>
