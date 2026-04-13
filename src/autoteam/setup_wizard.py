@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import secrets
+import sys
 
 from autoteam.config import PROJECT_ROOT
 
@@ -72,6 +73,13 @@ def check_and_setup(interactive: bool = True) -> bool:
             missing.append((key, prompt, default, optional))
 
     if not missing:
+        # 配置齐全，每次启动验证连通性
+        if not _verify_cloudmail():
+            logger.error("[验证] CloudMail 配置有误，请修改 .env 后重新启动")
+            sys.exit(1)
+        if not _verify_cpa():
+            logger.error("[验证] CPA 配置有误，请修改 .env 后重新启动")
+            sys.exit(1)
         return True
 
     if not interactive:
@@ -120,8 +128,13 @@ def check_and_setup(interactive: bool = True) -> bool:
     except Exception:
         pass
 
-    # 验证 CloudMail 配置
-    _verify_cloudmail()
+    # 验证配置连通性
+    if not _verify_cloudmail():
+        logger.error("[验证] CloudMail 配置有误，请修改 .env 后重新启动")
+        sys.exit(1)
+    if not _verify_cpa():
+        logger.error("[验证] CPA 配置有误，请修改 .env 后重新启动")
+        sys.exit(1)
 
     return True
 
@@ -136,33 +149,75 @@ def _verify_cloudmail():
     if not all([base_url, email, password, domain]):
         return
 
-    print("验证 CloudMail 配置...")
+    logger.info("[验证] CloudMail 配置...")
 
     try:
         from autoteam.cloudmail import CloudMailClient
 
         client = CloudMailClient()
         client.login()
-        print("  [1/3] 登录成功")
+        logger.info("[验证] CloudMail 登录成功")
     except Exception as e:
-        print(f"  [1/3] 登录失败: {e}")
-        print("  请检查 CLOUDMAIL_BASE_URL、CLOUDMAIL_EMAIL、CLOUDMAIL_PASSWORD 是否正确")
-        return
+        logger.error("[验证] CloudMail 登录失败: %s", e)
+        logger.error("[验证] 请检查 CLOUDMAIL_BASE_URL、CLOUDMAIL_EMAIL、CLOUDMAIL_PASSWORD")
+        return False
 
     test_account_id = None
     try:
-        test_account_id, test_email = client.create_temp_email(prefix="autoteam-test")
-        print(f"  [2/3] 创建测试邮箱成功: {test_email}")
+        import uuid as _uuid
+
+        test_account_id, test_email = client.create_temp_email(prefix=f"at-test-{_uuid.uuid4().hex[:6]}")
+        logger.info("[验证] CloudMail 创建测试邮箱成功: %s", test_email)
     except Exception as e:
-        print(f"  [2/3] 创建邮箱失败: {e}")
-        print("  请检查 CLOUDMAIL_DOMAIN 是否正确")
-        return
+        logger.error("[验证] CloudMail 创建邮箱失败: %s", e)
+        logger.error("[验证] 请检查 CLOUDMAIL_DOMAIN 是否正确")
+        return False
 
     try:
         if test_account_id:
             client.delete_account(test_account_id)
-            print("  [3/3] 测试邮箱已清理")
+            logger.info("[验证] CloudMail 测试邮箱已清理")
     except Exception as e:
-        print(f"  [3/3] 清理测试邮箱失败: {e}（不影响使用）")
+        logger.warning("[验证] CloudMail 清理测试邮箱失败: %s（不影响使用）", e)
 
-    print("  CloudMail 配置验证通过\n")
+    logger.info("[验证] CloudMail 配置验证通过")
+    return True
+
+
+def _verify_cpa():
+    """验证 CPA 配置是否正确：获取认证文件列表"""
+    cpa_url = os.environ.get("CPA_URL", "")
+    cpa_key = os.environ.get("CPA_KEY", "")
+
+    if not cpa_url or not cpa_key:
+        return True  # 没配就跳过
+
+    logger.info("[验证] CPA 配置...")
+
+    try:
+        import requests
+
+        resp = requests.get(
+            f"{cpa_url}/v0/management/auth-files",
+            headers={"Authorization": f"Bearer {cpa_key}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            count = len(data.get("files", []))
+            logger.info("[验证] CPA 连接成功（当前 %d 个认证文件）", count)
+            return True
+        if resp.status_code == 401:
+            logger.error("[验证] CPA 连接失败: 密钥无效 (401)")
+            logger.error("[验证] 请检查 CPA_KEY 是否正确")
+            return False
+        logger.error("[验证] CPA 连接失败: HTTP %d", resp.status_code)
+        logger.error("[验证] 请检查 CPA_URL 是否正确")
+        return False
+    except requests.exceptions.ConnectionError:
+        logger.error("[验证] CPA 连接失败: 无法连接到 %s", cpa_url)
+        logger.error("[验证] 请检查 CPA_URL 是否正确，CPA 服务是否已启动")
+        return False
+    except Exception as e:
+        logger.error("[验证] CPA 连接失败: %s", e)
+        return False
