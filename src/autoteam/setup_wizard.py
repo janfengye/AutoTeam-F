@@ -68,9 +68,7 @@ def check_and_setup(interactive: bool = True) -> bool:
 
     for key, prompt, default, optional in REQUIRED_CONFIGS:
         val = env.get(key, "") or os.environ.get(key, "")
-        if not val and not optional:
-            missing.append((key, prompt, default, optional))
-        elif not val and optional and key == "API_KEY":
+        if not val:
             missing.append((key, prompt, default, optional))
 
     if not missing:
