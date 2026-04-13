@@ -17,7 +17,9 @@ STATUS_PENDING = "pending"  # 已邀请，等待注册完成
 def load_accounts():
     """加载账号列表"""
     if ACCOUNTS_FILE.exists():
-        return json.loads(ACCOUNTS_FILE.read_text())
+        text = ACCOUNTS_FILE.read_text().strip()
+        if text:
+            return json.loads(text)
     return []
 
 
