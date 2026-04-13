@@ -747,13 +747,20 @@ def _register_direct_once(mail_client, email, password):
 
         screenshot(page, "direct_01_login_page.png")
 
+        # 新版页面是统一的 "Log in or sign up"，不需要点 Sign up 按钮
+        # 只在旧版页面（有单独注册按钮）时才点
         try:
-            signup_btn = page.locator(
-                'button:has-text("注册"), button:has-text("Sign up"), a:has-text("Sign up"), a:has-text("注册")'
-            ).first
-            if signup_btn.is_visible(timeout=5000):
-                signup_btn.click()
-                time.sleep(3)
+            email_visible = page.locator(
+                'input[name="email"], input[type="email"], input[placeholder*="email" i]'
+            ).first.is_visible(timeout=2000)
+            if not email_visible:
+                # 没看到邮箱输入框，可能是旧版需要先点注册
+                signup_btn = page.locator(
+                    'button:has-text("注册"), button:has-text("Sign up"), a:has-text("Sign up"), a:has-text("注册")'
+                ).first
+                if signup_btn.is_visible(timeout=3000):
+                    signup_btn.click()
+                    time.sleep(3)
         except Exception:
             pass
 
@@ -762,7 +769,11 @@ def _register_direct_once(mail_client, email, password):
         logger.info("[直接注册] 输入邮箱: %s", email)
         try:
             for attempt in range(2):
-                email_input = page.locator('input[name="email"], input[type="email"]').first
+                email_input = page.locator(
+                    'input[name="email"], input[type="email"], input[id="email"], '
+                    'input[autocomplete="email"], input[autocomplete="username"], '
+                    'input[placeholder*="email" i], input[placeholder*="Email" i]'
+                ).first
                 if not email_input.is_visible(timeout=5000):
                     break
 
