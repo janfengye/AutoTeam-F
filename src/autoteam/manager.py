@@ -747,20 +747,32 @@ def _register_direct_once(mail_client, email, password):
 
         screenshot(page, "direct_01_login_page.png")
 
-        # 新版页面是统一的 "Log in or sign up"，不需要点 Sign up 按钮
-        # 只在旧版页面（有单独注册按钮）时才点
+        # 可能是首页（Get started）或登录页，需要先进入注册流程
         try:
+            # 首先检查是否已经有邮箱输入框（新版统一页面）
             email_visible = page.locator(
-                'input[name="email"], input[type="email"], input[placeholder*="email" i]'
-            ).first.is_visible(timeout=2000)
+                'input[name="email"], input[type="email"], input[placeholder*="email" i], '
+                'input[placeholder*="Email" i], input[autocomplete="email"]'
+            ).first.is_visible(timeout=3000)
             if not email_visible:
-                # 没看到邮箱输入框，可能是旧版需要先点注册
-                signup_btn = page.locator(
-                    'button:has-text("注册"), button:has-text("Sign up"), a:has-text("Sign up"), a:has-text("注册")'
-                ).first
-                if signup_btn.is_visible(timeout=3000):
-                    signup_btn.click()
-                    time.sleep(3)
+                # 尝试点击各种注册/Sign up 按钮
+                for sel in [
+                    'a:has-text("Sign up for free")',
+                    'button:has-text("Sign up for free")',
+                    'a:has-text("Sign up")',
+                    'button:has-text("Sign up")',
+                    'a:has-text("注册")',
+                    'button:has-text("注册")',
+                ]:
+                    try:
+                        btn = page.locator(sel).first
+                        if btn.is_visible(timeout=1000):
+                            logger.info("[直接注册] 点击注册按钮: %s", sel)
+                            btn.click()
+                            time.sleep(5)
+                            break
+                    except Exception:
+                        continue
         except Exception:
             pass
 
