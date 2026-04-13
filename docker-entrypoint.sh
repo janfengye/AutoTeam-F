@@ -7,29 +7,21 @@ Xvfb :99 -screen 0 1280x800x24 &
 export DISPLAY=:99
 
 # 确保数据目录存在
-mkdir -p /app/data
+mkdir -p /app/data /app/data/auths /app/data/screenshots
 
-# 软链数据文件到工作目录（始终创建软链，保证写入持久化到 data/）
+# 数据文件：无条件软链到 data/（确保所有写入都持久化）
 for f in .env accounts.json state.json; do
-    # 如果 data 里没有但容器内有，先复制过去
-    if [ ! -f "/app/data/$f" ] && [ -f "/app/$f" ] && [ ! -L "/app/$f" ]; then
-        cp "/app/$f" "/app/data/$f"
-    fi
-    # 如果 data 里没有，创建空文件
-    if [ ! -f "/app/data/$f" ]; then
-        touch "/app/data/$f"
-    fi
-    # 创建软链
-    ln -sf "/app/data/$f" "/app/$f"
+    # data 里没有就创建空文件
+    [ -f "/app/data/$f" ] || touch "/app/data/$f"
+    # 删除容器内的真实文件（如果不是软链），然后建软链
+    rm -f "/app/$f"
+    ln -s "/app/data/$f" "/app/$f"
 done
 
-# 软链目录
+# 目录软链
 for d in auths screenshots; do
-    mkdir -p "/app/data/$d"
-    if [ ! -L "/app/$d" ]; then
-        rm -rf "/app/$d"
-        ln -sf "/app/data/$d" "/app/$d"
-    fi
+    rm -rf "/app/$d"
+    ln -s "/app/data/$d" "/app/$d"
 done
 
 # 执行命令
