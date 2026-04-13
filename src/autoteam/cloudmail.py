@@ -156,6 +156,22 @@ class CloudMailClient:
 
         return None
 
+    def delete_emails_for(self, to_email):
+        """删除指定收件人的所有邮件"""
+        emails = self.search_emails_by_recipient(to_email, size=50)
+        deleted = 0
+        for em in emails:
+            email_id = em.get("emailId")
+            if email_id:
+                try:
+                    self._delete("/email/delete", {"emailId": email_id})
+                    deleted += 1
+                except Exception:
+                    pass
+        if deleted:
+            logger.info("[CloudMail] 已删除 %s 的 %d 封旧邮件", to_email, deleted)
+        return deleted
+
     def delete_account(self, account_id):
         """删除临时邮箱账户"""
         resp = self._delete("/account/delete", {"accountId": account_id})

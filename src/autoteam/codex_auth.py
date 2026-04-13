@@ -300,7 +300,11 @@ def login_codex_via_browser(email, password, mail_client=None):
             if ci.is_visible(timeout=5000) and mail_client:
                 import re as _re2
 
-                logger.info("[Codex] ChatGPT 登录需要验证码...")
+                try:
+                    mail_client.delete_emails_for(email)
+                except Exception:
+                    pass
+                logger.info("[Codex] ChatGPT 登录需要验证码，已清空旧邮件...")
                 otp = None
                 t0 = time.time()
                 while time.time() - t0 < 120:
@@ -446,7 +450,11 @@ def login_codex_via_browser(email, password, mail_client=None):
             code_input = None
 
         if code_input and mail_client:
-            logger.info("[Codex] 需要登录验证码，从 CloudMail 获取...")
+            try:
+                mail_client.delete_emails_for(email)
+            except Exception:
+                pass
+            logger.info("[Codex] 需要登录验证码，已清空旧邮件，从 CloudMail 获取...")
             import re as _re
 
             start_t = time.time()
@@ -672,7 +680,12 @@ def login_codex_via_browser(email, password, mail_client=None):
                 if otp_input.is_visible(timeout=2000) and mail_client:
                     import re as _re3
 
-                    logger.info("[Codex] 需要邮箱验证码 (step %d)...", step + 1)
+                    # 删除旧邮件，确保拿到的是新验证码
+                    try:
+                        mail_client.delete_emails_for(email)
+                    except Exception:
+                        pass
+                    logger.info("[Codex] 需要邮箱验证码 (step %d)，已清空旧邮件，等待新邮件...", step + 1)
                     otp = None
                     t0 = time.time()
                     while time.time() - t0 < 120:
