@@ -59,11 +59,20 @@ def _write_env(key: str, value: str):
             ENV_FILE.write_text(f"{key}={value}\n")
 
 
+def _is_interactive() -> bool:
+    """检测是否有终端交互能力（Docker 等非交互环境返回 False）"""
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 def check_and_setup(interactive: bool = True) -> bool:
     """
     检查必填配置是否齐全，缺失时交互式提示输入。
     返回 True 表示配置完整，False 表示用户中断或非交互模式下缺配置。
     """
+    interactive = interactive and _is_interactive()
     env = _read_env()
     missing = []
 
@@ -85,6 +94,7 @@ def check_and_setup(interactive: bool = True) -> bool:
     if not interactive:
         for key, prompt, _, _ in missing:
             logger.warning("[配置] 缺少必填项: %s (%s)", key, prompt)
+        logger.warning("[配置] 请通过 Web 面板或编辑 .env 文件填入配置")
         return False
 
     print("\n=== AutoTeam 首次配置 ===\n")

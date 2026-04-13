@@ -27,7 +27,7 @@ app = FastAPI(
 # API Key 鉴权中间件
 # ---------------------------------------------------------------------------
 
-_AUTH_SKIP_PATHS = {"/api/auth/check"}
+_AUTH_SKIP_PATHS = {"/api/auth/check", "/api/setup/status", "/api/setup/save"}
 
 
 @app.middleware("http")
@@ -59,6 +59,86 @@ def check_auth(request: Request):
     if auth_header.startswith("Bearer ") and auth_header[7:] == API_KEY:
         return {"authenticated": True, "auth_required": True}
     return JSONResponse(status_code=401, content={"authenticated": False, "auth_required": True})
+
+
+# ---------------------------------------------------------------------------
+# 初始配置 API（无需鉴权）
+# ---------------------------------------------------------------------------
+
+
+class SetupConfig(BaseModel):
+    CLOUDMAIL_BASE_URL: str = ""
+    CLOUDMAIL_EMAIL: str = ""
+    CLOUDMAIL_PASSWORD: str = ""
+    CLOUDMAIL_DOMAIN: str = ""
+    CPA_URL: str = "http://127.0.0.1:8317"
+    CPA_KEY: str = ""
+    API_KEY: str = ""
+
+
+@app.get("/api/setup/status")
+def get_setup_status():
+    """检查配置是否完整"""
+    from autoteam.setup_wizard import REQUIRED_CONFIGS, _read_env
+
+    env = _read_env()
+    fields = []
+    all_ok = True
+    for key, prompt, default, optional in REQUIRED_CONFIGS:
+        val = env.get(key, "") or os.environ.get(key, "")
+        ok = bool(val)
+        if not ok and not optional:
+            all_ok = False
+        fields.append({"key": key, "prompt": prompt, "default": default, "optional": optional, "configured": ok})
+    return {"configured": all_ok, "fields": fields}
+
+
+@app.post("/api/setup/save")
+def post_setup_save(config: SetupConfig):
+    """保存配置到 .env 并验证连通性"""
+    import secrets as _secrets
+
+    from autoteam.setup_wizard import _write_env
+
+    data = config.model_dump()
+    if not data.get("API_KEY"):
+        data["API_KEY"] = _secrets.token_urlsafe(24)
+
+    for key, value in data.items():
+        if value:
+            _write_env(key, value)
+            os.environ[key] = value
+
+    # 重新加载模块
+    import importlib
+
+    import autoteam.config
+
+    importlib.reload(autoteam.config)
+    try:
+        import autoteam.cloudmail
+
+        importlib.reload(autoteam.cloudmail)
+    except Exception:
+        pass
+
+    # 验证连通性
+    errors = []
+    from autoteam.setup_wizard import _verify_cloudmail, _verify_cpa
+
+    if not _verify_cloudmail():
+        errors.append("CloudMail 连接失败")
+    if not _verify_cpa():
+        errors.append("CPA 连接失败")
+
+    if errors:
+        return JSONResponse(status_code=400, content={"message": "、".join(errors), "api_key": data["API_KEY"]})
+
+    # 更新运行时 API_KEY
+    global API_KEY
+    API_KEY = data["API_KEY"]
+
+    return {"message": "配置保存成功", "api_key": data["API_KEY"], "configured": True}
 
 
 # ---------------------------------------------------------------------------

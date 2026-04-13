@@ -33,6 +33,8 @@ async function request(method, path, body = null) {
 
 export const api = {
   checkAuth: () => request('GET', '/auth/check'),
+  getSetupStatus: () => request('GET', '/setup/status'),
+  saveSetup: (config) => request('POST', '/setup/save', config),
 
   getStatus: () => request('GET', '/status'),
   getAdminStatus: () => request('GET', '/admin/status'),

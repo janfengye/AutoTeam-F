@@ -11,10 +11,14 @@
 [![uv](https://img.shields.io/badge/uv-Package_Manager-DE5FE9?style=for-the-badge)](https://docs.astral.sh/uv/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-API_&_Web-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Vue](https://img.shields.io/badge/Vue_3-Frontend-4FC08D?style=for-the-badge&logo=vue.js&logoColor=white)](https://vuejs.org)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
 
 </div>
 
 ---
+
+> **免责声明**：本项目仅供学习和研究用途。使用本工具可能违反 OpenAI 的服务条款，包括但不限于自动化操作、多账号管理等。使用者需自行承担所有风险，包括账号封禁、IP 限制等后果。作者不对任何因使用本工具造成的损失承担责任。
 
 ## 特性
 
@@ -176,6 +180,37 @@ uv run autoteam api --port 9000   # 自定义端口
 
 </details>
 
+## Docker 部署
+
+```bash
+# 克隆项目
+git clone https://github.com/cnitlrt/AutoTeam.git
+cd AutoTeam
+
+# 创建数据目录和配置
+mkdir -p data
+cp .env.example data/.env
+# 编辑 data/.env 填入实际配置
+
+# 启动
+docker compose up -d
+
+# 查看日志
+docker compose logs -f
+
+# 停止
+docker compose down
+```
+
+数据持久化在 `data/` 目录下（`.env`、`accounts.json`、`state.json`、`auths/`）。
+
+也可以手动构建：
+
+```bash
+docker build -t autoteam .
+docker run -d -p 8787:8787 -v $(pwd)/data:/app/data autoteam
+```
+
 ## 工作原理
 
 ### 轮转流程
@@ -299,6 +334,15 @@ npm install
 npm run dev       # Vite dev server :5173，自动代理 /api → :8787
 npm run build     # 构建产物输出到 src/autoteam/web/dist/
 ```
+
+## 已知限制
+
+- **IP 风险** — VPS 的 IP 容易被 OpenAI/Cloudflare 标记，建议使用住宅代理
+- **Cloudflare 验证** — 无头浏览器可能被 Cloudflare 拦截，需要较新的 Chromium 版本
+- **验证码时效** — OpenAI 验证码有效期短，网络延迟可能导致验证码过期
+- **workspace 选择** — 部分页面结构可能变化，导致 workspace 选择失败
+- **并发限制** — 同一时间只允许一个 Playwright 操作（浏览器自动化不支持并发）
+- **密码丢失** — `accounts.json` 被删除后密码无法恢复，但不影响使用（走验证码登录）
 
 ## 友情链接
 

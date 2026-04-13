@@ -1,6 +1,9 @@
 <template>
+  <!-- 初始配置页 -->
+  <SetupPage v-if="needSetup" @configured="onSetupDone" />
+
   <!-- 登录页 -->
-  <div v-if="!authenticated" class="min-h-screen flex items-center justify-center">
+  <div v-else-if="!authenticated" class="min-h-screen flex items-center justify-center">
     <div class="bg-gray-900 border border-gray-800 rounded-xl p-8 w-full max-w-sm">
       <h1 class="text-xl font-bold text-white text-center mb-2">AutoTeam</h1>
       <p class="text-sm text-gray-400 text-center mb-6">请输入 API Key 登录</p>
@@ -69,6 +72,7 @@
 <script setup>
 import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { api, setApiKey, clearApiKey } from './api.js'
+import SetupPage from './components/SetupPage.vue'
 import Sidebar from './components/Sidebar.vue'
 import Dashboard from './components/Dashboard.vue'
 import TeamMembers from './components/TeamMembers.vue'
@@ -78,6 +82,7 @@ import TaskPanel from './components/TaskPanel.vue'
 import TaskHistory from './components/TaskHistory.vue'
 import Settings from './components/Settings.vue'
 
+const needSetup = ref(false)
 const authenticated = ref(false)
 const authRequired = ref(false)
 const authLoading = ref(false)
@@ -201,7 +206,31 @@ function stopPolling() {
   }
 }
 
+async function checkSetup() {
+  try {
+    const result = await api.getSetupStatus()
+    return result.configured
+  } catch {
+    return true // 接口不存在说明是旧版本，跳过
+  }
+}
+
+function onSetupDone() {
+  needSetup.value = false
+  checkAuth().then(ok => {
+    if (ok) {
+      refresh()
+      startPolling(600000)
+    }
+  })
+}
+
 onMounted(async () => {
+  const setupOk = await checkSetup()
+  if (!setupOk) {
+    needSetup.value = true
+    return
+  }
   const ok = await checkAuth()
   if (ok) {
     refresh()
