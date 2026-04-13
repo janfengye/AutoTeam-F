@@ -242,6 +242,16 @@ def login_codex_via_browser(email, password, mail_client=None):
             )
             logger.debug("[Codex] 登录前已注入 _account cookie = %s", chatgpt_account_id)
 
+        # 在登录开始前记录当前最新邮件 ID，后续只接受比这个更新的
+        _email_id_before_login = 0
+        if mail_client:
+            try:
+                _pre = mail_client.search_emails_by_recipient(email, size=1)
+                if _pre:
+                    _email_id_before_login = _pre[0].get("emailId", 0)
+            except Exception:
+                pass
+
         logger.info("[Codex] 先登录 ChatGPT 选择 Team workspace...")
         _page = context.new_page()
         _page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded", timeout=60000)
@@ -300,19 +310,12 @@ def login_codex_via_browser(email, password, mail_client=None):
             if ci.is_visible(timeout=5000) and mail_client:
                 import re as _re2
 
-                _latest_id = 0
-                try:
-                    _existing = mail_client.search_emails_by_recipient(email, size=1)
-                    if _existing:
-                        _latest_id = _existing[0].get("emailId", 0)
-                except Exception:
-                    pass
-                logger.info("[Codex] ChatGPT 登录需要验证码，等待 emailId > %d 的新邮件...", _latest_id)
+                logger.info("[Codex] ChatGPT 登录需要验证码，等待 emailId > %d 的新邮件...", _email_id_before_login)
                 otp = None
                 t0 = time.time()
                 while time.time() - t0 < 120:
                     for em in mail_client.search_emails_by_recipient(email, size=5):
-                        if em.get("emailId", 0) <= _latest_id:
+                        if em.get("emailId", 0) <= _email_id_before_login:
                             continue
                         text = em.get("text", "") or em.get("content", "")
                         m = _re2.search(r"\b(\d{6})\b", text)
@@ -454,14 +457,7 @@ def login_codex_via_browser(email, password, mail_client=None):
             code_input = None
 
         if code_input and mail_client:
-            _latest_id = 0
-            try:
-                _existing = mail_client.search_emails_by_recipient(email, size=1)
-                if _existing:
-                    _latest_id = _existing[0].get("emailId", 0)
-            except Exception:
-                pass
-            logger.info("[Codex] 需要登录验证码，等待 emailId > %d 的新邮件...", _latest_id)
+            logger.info("[Codex] 需要登录验证码，等待 emailId > %d 的新邮件...", _email_id_before_login)
             import re as _re
 
             start_t = time.time()
@@ -469,7 +465,7 @@ def login_codex_via_browser(email, password, mail_client=None):
             while time.time() - start_t < 120:
                 emails = mail_client.search_emails_by_recipient(email, size=5)
                 for em in emails:
-                    if em.get("emailId", 0) <= _latest_id:
+                    if em.get("emailId", 0) <= _email_id_before_login:
                         continue
                     subj = em.get("subject", "").lower()
                     if "invited" in subj or "invitation" in subj:
@@ -688,21 +684,17 @@ def login_codex_via_browser(email, password, mail_client=None):
                 if otp_input.is_visible(timeout=2000) and mail_client:
                     import re as _re3
 
-                    # 记录当前最新邮件 ID，只接受之后的新邮件
-                    _latest_id = 0
-                    try:
-                        _existing = mail_client.search_emails_by_recipient(email, size=1)
-                        if _existing:
-                            _latest_id = _existing[0].get("emailId", 0)
-                    except Exception:
-                        pass
-                    logger.info("[Codex] 需要邮箱验证码 (step %d)，等待 emailId > %d 的新邮件...", step + 1, _latest_id)
+                    logger.info(
+                        "[Codex] 需要邮箱验证码 (step %d)，等待 emailId > %d 的新邮件...",
+                        step + 1,
+                        _email_id_before_login,
+                    )
                     otp = None
                     t0 = time.time()
                     while time.time() - t0 < 120:
                         for em in mail_client.search_emails_by_recipient(email, size=5):
                             # 只接受比快照更新的邮件
-                            if em.get("emailId", 0) <= _latest_id:
+                            if em.get("emailId", 0) <= _email_id_before_login:
                                 continue
                             sender = (em.get("sendEmail") or "").lower()
                             if "openai" not in sender and "chatgpt" not in sender:
