@@ -19,7 +19,7 @@
     </div>
 
     <div ref="logContainer"
-      class="bg-gray-950 border border-gray-800 rounded-xl p-4 font-mono text-xs leading-relaxed h-[600px] overflow-y-auto">
+      class="bg-gray-950 border border-gray-800 rounded-xl p-3 md:p-4 font-mono text-xs leading-relaxed h-[calc(100vh-200px)] md:h-[600px] overflow-y-auto">
       <div v-if="logs.length === 0" class="text-gray-600 text-center py-8">暂无日志</div>
       <div v-for="(log, i) in logs" :key="i"
         class="py-0.5 flex gap-3 hover:bg-gray-900/50">

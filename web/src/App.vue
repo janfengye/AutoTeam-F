@@ -27,7 +27,7 @@
     <Sidebar :active="currentPage" @navigate="currentPage = $event" />
 
     <!-- 主内容区 -->
-    <div class="flex-1 p-6 overflow-y-auto">
+    <div class="flex-1 p-4 md:p-6 overflow-y-auto pb-20 md:pb-6">
       <!-- 顶部状态栏 -->
       <div class="flex items-center justify-end gap-3 mb-6">
         <span v-if="busyTask" class="flex items-center gap-2 text-sm text-yellow-400">
