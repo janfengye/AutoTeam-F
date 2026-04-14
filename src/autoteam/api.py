@@ -153,6 +153,7 @@ _admin_login_api = None
 _admin_login_step: str | None = None
 _main_codex_flow = None
 _main_codex_step: str | None = None
+_manual_account_flow = None
 MAX_TASK_HISTORY = 50
 
 
@@ -331,6 +332,10 @@ class AdminWorkspaceParams(BaseModel):
     option_id: str
 
 
+class ManualAccountCallbackParams(BaseModel):
+    redirect_url: str
+
+
 def _sanitize_account(acc: dict) -> dict:
     """脱敏账号信息（去掉 password 等敏感字段）"""
     return {k: v for k, v in acc.items() if k not in ("password", "cloudmail_account_id")}
@@ -354,6 +359,26 @@ def _main_codex_status():
         "in_progress": _main_codex_flow is not None,
         "step": _main_codex_step,
     }
+
+
+def _manual_account_status():
+    status = {
+        "in_progress": False,
+        "status": "idle",
+        "state": "",
+        "auth_url": "",
+        "started_at": None,
+        "message": "",
+        "error": "",
+        "account": None,
+        "callback_received": False,
+        "callback_source": "",
+        "auto_callback_available": False,
+        "auto_callback_error": "",
+    }
+    if _manual_account_flow:
+        status.update(_manual_account_flow.status())
+    return status
 
 
 def _finish_admin_login(completed: dict):
@@ -411,6 +436,16 @@ def _set_pending_main_codex_sync(flow, step):
     return {"status": step, "codex": _main_codex_status()}
 
 
+def _finish_manual_account_flow(result: dict):
+    return {**result, "manual_account": _manual_account_status()}
+
+
+def _set_pending_manual_account_flow(flow, result):
+    global _manual_account_flow
+    _manual_account_flow = flow
+    return {**result, "manual_account": _manual_account_status()}
+
+
 # ---------------------------------------------------------------------------
 # 同步端点
 # ---------------------------------------------------------------------------
@@ -426,6 +461,12 @@ def get_admin_status():
 def get_main_codex_status():
     """获取主号 Codex 同步状态。"""
     return _main_codex_status()
+
+
+@app.get("/api/manual-account/status")
+def get_manual_account_status():
+    """获取手动添加账号状态。"""
+    return _manual_account_status()
 
 
 @app.post("/api/admin/login/start")
@@ -724,6 +765,63 @@ def post_main_codex_cancel():
         if _playwright_lock.locked():
             _playwright_lock.release()
     return {"message": "主号 Codex 登录已取消", "codex": _main_codex_status()}
+
+
+@app.post("/api/manual-account/start")
+def post_manual_account_start():
+    """开始手动添加账号流程，返回 OAuth 链接。"""
+    global _manual_account_flow
+
+    if _manual_account_flow:
+        try:
+            _manual_account_flow.stop()
+        except Exception:
+            pass
+        _manual_account_flow = None
+
+    try:
+        from autoteam.manual_account import ManualAccountFlow
+
+        flow = ManualAccountFlow()
+        result = flow.start()
+        return _set_pending_manual_account_flow(flow, result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if _manual_account_flow:
+            try:
+                _manual_account_flow.stop()
+            except Exception:
+                pass
+            _manual_account_flow = None
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/manual-account/callback")
+def post_manual_account_callback(params: ManualAccountCallbackParams):
+    """提交 OAuth 回调 URL，完成手动添加账号。"""
+    global _manual_account_flow
+    if not _manual_account_flow:
+        raise HTTPException(status_code=409, detail="当前没有等待回调的手动添加账号流程")
+
+    try:
+        result = _manual_account_flow.submit_callback(params.redirect_url)
+        return _finish_manual_account_flow(result)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/manual-account/cancel")
+def post_manual_account_cancel():
+    """取消手动添加账号流程。"""
+    global _manual_account_flow
+    if _manual_account_flow:
+        try:
+            _manual_account_flow.stop()
+        except Exception:
+            pass
+        _manual_account_flow = None
+    return {"message": "手动添加账号流程已取消", "manual_account": _manual_account_status()}
 
 
 @app.get("/api/accounts")
@@ -1274,6 +1372,7 @@ class _QuietAccessLog(logging.Filter):
         "/api/config/auto-check",
         "/api/admin/status",
         "/api/main-codex/status",
+        "/api/manual-account/status",
         "/api/auth/check",
         "/api/setup/status",
     )

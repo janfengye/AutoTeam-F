@@ -56,6 +56,7 @@ const items = [
   { key: 'dashboard', icon: '📊', label: '仪表盘', mobileLabel: '仪表盘' },
   { key: 'team', icon: '👥', label: 'Team 成员', mobileLabel: '成员' },
   { key: 'tasks', icon: '⚡', label: '操作 & 任务', mobileLabel: '操作' },
+  { key: 'oauth', icon: '🔐', label: 'OAuth 登录', mobileLabel: 'OAuth' },
   { key: 'logs', icon: '📋', label: '日志', mobileLabel: '日志' },
   { key: 'settings', icon: '⚙️', label: '设置', mobileLabel: '设置' },
 ]

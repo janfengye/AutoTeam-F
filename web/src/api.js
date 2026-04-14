@@ -46,6 +46,7 @@ export const api = {
   getStatus: () => request('GET', '/status'),
   getAdminStatus: () => request('GET', '/admin/status'),
   getMainCodexStatus: () => request('GET', '/main-codex/status'),
+  getManualAccountStatus: () => request('GET', '/manual-account/status'),
   getAccounts: () => request('GET', '/accounts'),
   getActiveAccounts: () => request('GET', '/accounts/active'),
   getStandbyAccounts: () => request('GET', '/accounts/standby'),
@@ -64,6 +65,9 @@ export const api = {
   submitMainCodexPassword: (password) => request('POST', '/main-codex/password', { password }),
   submitMainCodexCode: (code) => request('POST', '/main-codex/code', { code }),
   cancelMainCodexSync: () => request('POST', '/main-codex/cancel'),
+  startManualAccount: () => request('POST', '/manual-account/start'),
+  submitManualAccountCallback: (redirectUrl) => request('POST', '/manual-account/callback', { redirect_url: redirectUrl }),
+  cancelManualAccount: () => request('POST', '/manual-account/cancel'),
 
   postSync: () => request('POST', '/sync'),
   postSyncAccounts: () => request('POST', '/sync/accounts'),

@@ -954,7 +954,7 @@ def login_codex_via_session():
     return _exchange_auth_code(auth_code, code_verifier)
 
 
-class MainCodexSyncFlow:
+class SessionCodexAuthFlow:
     EMAIL_SELECTORS = [
         'input[name="email"]',
         'input[id="email-input"]',
@@ -977,12 +977,24 @@ class MainCodexSyncFlow:
         'input[autocomplete="one-time-code"]',
     ]
 
-    def __init__(self):
-        self.email = get_admin_email()
-        self.password = get_admin_password()
-        self.workspace_name = get_chatgpt_workspace_name()
-        self.account_id = get_chatgpt_account_id()
-        self.session_token = get_admin_session_token()
+    def __init__(
+        self,
+        *,
+        email,
+        session_token,
+        account_id,
+        workspace_name="",
+        password="",
+        password_callback=None,
+        auth_file_callback=None,
+    ):
+        self.email = email or ""
+        self.password = password or ""
+        self.workspace_name = workspace_name or ""
+        self.account_id = account_id or ""
+        self.session_token = session_token or ""
+        self.password_callback = password_callback
+        self.auth_file_callback = auth_file_callback or save_auth_file
         self.code_verifier, code_challenge = _generate_pkce()
         self.state = secrets.token_urlsafe(16)
         self.auth_url = _build_auth_url(code_challenge, self.state)
@@ -1188,14 +1200,14 @@ class MainCodexSyncFlow:
 
     def start(self):
         if not self.session_token:
-            raise RuntimeError("缺少管理员 session，请先完成管理员登录")
+            raise RuntimeError("缺少登录 session")
         if not self.email:
-            raise RuntimeError("缺少管理员邮箱，请先完成管理员登录")
+            raise RuntimeError("缺少登录邮箱")
 
         from autoteam.chatgpt_api import ChatGPTTeamAPI
 
         self.chatgpt = ChatGPTTeamAPI()
-        self.chatgpt.start()
+        self.chatgpt.start_with_session(self.session_token, self.account_id, self.workspace_name)
         self.page = self.chatgpt.context.new_page()
         self._attach_callback_listeners()
         self._inject_auth_cookies()
@@ -1205,10 +1217,11 @@ class MainCodexSyncFlow:
 
     def submit_password(self, password):
         self.password = password
-        update_admin_state(password=password)
+        if self.password_callback:
+            self.password_callback(password)
         password_input = self._visible_locator(self.PASSWORD_SELECTORS, timeout_ms=5000)
         if not password_input:
-            raise RuntimeError("当前主号 Codex 登录不是密码输入步骤")
+            raise RuntimeError("当前 Codex 登录不是密码输入步骤")
 
         password_input.fill(password)
         time.sleep(0.5)
@@ -1219,7 +1232,7 @@ class MainCodexSyncFlow:
     def submit_code(self, code):
         code_input = self._visible_locator(self.CODE_SELECTORS, timeout_ms=5000)
         if not code_input:
-            raise RuntimeError("当前主号 Codex 登录不是验证码输入步骤")
+            raise RuntimeError("当前 Codex 登录不是验证码输入步骤")
 
         code_input.fill(code)
         time.sleep(0.5)
@@ -1229,20 +1242,18 @@ class MainCodexSyncFlow:
 
     def complete(self):
         if not self.auth_code:
-            raise RuntimeError("未获取到主号 Codex authorization code")
+            raise RuntimeError("未获取到 Codex authorization code")
 
         bundle = _exchange_auth_code(self.auth_code, self.code_verifier, fallback_email=self.email)
         if not bundle:
-            raise RuntimeError("主号 Codex token 交换失败")
+            raise RuntimeError("Codex token 交换失败")
 
-        from autoteam.cpa_sync import sync_main_codex_to_cpa
-
-        filepath = save_main_auth_file(bundle)
-        sync_main_codex_to_cpa(filepath)
+        filepath = self.auth_file_callback(bundle)
         return {
             "email": bundle.get("email"),
             "auth_file": filepath,
             "plan_type": bundle.get("plan_type"),
+            "bundle": bundle,
         }
 
     def stop(self):
@@ -1250,6 +1261,31 @@ class MainCodexSyncFlow:
             self.chatgpt.stop()
         self.chatgpt = None
         self.page = None
+
+
+class MainCodexSyncFlow(SessionCodexAuthFlow):
+    def __init__(self):
+        super().__init__(
+            email=get_admin_email(),
+            session_token=get_admin_session_token(),
+            account_id=get_chatgpt_account_id(),
+            workspace_name=get_chatgpt_workspace_name(),
+            password=get_admin_password(),
+            password_callback=lambda password: update_admin_state(password=password),
+            auth_file_callback=save_main_auth_file,
+        )
+
+    def complete(self):
+        info = super().complete()
+
+        from autoteam.cpa_sync import sync_main_codex_to_cpa
+
+        sync_main_codex_to_cpa(info["auth_file"])
+        return {
+            "email": info.get("email"),
+            "auth_file": info.get("auth_file"),
+            "plan_type": info.get("plan_type"),
+        }
 
 
 def login_main_codex():

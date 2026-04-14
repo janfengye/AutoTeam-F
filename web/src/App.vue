@@ -52,10 +52,14 @@
         :running-task="busyTask" :admin-status="adminStatus" :tasks="tasks"
         @task-started="onTaskStarted" @refresh="refresh" />
 
+      <OAuthPage v-else-if="currentPage === 'oauth'"
+        :manual-account-status="manualAccountStatus" @refresh="refresh" @progress="onAdminProgress" />
+
       <LogViewer v-else-if="currentPage === 'logs'" />
 
       <Settings v-else-if="currentPage === 'settings'"
-        :admin-status="adminStatus" :codex-status="codexStatus" @refresh="refresh" @admin-progress="onAdminProgress" />
+        :admin-status="adminStatus" :codex-status="codexStatus"
+        @refresh="refresh" @admin-progress="onAdminProgress" />
     </div>
   </div>
 </template>
@@ -69,6 +73,7 @@ import Dashboard from './components/Dashboard.vue'
 import TeamMembers from './components/TeamMembers.vue'
 import TasksPage from './components/TasksPage.vue'
 import LogViewer from './components/LogViewer.vue'
+import OAuthPage from './components/OAuthPage.vue'
 import TaskPanel from './components/TaskPanel.vue'
 import TaskHistory from './components/TaskHistory.vue'
 import Settings from './components/Settings.vue'
@@ -84,6 +89,7 @@ const currentPage = ref('dashboard')
 const status = ref(null)
 const adminStatus = ref(null)
 const codexStatus = ref(null)
+const manualAccountStatus = ref(null)
 const tasks = ref([])
 const loading = ref(false)
 const runningTask = ref(null)
@@ -148,16 +154,18 @@ function doLogout() {
 async function refresh() {
   loading.value = true
   try {
-    const [s, t, admin, codex] = await Promise.all([
+    const [s, t, admin, codex, manualAccount] = await Promise.all([
       api.getStatus(),
       api.getTasks(),
       api.getAdminStatus(),
       api.getMainCodexStatus(),
+      api.getManualAccountStatus(),
     ])
     status.value = s
     tasks.value = t
     adminStatus.value = admin
     codexStatus.value = codex
+    manualAccountStatus.value = manualAccount
     runningTask.value = t.find(t => t.status === 'running' || t.status === 'pending') || null
   } catch (e) {
     if (e.status === 401) {

@@ -64,6 +64,17 @@
 | POST | `/api/main-codex/code` | 提交验证码 |
 | POST | `/api/main-codex/cancel` | 取消同步 |
 
+## 手动添加账号
+
+后端先生成 Codex OAuth 链接，并尝试在 `localhost:1455` 自动接收回调；如果自动回调不可用，用户也可以手动把最终回调 URL 粘贴回系统完成 token 交换。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/manual-account/status` | 当前手动添加流程状态 |
+| POST | `/api/manual-account/start` | 开始流程，返回 `auth_url` 和 `state` |
+| POST | `/api/manual-account/callback` | 提交回调 URL `{"redirect_url": "http://localhost:1455/auth/callback?code=...&state=..."}` |
+| POST | `/api/manual-account/cancel` | 取消流程 |
+
 ## 调用示例
 
 ```bash

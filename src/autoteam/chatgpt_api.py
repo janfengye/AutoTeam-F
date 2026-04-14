@@ -459,12 +459,12 @@ class ChatGPTTeamAPI:
         logger.info("[ChatGPT] 登录步骤检测: unknown | URL=%s", self.page.url)
         return "unknown", self.page.url
 
-    def begin_admin_login(self, email):
+    def begin_login(self, email, actor_label="账号"):
         self.login_email = email
         if not self.browser:
             self._launch_browser()
 
-        logger.info("[ChatGPT] 开始管理员登录: %s", email)
+        logger.info("[ChatGPT] 开始%s登录: %s", actor_label, email)
         self.page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
         time.sleep(5)
         self._wait_for_cloudflare()
@@ -475,7 +475,7 @@ class ChatGPTTeamAPI:
         if step == "workspace_required":
             self._list_workspace_options()
         if step in ("password_required", "code_required", "workspace_required", "completed", "error"):
-            logger.info("[ChatGPT] 管理员登录初始步骤: %s | detail=%s", step, detail)
+            logger.info("[ChatGPT] %s登录初始步骤: %s | detail=%s", actor_label, step, detail)
             return {"step": step, "detail": detail}
 
         email_input = self._visible_locator_in_frames(self.EMAIL_INPUT_SELECTORS, timeout_ms=15000)
@@ -489,40 +489,46 @@ class ChatGPTTeamAPI:
                 body_excerpt = self.page.locator("body").inner_text(timeout=2000)[:300]
             except Exception:
                 pass
-            raise RuntimeError(f"未找到管理员邮箱输入框，当前 URL: {self.page.url}，页面片段: {body_excerpt}")
+            raise RuntimeError(f"未找到{actor_label}邮箱输入框，当前 URL: {self.page.url}，页面片段: {body_excerpt}")
 
         email_input.fill(email)
         time.sleep(0.5)
         self._click_auth_button(email_input, ["Continue", "继续"])
         time.sleep(3)
-        self._log_login_state("管理员邮箱提交后")
+        self._log_login_state(f"{actor_label}邮箱提交后")
 
         step, detail = self._detect_login_step()
         if step == "workspace_required":
             self._list_workspace_options()
-        logger.info("[ChatGPT] 管理员邮箱提交结果: %s | detail=%s", step, detail)
+        logger.info("[ChatGPT] %s邮箱提交结果: %s | detail=%s", actor_label, step, detail)
         return {"step": step, "detail": detail}
 
-    def submit_admin_password(self, password):
+    def begin_admin_login(self, email):
+        return self.begin_login(email, actor_label="管理员")
+
+    def submit_login_password(self, password, actor_label="账号"):
         self.login_password = password
         password_input = self._visible_locator_in_frames(self.PASSWORD_INPUT_SELECTORS, timeout_ms=5000)
         if not password_input:
             raise RuntimeError("当前不是密码输入步骤")
 
-        logger.info("[ChatGPT] 提交管理员密码前 | URL=%s", self.page.url)
+        logger.info("[ChatGPT] 提交%s密码前 | URL=%s", actor_label, self.page.url)
         password_input.fill(password)
         time.sleep(0.5)
         self._click_auth_button(password_input, ["Continue", "继续", "Log in"])
         time.sleep(8)
-        self._log_login_state("管理员密码提交后")
+        self._log_login_state(f"{actor_label}密码提交后")
 
         step, detail = self._detect_login_step()
         if step == "workspace_required":
             self._list_workspace_options()
-        logger.info("[ChatGPT] 管理员密码提交结果: %s | detail=%s", step, detail)
+        logger.info("[ChatGPT] %s密码提交结果: %s | detail=%s", actor_label, step, detail)
         return {"step": step, "detail": detail}
 
-    def submit_admin_code(self, code):
+    def submit_admin_password(self, password):
+        return self.submit_login_password(password, actor_label="管理员")
+
+    def submit_login_code(self, code, actor_label="账号"):
         code_input = self._visible_locator_in_frames(self.CODE_INPUT_SELECTORS, timeout_ms=5000)
         if not code_input:
             time.sleep(3)
@@ -549,7 +555,7 @@ class ChatGPTTeamAPI:
                     except Exception:
                         pass
                     time.sleep(8)
-                    self._log_login_state("管理员验证码提交后（单字符）")
+                    self._log_login_state(f"{actor_label}验证码提交后（单字符）")
                     step, detail = self._detect_login_step()
                     if step == "workspace_required":
                         self._list_workspace_options()
@@ -569,10 +575,10 @@ class ChatGPTTeamAPI:
                 self.page.screenshot(path=str(SCREENSHOT_DIR / "admin_login_code_not_found.png"), full_page=True)
             except Exception:
                 pass
-            logger.error("[ChatGPT] 找不到验证码输入框 | URL=%s", self.page.url)
+            logger.error("[ChatGPT] 找不到%s验证码输入框 | URL=%s", actor_label, self.page.url)
             raise RuntimeError("找不到验证码输入框，页面可能已跳转或验证码已过期")
 
-        logger.info("[ChatGPT] 提交管理员验证码前 | URL=%s | code_len=%d", self.page.url, len(code))
+        logger.info("[ChatGPT] 提交%s验证码前 | URL=%s | code_len=%d", actor_label, self.page.url, len(code))
         try:
             self.page.screenshot(path=str(SCREENSHOT_DIR / "admin_login_code_before_submit.png"), full_page=True)
         except Exception:
@@ -585,13 +591,16 @@ class ChatGPTTeamAPI:
             self.page.screenshot(path=str(SCREENSHOT_DIR / "admin_login_code_after_submit.png"), full_page=True)
         except Exception:
             pass
-        self._log_login_state("管理员验证码提交后")
+        self._log_login_state(f"{actor_label}验证码提交后")
 
         step, detail = self._detect_login_step()
         if step == "workspace_required":
             self._list_workspace_options()
-        logger.info("[ChatGPT] 管理员验证码提交结果: %s | detail=%s", step, detail)
+        logger.info("[ChatGPT] %s验证码提交结果: %s | detail=%s", actor_label, step, detail)
         return {"step": step, "detail": detail}
+
+    def submit_admin_code(self, code):
+        return self.submit_login_code(code, actor_label="管理员")
 
     def _guess_account_info(self):
         try:
@@ -668,10 +677,10 @@ class ChatGPTTeamAPI:
         workspace_name = (chosen or {}).get("workspace_name") or dom_name or self.workspace_name
         return account_id, workspace_name
 
-    def complete_admin_login(self):
+    def complete_login(self, persist_admin_state=False):
         session_token = self._extract_session_token()
         if not session_token:
-            raise RuntimeError("管理员登录成功后未提取到 session token")
+            raise RuntimeError("登录成功后未提取到 session token")
 
         self._fetch_access_token()
         account_id, workspace_name = self._guess_account_info()
@@ -689,25 +698,37 @@ class ChatGPTTeamAPI:
         if self.login_password:
             payload["password"] = self.login_password
 
-        update_admin_state(**payload)
+        if persist_admin_state:
+            update_admin_state(**payload)
+            logger.info("[ChatGPT] 管理员登录状态已保存")
 
-        logger.info("[ChatGPT] 管理员登录状态已保存")
         return {
             "email": self.login_email or "",
+            "password": self.login_password or "",
+            "session_token": session_token,
             "account_id": self.account_id,
             "workspace_name": self.workspace_name,
             "session_len": len(session_token),
         }
+
+    def complete_admin_login(self):
+        return self.complete_login(persist_admin_state=True)
 
     def start(self):
         """用已保存的管理员 session 启动 Team API 客户端。"""
         session_token = get_admin_session_token()
         self.account_id = get_chatgpt_account_id()
         self.workspace_name = get_chatgpt_workspace_name()
+        self.start_with_session(session_token, self.account_id, self.workspace_name)
+
+    def start_with_session(self, session_token, account_id, workspace_name=""):
+        """用指定的 session/account 启动浏览器上下文。"""
         if not session_token:
-            raise FileNotFoundError("请先完成管理员登录")
+            raise FileNotFoundError("缺少会话信息")
+        self.account_id = account_id or ""
+        self.workspace_name = workspace_name or ""
         if not self.account_id:
-            raise RuntimeError("缺少已保存的 workspace/account ID，请重新完成管理员登录")
+            raise RuntimeError("缺少 workspace/account ID")
 
         self._launch_browser()
         logger.info("[ChatGPT] 访问 chatgpt.com 过 Cloudflare...")

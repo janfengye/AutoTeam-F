@@ -1421,6 +1421,40 @@ def cmd_add():
             chatgpt.stop()
 
 
+def cmd_manual_add():
+    """手动添加账号：优先自动接收 localhost 回调，失败时再手动粘贴回调 URL。"""
+    from autoteam.manual_account import ManualAccountFlow
+
+    flow = ManualAccountFlow()
+    try:
+        result = flow.start()
+        logger.info("[手动添加] 打开以下链接完成 OAuth 登录：\n%s", result["auth_url"])
+        if result.get("auto_callback_available"):
+            logger.info("[手动添加] 已启动本地回调服务 http://localhost:1455/auth/callback，可自动完成认证")
+        else:
+            logger.warning("[手动添加] 本地自动回调不可用：%s", result.get("auto_callback_error") or "未知错误")
+
+        callback_url = input("登录成功后：若自动完成则直接回车；否则粘贴回调 URL（留空取消）: ").strip()
+        if callback_url:
+            result = flow.submit_callback(callback_url)
+        else:
+            result = flow.status()
+            if result.get("status") != "completed":
+                logger.warning("[手动添加] 未检测到自动回调，已取消")
+                return None
+
+        account = result.get("account") or {}
+        logger.info(
+            "[手动添加] 完成: %s (plan=%s, status=%s)",
+            account.get("email") or "?",
+            account.get("plan_type") or "?",
+            account.get("status") or "?",
+        )
+        return result
+    finally:
+        flow.stop()
+
+
 def cmd_admin_login(email=None):
     """交互式完成管理员登录并保存到 state.json。"""
     email = (email or "").strip()
@@ -1748,6 +1782,7 @@ def main():
     rotate_p = sub.add_parser("rotate", help="智能轮转（检查额度 → 移出 → 复用旧号 → 万不得已才创建新号）")
     rotate_p.add_argument("target", type=int, nargs="?", default=5, help="目标成员数（默认 5）")
     sub.add_parser("add", help="手动添加一个新账号")
+    sub.add_parser("manual-add", help="手动 OAuth 添加账号（打开链接登录后粘贴回调 URL）")
     admin_login_p = sub.add_parser("admin-login", help="交互式完成管理员主号登录")
     admin_login_p.add_argument("--email", help="管理员邮箱；不传则运行时交互输入")
     sub.add_parser("main-codex-sync", help="交互式同步主号 Codex 到 CPA")
@@ -1784,6 +1819,8 @@ def main():
         cmd_rotate(args.target)
     elif args.command == "add":
         cmd_add()
+    elif args.command == "manual-add":
+        cmd_manual_add()
     elif args.command == "admin-login":
         cmd_admin_login(args.email)
     elif args.command == "main-codex-sync":
