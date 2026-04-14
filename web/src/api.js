@@ -70,6 +70,7 @@ export const api = {
   cancelManualAccount: () => request('POST', '/manual-account/cancel'),
 
   postSync: () => request('POST', '/sync'),
+  postSyncFromCpa: () => request('POST', '/sync/from-cpa'),
   postSyncAccounts: () => request('POST', '/sync/accounts'),
   postSyncMainCodex: () => request('POST', '/sync/main-codex'),
 

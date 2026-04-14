@@ -52,7 +52,7 @@ from autoteam.codex_auth import (
     refresh_access_token,
     save_auth_file,
 )
-from autoteam.cpa_sync import sync_to_cpa
+from autoteam.cpa_sync import sync_from_cpa, sync_to_cpa
 from autoteam.textio import read_text, write_text
 
 logger = logging.getLogger(__name__)
@@ -1768,6 +1768,20 @@ def cmd_cleanup(max_seats=None):
         chatgpt.stop()
 
 
+def cmd_pull_cpa():
+    """从 CPA 反向同步认证文件到本地。"""
+    result = sync_from_cpa()
+    logger.info(
+        "[CPA] 拉取完成: 新增文件 %d, 更新文件 %d, 新增账号 %d, 更新账号 %d, 跳过 %d",
+        result.get("downloaded", 0),
+        result.get("updated", 0),
+        result.get("accounts_added", 0),
+        result.get("accounts_updated", 0),
+        result.get("skipped", 0),
+    )
+    return result
+
+
 def main():
     import argparse
 
@@ -1794,6 +1808,7 @@ def main():
     cleanup_p.add_argument("max_seats", type=int, nargs="?", default=None, help="最大席位数")
 
     sub.add_parser("sync", help="手动同步认证文件到 CPA")
+    sub.add_parser("pull-cpa", help="从 CPA 反向同步认证文件到本地")
 
     api_p = sub.add_parser("api", help="启动 HTTP API 服务器")
     api_p.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
@@ -1831,6 +1846,8 @@ def main():
         cmd_cleanup(args.max_seats)
     elif args.command == "sync":
         sync_to_cpa()
+    elif args.command == "pull-cpa":
+        cmd_pull_cpa()
     elif args.command == "api":
         from autoteam.api import start_server
 

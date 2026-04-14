@@ -1,11 +1,14 @@
 """CPA (CLIProxyAPI) 认证文件同步 - 保持本地 codex 认证文件与 CPA 一致"""
 
+import json
 import logging
+import time
 from pathlib import Path
 
 import requests
 
 from autoteam.config import CPA_KEY, CPA_URL
+from autoteam.textio import write_text
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +67,154 @@ def delete_from_cpa(name):
     else:
         logger.error("[CPA] 删除失败: %d %s", resp.status_code, resp.text[:200])
         return False
+
+
+def download_from_cpa(name):
+    """从 CPA 下载认证文件内容。"""
+    resp = requests.get(
+        f"{CPA_URL}/v0/management/auth-files/download",
+        headers=_headers(),
+        params={"name": name},
+        timeout=10,
+    )
+    if resp.status_code == 200:
+        return resp.text
+    logger.error("[CPA] 下载失败: %s -> %d %s", name, resp.status_code, resp.text[:200])
+    return None
+
+
+def _write_auth_text(path, content):
+    write_text(path, content)
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+
+
+def sync_from_cpa():
+    """
+    从 CPA 反向同步认证文件到本地。
+
+    规则：
+    - 下载 CPA 中所有 codex 认证文件到本地 auths/
+    - 非主号文件会导入/修复到 accounts.json，默认状态为 standby（保守导入）
+    - 不删除本地账号记录，仅补充/更新 auth_file
+    """
+    from autoteam.accounts import STATUS_STANDBY, find_account, load_accounts, save_accounts
+
+    AUTH_DIR.mkdir(exist_ok=True)
+
+    accounts = load_accounts()
+    changed_accounts = False
+    imported_files = 0
+    updated_files = 0
+    added_accounts = 0
+    updated_accounts = 0
+    skipped = 0
+
+    cpa_files = list_cpa_files()
+    if not cpa_files:
+        logger.info("[CPA] 未发现可反向同步的认证文件")
+        return {
+            "downloaded": 0,
+            "updated": 0,
+            "accounts_added": 0,
+            "accounts_updated": 0,
+            "skipped": 0,
+            "total": 0,
+        }
+
+    for item in cpa_files:
+        name = (item.get("name") or "").strip()
+        if not name or not name.endswith(".json") or not name.startswith("codex-"):
+            skipped += 1
+            continue
+
+        content = download_from_cpa(name)
+        if not content:
+            skipped += 1
+            continue
+
+        try:
+            auth_data = json.loads(content)
+        except Exception:
+            logger.warning("[CPA] 跳过无效 JSON: %s", name)
+            skipped += 1
+            continue
+
+        if auth_data.get("type") != "codex":
+            logger.info("[CPA] 跳过非 codex 文件: %s", name)
+            skipped += 1
+            continue
+
+        local_path = AUTH_DIR / name
+        existed = local_path.exists()
+        previous = None
+        if existed:
+            try:
+                previous = local_path.read_text(encoding="utf-8")
+            except Exception:
+                previous = None
+
+        if not existed:
+            imported_files += 1
+        elif previous != content:
+            updated_files += 1
+
+        _write_auth_text(local_path, content)
+
+        email = (auth_data.get("email") or item.get("email") or "").lower().strip()
+        if name.startswith("codex-main-") or not email:
+            continue
+
+        # 清理同邮箱的旧本地文件，保留 CPA 当前下载的版本
+        for old in AUTH_DIR.glob(f"codex-{email}-*.json"):
+            if old.name != name and old.exists():
+                old.unlink()
+
+        acc = find_account(accounts, email)
+        resolved_path = str(local_path.resolve())
+        if acc:
+            if acc.get("auth_file") != resolved_path:
+                acc["auth_file"] = resolved_path
+                changed_accounts = True
+                updated_accounts += 1
+        else:
+            accounts.append(
+                {
+                    "email": email,
+                    "password": "",
+                    "cloudmail_account_id": None,
+                    "status": STATUS_STANDBY,
+                    "auth_file": resolved_path,
+                    "quota_exhausted_at": None,
+                    "quota_resets_at": None,
+                    "created_at": time.time(),
+                    "last_active_at": None,
+                }
+            )
+            changed_accounts = True
+            added_accounts += 1
+
+    if changed_accounts:
+        save_accounts(accounts)
+
+    logger.info(
+        "[CPA] 反向同步完成: 新增文件 %d, 更新文件 %d, 新增账号 %d, 更新账号 %d, 跳过 %d",
+        imported_files,
+        updated_files,
+        added_accounts,
+        updated_accounts,
+        skipped,
+    )
+    return {
+        "downloaded": imported_files,
+        "updated": updated_files,
+        "accounts_added": added_accounts,
+        "accounts_updated": updated_accounts,
+        "skipped": skipped,
+        "total": len(cpa_files),
+    }
 
 
 def sync_to_cpa():

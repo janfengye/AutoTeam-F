@@ -1010,6 +1010,15 @@ def post_sync():
     return {"message": "同步完成"}
 
 
+@app.post("/api/sync/from-cpa")
+def post_sync_from_cpa():
+    """从 CPA 反向同步认证文件到本地。"""
+    from autoteam.cpa_sync import sync_from_cpa
+
+    result = sync_from_cpa()
+    return {"message": "已从 CPA 同步到本地", "result": result}
+
+
 @app.post("/api/sync/accounts")
 def post_sync_accounts():
     """从 auths 目录和 Team 成员同步账号到 accounts.json"""

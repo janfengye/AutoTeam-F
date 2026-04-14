@@ -2,14 +2,14 @@
   <div class="mt-6 bg-gray-900 border border-gray-800 rounded-xl p-4">
     <h2 class="text-lg font-semibold text-white mb-4">操作</h2>
     <div v-if="!adminReady" class="mb-4 px-4 py-3 rounded-lg text-sm border bg-amber-500/10 text-amber-300 border-amber-500/20">
-      请先在「设置」页完成管理员登录后，管理操作才会开放。
+      请先在「设置」页完成管理员登录后，轮转/补满等管理操作才会开放；同步类操作仍可使用。
     </div>
     <div class="flex flex-wrap gap-3">
       <button v-for="action in actions" :key="action.key"
         @click="execute(action)"
-        :disabled="disabled"
+        :disabled="isDisabled(action)"
         class="px-4 py-2 rounded-lg text-sm font-medium transition border"
-        :class="disabled
+        :class="isDisabled(action)
           ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
           : `${action.style} hover:opacity-80`">
         {{ action.label }}
@@ -21,7 +21,7 @@
       <label class="text-sm text-gray-400">{{ paramLabel }}:</label>
       <input v-model.number="paramValue" type="number" min="1" max="20"
         class="w-20 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-white focus:outline-none focus:border-blue-500" />
-      <button @click="confirmAction" :disabled="disabled"
+      <button @click="confirmAction" :disabled="pendingAction && isDisabled(pendingAction)"
         class="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition">
         确认执行
       </button>
@@ -57,8 +57,9 @@ const actions = [
   { key: 'fill', label: '补满成员', method: 'startFill', needParam: true, paramName: 'target', style: 'bg-violet-600 text-white border-violet-500' },
   { key: 'add', label: '添加账号', method: 'startAdd', needParam: false, style: 'bg-amber-600 text-white border-amber-500' },
   { key: 'cleanup', label: '清理成员', method: 'startCleanup', needParam: false, style: 'bg-rose-600 text-white border-rose-500' },
-  { key: 'sync', label: '同步 CPA', method: 'postSync', needParam: false, sync: true, style: 'bg-gray-700 text-white border-gray-600' },
-  { key: 'sync-accounts', label: '同步账号', method: 'postSyncAccounts', needParam: false, sync: true, style: 'bg-gray-700 text-white border-gray-600' },
+  { key: 'sync', label: '同步 CPA', method: 'postSync', needParam: false, sync: true, allowWithoutAdmin: true, style: 'bg-gray-700 text-white border-gray-600' },
+  { key: 'pull-cpa', label: '拉取 CPA', method: 'postSyncFromCpa', needParam: false, sync: true, allowWithoutAdmin: true, style: 'bg-gray-700 text-white border-gray-600' },
+  { key: 'sync-accounts', label: '同步账号', method: 'postSyncAccounts', needParam: false, sync: true, allowWithoutAdmin: true, style: 'bg-gray-700 text-white border-gray-600' },
 ]
 
 const showParams = ref(false)
@@ -68,10 +69,15 @@ const pendingAction = ref(null)
 const message = ref('')
 const messageClass = ref('')
 const adminReady = computed(() => !!props.adminStatus?.configured)
-const disabled = computed(() => !!props.runningTask || !adminReady.value)
+
+function isDisabled(action) {
+  if (props.runningTask) return true
+  if (!adminReady.value && !action.allowWithoutAdmin) return true
+  return false
+}
 
 async function execute(action) {
-  if (disabled.value) return
+  if (isDisabled(action)) return
   message.value = ''
   if (action.needParam) {
     pendingAction.value = action

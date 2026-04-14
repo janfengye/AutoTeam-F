@@ -86,6 +86,7 @@ docker compose up -d
 | `fill [N]` | 补满成员 |
 | `cleanup [N]` | 清理多余成员 |
 | `sync` | 同步认证文件到 CPA |
+| `pull-cpa` | 从 CPA 反向同步认证文件到本地 |
 | `admin-login` | 管理员登录 |
 
 ## Web 管理面板

@@ -21,6 +21,7 @@
 | GET | `/api/config/auto-check` | 巡检配置 |
 | PUT | `/api/config/auto-check` | 修改巡检配置（运行时生效） |
 | POST | `/api/sync` | 同步认证文件到 CPA |
+| POST | `/api/sync/from-cpa` | 从 CPA 反向同步认证文件到本地（导入为本地 auths/，新账号默认 standby） |
 | POST | `/api/sync/accounts` | 从 auths 目录同步账号 |
 | POST | `/api/accounts/login` | 触发单账号 Codex 登录 `{"email": "..."}` |
 | POST | `/api/accounts/{email}/kick` | 移出 Team |
