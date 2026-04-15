@@ -57,6 +57,7 @@ export const api = {
   getCpaFiles: () => request('GET', '/cpa/files'),
 
   startAdminLogin: (email) => request('POST', '/admin/login/start', { email }),
+  submitAdminSession: (email, sessionToken) => request('POST', '/admin/login/session', { email, session_token: sessionToken }),
   submitAdminPassword: (password) => request('POST', '/admin/login/password', { password }),
   submitAdminCode: (code) => request('POST', '/admin/login/code', { code }),
   submitAdminWorkspace: (optionId) => request('POST', '/admin/login/workspace', { option_id: optionId }),

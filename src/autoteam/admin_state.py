@@ -22,6 +22,7 @@ from autoteam.textio import read_text, write_text
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 STATE_FILE = PROJECT_ROOT / "state.json"
 LEGACY_SESSION_FILE = PROJECT_ROOT / "session"
+STATE_FILE_MODE = 0o666
 
 
 def _normalize_state(data):
@@ -63,8 +64,11 @@ def _load_state_from_file(path: Path):
 
 
 def _save_state(state):
-    write_text(STATE_FILE, json.dumps(_normalize_state(state), indent=2, ensure_ascii=False))
-    os.chmod(STATE_FILE, 0o600)
+    # 如果是软链，写入目标路径（避免 Docker 场景下误删/替换软链）
+    target = STATE_FILE.resolve()
+    write_text(target, json.dumps(_normalize_state(state), indent=2, ensure_ascii=False))
+    # Docker bind mount 下文件常由容器用户写入；给宿主机用户保留可访问权限
+    os.chmod(target, STATE_FILE_MODE)
 
 
 def _migrate_legacy_state():
@@ -98,7 +102,10 @@ def update_admin_state(**kwargs):
 
 def clear_admin_state():
     if STATE_FILE.exists():
-        STATE_FILE.unlink()
+        # 写空内容而不是删除（保护 Docker 软链）
+        target = STATE_FILE.resolve()
+        write_text(target, "{}")
+        os.chmod(target, STATE_FILE_MODE)
     if LEGACY_SESSION_FILE.exists():
         LEGACY_SESSION_FILE.unlink()
 

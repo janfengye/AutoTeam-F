@@ -545,7 +545,7 @@ def cmd_check():
     return exhausted_list
 
 
-def remove_from_team(chatgpt_api, email):
+def remove_from_team(chatgpt_api, email, *, return_status=False):
     """将账号从 Team 中移除"""
     account_id = get_chatgpt_account_id()
     # 先获取成员列表找到 user_id
@@ -554,14 +554,14 @@ def remove_from_team(chatgpt_api, email):
 
     if result["status"] != 200:
         logger.error("[Team] 获取成员列表失败: %d", result["status"])
-        return False
+        return "failed" if return_status else False
 
     try:
         data = json.loads(result["body"])
         members = data.get("items", data.get("users", data.get("members", [])))
     except Exception:
         logger.error("[Team] 解析成员列表失败")
-        return False
+        return "failed" if return_status else False
 
     # 找到对应邮箱的成员
     target_user_id = None
@@ -574,7 +574,7 @@ def remove_from_team(chatgpt_api, email):
     if not target_user_id:
         logger.info("[Team] 未在成员列表中找到 %s（可能已移出）", email)
         # 可能已经不在 team 了
-        return True
+        return "already_absent" if return_status else True
 
     # 删除成员
     delete_path = f"/backend-api/accounts/{account_id}/users/{target_user_id}"
@@ -582,10 +582,10 @@ def remove_from_team(chatgpt_api, email):
 
     if result["status"] in (200, 204):
         logger.info("[Team] 已将 %s 移出 Team", email)
-        return True
+        return "removed" if return_status else True
     else:
         logger.error("[Team] 移除 %s 失败: %d %s", email, result["status"], result["body"][:200])
-        return False
+        return "failed" if return_status else False
 
 
 def invite_to_team(chatgpt_api, email, seat_type="default"):
@@ -716,20 +716,96 @@ def _is_email_in_team(email):
             chatgpt.stop()
 
 
+_DIRECT_EMAIL_SELECTORS = (
+    'input[name="email"], input[type="email"], input[id="email"], '
+    'input[autocomplete="email"], input[autocomplete="username"], '
+    'input[placeholder*="email" i], input[placeholder*="Email" i]'
+)
+_DIRECT_PASSWORD_SELECTORS = 'input[name="password"], input[type="password"]'
+_DIRECT_CODE_SELECTORS = 'input[name="code"], input[placeholder*="验证码"], input[placeholder*="code" i]'
+
+
+def _safe_invite_screenshot(page, name):
+    from autoteam.invite import screenshot
+
+    try:
+        screenshot(page, name)
+    except Exception as exc:
+        logger.debug("[直接注册] 截图失败 %s: %s", name, exc)
+
+
+def _page_excerpt(page, limit=240):
+    try:
+        return page.locator("body").inner_text(timeout=1500)[:limit].replace("\n", " ")
+    except Exception:
+        return ""
+
+
+def _detect_direct_register_step(page):
+    url = (page.url or "").lower()
+    if _is_google_redirect(page):
+        return "google"
+
+    try:
+        if page.locator(_DIRECT_PASSWORD_SELECTORS).first.is_visible(timeout=300):
+            return "password"
+    except Exception:
+        pass
+
+    try:
+        if page.locator(_DIRECT_CODE_SELECTORS).first.is_visible(timeout=300):
+            return "code"
+    except Exception:
+        pass
+
+    try:
+        if page.locator('input[name="name"], [role="spinbutton"]').first.is_visible(timeout=300):
+            return "profile"
+    except Exception:
+        pass
+
+    if "chatgpt.com" in url and "auth" not in url:
+        return "completed"
+
+    try:
+        if page.locator(_DIRECT_EMAIL_SELECTORS).first.is_visible(timeout=300):
+            return "email"
+    except Exception:
+        pass
+
+    if "log-in-or-create-account" in url or url.endswith("/auth/login"):
+        return "email"
+    if "create-account" in url or "password" in url:
+        return "password"
+    return "unknown"
+
+
+def _wait_for_direct_register_step(page, allowed_steps, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        step = _detect_direct_register_step(page)
+        if step in allowed_steps:
+            return step
+        time.sleep(0.5)
+    return _detect_direct_register_step(page)
+
+
 def _register_direct_once(mail_client, email, password):
     """执行一次直接注册，返回是否完成注册并进入 Team。"""
     from playwright.sync_api import sync_playwright
-
-    from autoteam.invite import screenshot
 
     logger.info("[直接注册] %s", email)
     signup_url = "https://chatgpt.com/auth/login"
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
+        launch_kwargs = {
+            "headless": False,
+            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        }
+        if sys.platform.startswith("win"):
+            launch_kwargs["slow_mo"] = 100
+
+        browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -746,16 +822,11 @@ def _register_direct_once(mail_client, email, password):
             logger.info("[直接注册] 等待 Cloudflare... (%ds)", i * 5)
             time.sleep(5)
 
-        screenshot(page, "direct_01_login_page.png")
+        _safe_invite_screenshot(page, "direct_01_login_page.png")
 
         # OpenAI 首页有多种 A/B 测试变体，需要逐步找到邮箱输入框
-        _email_selectors = (
-            'input[name="email"], input[type="email"], input[id="email"], '
-            'input[autocomplete="email"], input[autocomplete="username"], '
-            'input[placeholder*="email" i], input[placeholder*="Email" i]'
-        )
         try:
-            email_visible = page.locator(_email_selectors).first.is_visible(timeout=3000)
+            email_visible = page.locator(_DIRECT_EMAIL_SELECTORS).first.is_visible(timeout=3000)
             if not email_visible:
                 # 尝试按优先级点击各种按钮来展开/跳转到邮箱输入
                 for sel, desc in [
@@ -775,96 +846,143 @@ def _register_direct_once(mail_client, email, password):
                         if btn.is_visible(timeout=1000):
                             logger.info("[直接注册] 点击: %s", desc)
                             btn.click()
-                            time.sleep(3)
+                            time.sleep(2)
                             # 检查邮箱输入框是否出现了
-                            if page.locator(_email_selectors).first.is_visible(timeout=3000):
+                            step = _wait_for_direct_register_step(
+                                page,
+                                {"email", "password", "code", "profile", "completed", "google"},
+                                timeout=10,
+                            )
+                            if step != "unknown":
                                 break
                     except Exception:
                         continue
         except Exception:
             pass
 
-        screenshot(page, "direct_02_signup.png")
+        _safe_invite_screenshot(page, "direct_02_signup.png")
 
         logger.info("[直接注册] 输入邮箱: %s", email)
+        email_step = _wait_for_direct_register_step(
+            page,
+            {"email", "password", "code", "profile", "completed", "google"},
+            timeout=15,
+        )
+        logger.info("[直接注册] 邮箱步骤初始状态: %s | URL: %s", email_step, page.url)
+
+        if email_step == "google":
+            logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录页")
+            browser.close()
+            return False
+        if email_step == "unknown":
+            logger.warning("[直接注册] 未识别到邮箱步骤 | URL: %s | body=%s", page.url, _page_excerpt(page))
+            browser.close()
+            return False
+
         try:
-            for attempt in range(2):
-                email_input = page.locator(
-                    'input[name="email"], input[type="email"], input[id="email"], '
-                    'input[autocomplete="email"], input[autocomplete="username"], '
-                    'input[placeholder*="email" i], input[placeholder*="Email" i]'
-                ).first
-                if not email_input.is_visible(timeout=5000):
+            for attempt in range(3):
+                step = _detect_direct_register_step(page)
+                if step != "email":
                     break
 
+                email_input = page.locator(_DIRECT_EMAIL_SELECTORS).first
+                email_input.wait_for(state="visible", timeout=5000)
                 email_input.fill(email)
                 time.sleep(0.5)
-                screenshot(page, f"direct_02b_email_filled_{attempt}.png")
-                logger.info("[直接注册] 邮箱已填入，点击 Continue...")
+                logger.info("[直接注册] 邮箱已填入，点击 Continue... (attempt %d)", attempt + 1)
+                _safe_invite_screenshot(page, f"direct_02b_email_filled_{attempt}.png")
                 _click_primary_auth_button(page, email_input, ["Continue", "继续"])
-                time.sleep(5)
-                logger.info("[直接注册] 点击 Continue 后 URL: %s", page.url)
-                screenshot(page, f"direct_02c_after_continue_{attempt}.png")
 
-                if not _is_google_redirect(page):
+                next_step = _wait_for_direct_register_step(
+                    page,
+                    {"email", "password", "code", "profile", "completed", "google"},
+                    timeout=15,
+                )
+                logger.info("[直接注册] 点击 Continue 后状态: %s | URL: %s", next_step, page.url)
+                _safe_invite_screenshot(page, f"direct_02c_after_continue_{attempt}.png")
+
+                if next_step == "google":
+                    _safe_invite_screenshot(page, f"direct_03_google_redirect_attempt{attempt + 1}.png")
+                    logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
+                    page.go_back(wait_until="domcontentloaded", timeout=30000)
+                    time.sleep(2)
+                    continue
+                if next_step != "email":
                     break
 
-                screenshot(page, f"direct_03_google_redirect_attempt{attempt + 1}.png")
-                logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
-                page.go_back(wait_until="domcontentloaded", timeout=30000)
-                time.sleep(2)
-        except Exception:
-            pass
+                logger.warning(
+                    "[直接注册] 点击 Continue 后仍停留在邮箱步骤，准备重试... | URL: %s | body=%s",
+                    page.url,
+                    _page_excerpt(page),
+                )
+        except Exception as exc:
+            logger.warning("[直接注册] 邮箱步骤异常: %s | URL: %s", exc, page.url)
 
-        screenshot(page, "direct_03_after_email.png")
-        logger.info("[直接注册] 当前 URL: %s", page.url)
-        if _is_google_redirect(page):
+        _safe_invite_screenshot(page, "direct_03_after_email.png")
+        current_step = _detect_direct_register_step(page)
+        logger.info("[直接注册] 邮箱步骤结束状态: %s | URL: %s", current_step, page.url)
+        if current_step == "google":
             logger.warning("[直接注册] 邮箱步骤仍停留在 Google 登录页")
+            browser.close()
+            return False
+        if current_step == "email":
+            logger.warning("[直接注册] 邮箱步骤未推进 | URL: %s | body=%s", page.url, _page_excerpt(page))
             browser.close()
             return False
 
         # 等待页面跳转完成（可能跳到 create-account/password）
-        for _wait in range(10):
-            if "password" in page.url or page.locator('input[type="password"]').count() > 0:
-                break
-            time.sleep(1)
-        logger.info("[直接注册] 密码页检测 URL: %s", page.url)
-        screenshot(page, "direct_03b_before_password.png")
+        password_step = _wait_for_direct_register_step(
+            page,
+            {"password", "code", "profile", "completed", "google", "email"},
+            timeout=15,
+        )
+        logger.info("[直接注册] 密码页检测状态: %s | URL: %s", password_step, page.url)
+        _safe_invite_screenshot(page, "direct_03b_before_password.png")
 
         try:
             for attempt in range(2):
-                pwd_input = page.locator('input[type="password"]').first
-                if not pwd_input.is_visible(timeout=10000):
+                if _detect_direct_register_step(page) != "password":
                     logger.info("[直接注册] 未检测到密码输入框，跳过")
                     break
 
+                pwd_input = page.locator(_DIRECT_PASSWORD_SELECTORS).first
+                pwd_input.wait_for(state="visible", timeout=10000)
                 logger.info("[直接注册] 设置密码")
                 pwd_input.fill(password)
                 time.sleep(0.5)
                 _click_primary_auth_button(page, pwd_input, ["Continue", "继续", "Log in"])
-                time.sleep(5)
+                next_step = _wait_for_direct_register_step(
+                    page,
+                    {"password", "code", "profile", "completed", "google", "email"},
+                    timeout=15,
+                )
+                logger.info("[直接注册] 提交密码后状态: %s | URL: %s", next_step, page.url)
 
-                if not _is_google_redirect(page):
+                if next_step == "google":
+                    _safe_invite_screenshot(page, f"direct_04_google_redirect_attempt{attempt + 1}.png")
+                    logger.warning("[直接注册] 密码步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
+                    page.go_back(wait_until="domcontentloaded", timeout=30000)
+                    time.sleep(2)
+                    continue
+                if next_step != "password":
                     break
+        except Exception as exc:
+            logger.warning("[直接注册] 密码步骤异常: %s | URL: %s", exc, page.url)
 
-                screenshot(page, f"direct_04_google_redirect_attempt{attempt + 1}.png")
-                logger.warning("[直接注册] 密码步骤误跳转到 Google 登录，返回重试... (attempt %d)", attempt + 1)
-                page.go_back(wait_until="domcontentloaded", timeout=30000)
-                time.sleep(2)
-        except Exception:
-            pass
-
-        screenshot(page, "direct_04_after_password.png")
-        if _is_google_redirect(page):
+        _safe_invite_screenshot(page, "direct_04_after_password.png")
+        current_step = _detect_direct_register_step(page)
+        if current_step == "google":
             logger.warning("[直接注册] 密码步骤仍停留在 Google 登录页")
+            browser.close()
+            return False
+        if current_step == "email":
+            logger.warning("[直接注册] 提交密码前流程回退到邮箱页 | URL: %s | body=%s", page.url, _page_excerpt(page))
             browser.close()
             return False
 
         code_input = None
         try:
-            code_input = page.locator(
-                'input[name="code"], input[placeholder*="验证码"], input[placeholder*="code" i]'
-            ).first
+            code_input = page.locator(_DIRECT_CODE_SELECTORS).first
             if not code_input.is_visible(timeout=5000):
                 code_input = None
         except Exception:
@@ -901,7 +1019,7 @@ def _register_direct_once(mail_client, email, password):
                 browser.close()
                 return False
 
-        screenshot(page, "direct_05_after_code.png")
+        _safe_invite_screenshot(page, "direct_05_after_code.png")
         logger.info("[直接注册] 当前 URL: %s", page.url)
 
         name_input = page.locator('input[name="name"]').first
@@ -937,7 +1055,7 @@ def _register_direct_once(mail_client, email, password):
         except Exception:
             pass
 
-        screenshot(page, "direct_06_after_profile.png")
+        _safe_invite_screenshot(page, "direct_06_after_profile.png")
         logger.info("[直接注册] 当前 URL: %s", page.url)
 
         try:
@@ -948,7 +1066,7 @@ def _register_direct_once(mail_client, email, password):
         except Exception:
             pass
 
-        screenshot(page, "direct_07_final.png")
+        _safe_invite_screenshot(page, "direct_07_final.png")
 
         current_url = page.url
         success = "chatgpt.com" in current_url and "auth" not in current_url and not _is_google_redirect(page)
@@ -1242,40 +1360,56 @@ def cmd_rotate(target_seats=5):
         # 移出所有 exhausted 账号（包括之前已标记的）
         all_accounts = load_accounts()
         all_exhausted = [a for a in all_accounts if a["status"] == STATUS_EXHAUSTED]
+        initial_api_count = -1
+        removed_now = 0
+        already_absent_count = 0
 
         if all_exhausted:
             logger.info("[3/5] 移出 %d 个额度用完的账号...", len(all_exhausted))
             ensure_chatgpt()
+            initial_api_count = get_team_member_count(chatgpt)
             for acc in all_exhausted:
                 email = acc["email"]
                 if not chatgpt.browser:
                     chatgpt.start()
-                if remove_from_team(chatgpt, email):
+                remove_status = remove_from_team(chatgpt, email, return_status=True)
+                if remove_status in ("removed", "already_absent"):
                     update_account(email, status=STATUS_STANDBY)
-                    logger.info("[3/5] %s → standby", email)
+                    if remove_status == "removed":
+                        removed_now += 1
+                        logger.info("[3/5] %s → standby（已从 Team 移出）", email)
+                    else:
+                        already_absent_count += 1
+                        logger.info("[3/5] %s → standby（远端已不存在）", email)
         else:
             logger.info("[3/5] 无需移出账号")
-
-        removed_count = len(
-            [
-                a
-                for a in all_exhausted
-                if find_account(load_accounts(), a["email"])
-                and find_account(load_accounts(), a["email"])["status"] == STATUS_STANDBY
-            ]
-        )
         if not chatgpt or not chatgpt.browser:
             ensure_chatgpt()
         api_count = get_team_member_count(chatgpt)
-        logger.info("[4/5] API 返回成员数: %d（本轮移出: %d）", api_count, removed_count)
+        logger.info(
+            "[4/5] API 返回成员数: %d（实际移出: %d，远端已缺席: %d）",
+            api_count,
+            removed_now,
+            already_absent_count,
+        )
         if api_count <= 0:
             # API 返回异常，用本地 active 账号数兜底
             local_active = sum(1 for a in load_accounts() if a["status"] == STATUS_ACTIVE)
             logger.warning("[4/5] API 成员数异常 (%d)，使用本地 active 数: %d", api_count, local_active)
             current_count = local_active
         else:
-            # API 有缓存延迟，移出后可能返回旧数据，手动修正
-            current_count = max(0, api_count - removed_count)
+            # 保守估算当前成员数：
+            # - api_count 是移除后的最新观察值
+            # - initial_api_count - removed_now 是基于移除前人数的理论下界
+            # 若远端成员本就不存在（already_absent），不能再从 api_count 里额外扣减，否则会少算人数。
+            estimates = [api_count]
+            if initial_api_count > 0 and removed_now > 0:
+                estimates.append(max(0, initial_api_count - removed_now))
+            current_count = min(estimates)
+            if len(estimates) > 1 and current_count != api_count:
+                logger.info(
+                    "[4/5] 成员数保守估算: %d（初始=%d，移出=%d）", current_count, initial_api_count, removed_now
+                )
         vacancies = TARGET - current_count
 
         if vacancies <= 0:
@@ -1390,16 +1524,15 @@ def cmd_rotate(target_seats=5):
         remaining = TARGET - current_count
         if remaining <= 0:
             logger.info("[4/5] 已用旧账号填满空缺")
-            return
-
-        # 必须创建新号
-        logger.info("[5/5] 创建 %d 个新账号...", remaining)
-        for i in range(remaining):
-            logger.info("[5/5] 创建第 %d/%d 个...", i + 1, remaining)
-            if not chatgpt or not chatgpt.browser:
-                ensure_chatgpt()
-            if create_new_account(chatgpt, ensure_mail()):
-                current_count += 1
+        else:
+            # 必须创建新号
+            logger.info("[5/5] 创建 %d 个新账号...", remaining)
+            for i in range(remaining):
+                logger.info("[5/5] 创建第 %d/%d 个...", i + 1, remaining)
+                if not chatgpt or not chatgpt.browser:
+                    ensure_chatgpt()
+                if create_new_account(chatgpt, ensure_mail()):
+                    current_count += 1
 
         if not chatgpt or not chatgpt.browser:
             ensure_chatgpt()
@@ -1548,6 +1681,35 @@ def cmd_admin_login(email=None):
     except KeyboardInterrupt:
         logger.warning("[管理员登录] 已中断")
         return None
+    finally:
+        chatgpt.stop()
+
+
+def cmd_admin_session(email=None):
+    """手动导入管理员 session_token 并保存到 state.json。"""
+    email = (email or "").strip()
+    if not email:
+        email = input("管理员邮箱: ").strip()
+
+    if not email:
+        logger.error("[管理员登录] 邮箱不能为空")
+        return None
+
+    session_token = getpass.getpass("session_token（留空取消）: ").strip()
+    if not session_token:
+        logger.warning("[管理员登录] 已取消")
+        return None
+
+    chatgpt = ChatGPTTeamAPI()
+    try:
+        logger.info("[管理员登录] 开始导入 session_token: %s", email)
+        info = chatgpt.import_admin_session(email, session_token)
+        logger.info("[管理员登录] session_token 导入完成: %s", info.get("email") or email)
+        if info.get("account_id"):
+            logger.info("[管理员登录] Workspace ID: %s", info["account_id"])
+        if info.get("workspace_name"):
+            logger.info("[管理员登录] Workspace 名称: %s", info["workspace_name"])
+        return info
     finally:
         chatgpt.stop()
 
@@ -1816,6 +1978,8 @@ def main():
     sub.add_parser("manual-add", help="手动 OAuth 添加账号（打开链接登录后粘贴回调 URL）")
     admin_login_p = sub.add_parser("admin-login", help="交互式完成管理员主号登录")
     admin_login_p.add_argument("--email", help="管理员邮箱；不传则运行时交互输入")
+    admin_session_p = sub.add_parser("admin-session", help="手动输入 session_token 导入管理员登录态")
+    admin_session_p.add_argument("--email", help="管理员邮箱；不传则运行时交互输入")
     sub.add_parser("main-codex-sync", help="交互式同步主号 Codex 到 CPA")
 
     fill_p = sub.add_parser("fill", help="补满 Team 成员到指定数量")
@@ -1855,6 +2019,8 @@ def main():
         cmd_manual_add()
     elif args.command == "admin-login":
         cmd_admin_login(args.email)
+    elif args.command == "admin-session":
+        cmd_admin_session(args.email)
     elif args.command == "main-codex-sync":
         cmd_main_codex_sync()
     elif args.command == "fill":

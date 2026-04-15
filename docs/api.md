@@ -77,6 +77,7 @@ Authorization: Bearer <API_KEY>
 |------|------|------|
 | GET | `/api/admin/status` | 管理员状态 |
 | POST | `/api/admin/login/start` | 开始登录 `{"email": "admin@example.com"}` |
+| POST | `/api/admin/login/session` | 手动导入 session_token `{"email": "admin@example.com", "session_token": "..."}` |
 | POST | `/api/admin/login/password` | 提交密码 `{"password": "..."}` |
 | POST | `/api/admin/login/code` | 提交验证码 `{"code": "123456"}` |
 | POST | `/api/admin/login/workspace` | 选择组织 `{"option_id": "0"}` |

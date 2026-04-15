@@ -320,6 +320,11 @@ class AdminEmailParams(BaseModel):
     email: str
 
 
+class AdminSessionParams(BaseModel):
+    email: str
+    session_token: str
+
+
 class AdminPasswordParams(BaseModel):
     password: str
 
@@ -523,6 +528,46 @@ def post_admin_login_start(params: AdminEmailParams):
         if _playwright_lock.locked():
             _playwright_lock.release()
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/admin/login/session")
+def post_admin_login_session(params: AdminSessionParams):
+    """手动导入管理员 session_token。"""
+    global _admin_login_api, _admin_login_step
+
+    if _admin_login_api:
+        post_admin_login_cancel()
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail=_current_busy_detail("有任务正在执行，请等待完成后再导入管理员 session_token"),
+        )
+
+    try:
+        from autoteam.chatgpt_api import ChatGPTTeamAPI
+
+        logger.info("[API] 导入管理员 session_token: %s", params.email.strip())
+
+        def _do_import(email, session_token):
+            api = ChatGPTTeamAPI()
+            try:
+                return api.import_admin_session(email, session_token)
+            finally:
+                api.stop()
+
+        info = _pw_executor.run(_do_import, params.email.strip(), params.session_token.strip())
+        _admin_login_api = None
+        _admin_login_step = None
+        return {"status": "completed", "admin": _admin_status(), "info": info}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[API] 导入管理员 session_token 失败")
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        if _playwright_lock.locked():
+            _playwright_lock.release()
 
 
 @app.post("/api/admin/login/password")
