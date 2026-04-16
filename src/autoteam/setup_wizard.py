@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 ENV_FILE = PROJECT_ROOT / ".env"
 ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
 
-# 需要交互式输入的配置项（key, 提示, 默认值, 是否可选）
+# 启动配置项（key, 提示, 默认值, 是否可选）
 REQUIRED_CONFIGS = [
     ("CLOUDMAIL_BASE_URL", "CloudMail API 地址", "", False),
     ("CLOUDMAIL_EMAIL", "CloudMail 登录邮箱", "", False),
@@ -71,6 +71,7 @@ def _is_interactive() -> bool:
 def check_and_setup(interactive: bool = True) -> bool:
     """
     检查必填配置是否齐全，缺失时交互式提示输入。
+    标记为可选的配置项不会阻塞启动，也不会在首次向导中强制提示。
     返回 True 表示配置完整，False 表示用户中断或非交互模式下缺配置。
     """
     interactive = interactive and _is_interactive()
@@ -79,7 +80,7 @@ def check_and_setup(interactive: bool = True) -> bool:
 
     for key, prompt, default, optional in REQUIRED_CONFIGS:
         val = env.get(key, "") or os.environ.get(key, "")
-        if not val:
+        if not val and not optional:
             missing.append((key, prompt, default, optional))
 
     if not missing:
