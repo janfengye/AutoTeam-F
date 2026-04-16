@@ -15,11 +15,9 @@ from playwright.sync_api import sync_playwright
 import autoteam.display  # noqa: F401
 from autoteam.admin_state import (
     get_admin_email,
-    get_admin_password,
     get_admin_session_token,
     get_chatgpt_account_id,
     get_chatgpt_workspace_name,
-    update_admin_state,
 )
 from autoteam.auth_storage import AUTH_DIR, ensure_auth_dir, ensure_auth_file_permissions
 from autoteam.textio import write_text
@@ -1083,6 +1081,20 @@ class SessionCodexAuthFlow:
         'input[inputmode="numeric"]',
         'input[autocomplete="one-time-code"]',
     ]
+    OTP_OPTION_SELECTORS = [
+        'button:has-text("一次性验证码")',
+        'button:has-text("邮箱验证码")',
+        'button:has-text("Email login")',
+        'button:has-text("email login")',
+        'button:has-text("one-time")',
+        'button:has-text("One-time")',
+        'button:has-text("email code")',
+        'button:has-text("Email code")',
+        'a:has-text("一次性验证码")',
+        'a:has-text("邮箱验证码")',
+        'a:has-text("Email login")',
+        'a:has-text("one-time")',
+    ]
 
     def __init__(
         self,
@@ -1278,6 +1290,23 @@ class SessionCodexAuthFlow:
         time.sleep(5)
         return True
 
+    def _switch_password_to_otp(self):
+        otp_entry = self._visible_locator(self.OTP_OPTION_SELECTORS, timeout_ms=1500)
+        if not otp_entry:
+            return False
+
+        try:
+            otp_entry.click()
+        except Exception:
+            try:
+                otp_entry.click(force=True)
+            except Exception:
+                return False
+
+        logger.info("[Codex] 主号流程检测到密码页，自动切换到一次性验证码登录")
+        time.sleep(3)
+        return True
+
     def _advance(self, attempts=12):
         for _ in range(attempts):
             step, detail = self._detect_step()
@@ -1285,17 +1314,18 @@ class SessionCodexAuthFlow:
                 return {"step": "completed", "detail": detail}
             if step == "code_required":
                 return {"step": "code_required", "detail": detail}
-            if step == "password_required" and not self.password:
-                return {"step": "password_required", "detail": detail}
+            if step == "password_required":
+                if self._switch_password_to_otp():
+                    continue
+                return {
+                    "step": "unsupported_password",
+                    "detail": "主号 Codex 当前停留在密码页，且未找到一次性验证码入口",
+                }
 
             if step == "email_required":
                 if self._auto_fill_email():
                     continue
                 return {"step": "email_required", "detail": detail}
-
-            if step == "password_required" and self.password:
-                if self._auto_fill_password():
-                    continue
 
             if self._click_workspace_or_consent():
                 continue
@@ -1377,8 +1407,8 @@ class MainCodexSyncFlow(SessionCodexAuthFlow):
             session_token=get_admin_session_token(),
             account_id=get_chatgpt_account_id(),
             workspace_name=get_chatgpt_workspace_name(),
-            password=get_admin_password(),
-            password_callback=lambda password: update_admin_state(password=password),
+            password="",
+            password_callback=None,
             auth_file_callback=save_main_auth_file,
         )
 
