@@ -1222,6 +1222,7 @@ def get_team_members():
         raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再查询"))
 
     try:
+
         def _fetch_team_members():
             from autoteam.account_ops import fetch_team_state
             from autoteam.accounts import load_accounts
