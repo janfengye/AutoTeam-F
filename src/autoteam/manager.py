@@ -101,6 +101,167 @@ def _auto_reuse_skip_reason(acc: dict | None) -> str | None:
     return None
 
 
+# Team 子账号(非主号)硬上限。主号 + 4 子号 = 5 席,与 cmd_rotate / cmd_fill 默认 target=5 一致。
+# 超过这个数说明有"假 standby / 假 personal"在 Team 里占席位(同步延迟或历史 bug 遗留),
+# _reconcile_team_members 会按优先级 kick 多余者,永不让 Team 超出 4 子号。
+TEAM_SUB_ACCOUNT_HARD_CAP = 4
+
+
+def _reconcile_team_members(chatgpt_api=None):
+    """对账:Team 实际成员 vs 本地 accounts.json,修复一切不一致。
+
+    触发原因:历史 bug(OpenAI /users 同步延迟 → remove_from_team already_absent 误判 →
+    DELETE 被跳过)在 Team 里留下"假 standby""假 personal"遗留成员,占 4 子号的席位。
+    新版 remove_from_team 已带 retry 修复源头,但对账层仍需兜底:
+
+    处理矩阵:
+        Team里 + 本地 active    → 正常,不动
+        Team里 + 本地 pending   → 注册完成,升 active
+        Team里 + 本地 standby   → 假 standby(应被踢但未踢),KICK
+        Team里 + 本地 exhausted → 应被踢但未踢,KICK
+        Team里 + 本地 personal  → fill-personal 本应踢出,KICK
+        Team里 + 本地无记录     → 手动邀请/其他来源,sync_account_states 会补录
+
+    之后若 Team 非主号子账号仍 > TEAM_SUB_ACCOUNT_HARD_CAP,按 exhausted → personal →
+    standby → 额度最低的 active 顺序 kick 到刚好 4 为止。
+
+    返回 dict: {kicked: [email...], flipped_to_active: [email...], over_cap_kicked: [email...]}
+    """
+    result = {"kicked": [], "flipped_to_active": [], "over_cap_kicked": []}
+    account_id = get_chatgpt_account_id()
+    if not account_id:
+        logger.warning("[对账] account_id 为空,跳过对账")
+        return result
+
+    need_stop = False
+    if not chatgpt_api or not getattr(chatgpt_api, "browser", None):
+        try:
+            chatgpt_api = ChatGPTTeamAPI()
+            chatgpt_api.start()
+            need_stop = True
+        except Exception as exc:
+            logger.warning("[对账] 无法启动 ChatGPTTeamAPI,跳过对账: %s", exc)
+            return result
+
+    try:
+        path = f"/backend-api/accounts/{account_id}/users"
+        resp = chatgpt_api._api_fetch("GET", path)
+        if resp.get("status") != 200:
+            logger.warning("[对账] /users 返回 status=%s,跳过", resp.get("status"))
+            return result
+        try:
+            data = json.loads(resp.get("body") or "{}")
+        except Exception as exc:
+            logger.warning("[对账] 解析 /users body 失败: %s", exc)
+            return result
+        members = data.get("items", data.get("users", data.get("members", [])))
+
+        accounts = load_accounts()
+        by_email = {(a.get("email") or "").lower(): a for a in accounts}
+
+        # 收集 Team 里非主号成员
+        team_subs = []
+        for m in members:
+            email = (m.get("email") or "").lower()
+            if not email or _is_main_account_email(email):
+                continue
+            team_subs.append((email, m))
+
+        # 第一轮:按状态对账
+        for email, _m in team_subs:
+            acc = by_email.get(email)
+            if not acc:
+                continue
+            status = acc.get("status")
+            if status == STATUS_ACTIVE:
+                continue
+            if status == STATUS_PENDING:
+                logger.info("[对账] %s pending → active(Team 里已存在)", email)
+                update_account(acc.get("email"), status=STATUS_ACTIVE)
+                result["flipped_to_active"].append(email)
+                continue
+            if status in (STATUS_STANDBY, STATUS_EXHAUSTED, STATUS_PERSONAL):
+                logger.warning("[对账] %s 本地=%s 但 Team 里仍挂着,KICK", email, status)
+                try:
+                    remove_status = remove_from_team(chatgpt_api, acc.get("email"), return_status=True)
+                    if remove_status in ("removed", "already_absent"):
+                        # standby/exhausted 保留原状态,personal 也保留(下次 fill-personal 才会真处理)
+                        result["kicked"].append(email)
+                    else:
+                        logger.error("[对账] KICK %s 失败: status=%s", email, remove_status)
+                except Exception as exc:
+                    logger.error("[对账] KICK %s 抛异常: %s", email, exc)
+
+        # 第二轮:硬上限 4 子号。kick 完上面的,再拉一次 /users 得到最新数
+        resp2 = chatgpt_api._api_fetch("GET", path)
+        if resp2.get("status") == 200:
+            try:
+                data2 = json.loads(resp2.get("body") or "{}")
+                members2 = data2.get("items", data2.get("users", data2.get("members", [])))
+            except Exception:
+                members2 = members
+        else:
+            members2 = members
+
+        remaining_subs = [
+            (m.get("email") or "").lower()
+            for m in members2
+            if (m.get("email") or "") and not _is_main_account_email(m.get("email"))
+        ]
+        excess = len(remaining_subs) - TEAM_SUB_ACCOUNT_HARD_CAP
+        if excess > 0:
+            logger.warning(
+                "[对账] Team 子号 %d > 硬上限 %d,按优先级 kick %d 个",
+                len(remaining_subs),
+                TEAM_SUB_ACCOUNT_HARD_CAP,
+                excess,
+            )
+            accounts_now = load_accounts()
+            acc_map = {(a.get("email") or "").lower(): a for a in accounts_now}
+
+            def _priority(email):
+                # 优先级越小越先 kick
+                a = acc_map.get(email)
+                if not a:
+                    return (0, 0)  # 不在本地的未知账号最先 kick
+                st = a.get("status")
+                if st == STATUS_EXHAUSTED:
+                    return (1, 0)
+                if st == STATUS_PERSONAL:
+                    return (2, 0)
+                if st == STATUS_STANDBY:
+                    return (3, 0)
+                if st == STATUS_ACTIVE:
+                    # active 按额度剩余从低到高 kick
+                    lq = a.get("last_quota") or {}
+                    p_remain = 100 - lq.get("primary_pct", 0)
+                    return (4, p_remain)
+                return (5, 0)
+
+            victims = sorted(remaining_subs, key=_priority)[:excess]
+            for email in victims:
+                try:
+                    remove_status = remove_from_team(chatgpt_api, email, return_status=True)
+                    if remove_status in ("removed", "already_absent"):
+                        acc = acc_map.get(email)
+                        if acc and acc.get("status") == STATUS_ACTIVE:
+                            update_account(acc.get("email"), status=STATUS_STANDBY)
+                        result["over_cap_kicked"].append(email)
+                        logger.info("[对账] 超员 kick %s (priority=%s)", email, _priority(email))
+                    else:
+                        logger.error("[对账] 超员 kick %s 失败: status=%s", email, remove_status)
+                except Exception as exc:
+                    logger.error("[对账] 超员 kick %s 抛异常: %s", email, exc)
+    finally:
+        if need_stop:
+            try:
+                chatgpt_api.stop()
+            except Exception:
+                pass
+
+    return result
+
+
 def sync_account_states(chatgpt_api=None):
     """根据 Team 实际成员列表同步本地账号状态"""
     account_id = get_chatgpt_account_id()
@@ -440,6 +601,21 @@ def cmd_check():
                     email,
                 )
             # status_str == "no_auth" 已在 _check_and_refresh 里被 auth_file 判空挡掉
+
+    # 入口先跑一次对账:凡是"Team 里挂着但本地 standby/exhausted/personal"的遗留成员,
+    # 统一 kick。顺便把 Team 子号硬压到 TEAM_SUB_ACCOUNT_HARD_CAP(4)以内。
+    # 这里失败不影响后续额度检查(已有 try/except 包裹),避免对账异常把整个 check 打挂。
+    try:
+        recon = _reconcile_team_members()
+        if recon.get("kicked") or recon.get("over_cap_kicked") or recon.get("flipped_to_active"):
+            logger.info(
+                "[检查] 对账结果:kicked=%d, over_cap_kicked=%d, flipped_to_active=%d",
+                len(recon.get("kicked", [])),
+                len(recon.get("over_cap_kicked", [])),
+                len(recon.get("flipped_to_active", [])),
+            )
+    except Exception as exc:
+        logger.warning("[检查] 对账阶段抛异常(跳过,不影响额度检查): %s", exc)
 
     accounts = load_accounts()
 
