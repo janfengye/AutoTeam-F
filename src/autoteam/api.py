@@ -1859,6 +1859,32 @@ def post_rotate(params: TaskParams = TaskParams()):
     return task
 
 
+class ReplaceParams(BaseModel):
+    email: str
+    reason: str = "manual"
+
+
+@app.post("/api/tasks/replace", status_code=202)
+def post_replace(params: ReplaceParams):
+    """定点替换一个 Team 子号:kick + 补一个(标准行为:优先 standby 复用,否则新号)。
+
+    失效一个立即轮换一个的手动触发入口,也可由 auto-check 自动调用 cmd_replace_batch。
+    """
+    from autoteam.manager import cmd_replace_one
+
+    email = (params.email or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="email 不能为空")
+    task = _start_task(
+        "replace",
+        cmd_replace_one,
+        {"email": email, "reason": params.reason},
+        email,
+        params.reason,
+    )
+    return task
+
+
 @app.post("/api/tasks/add", status_code=202)
 def post_add():
     """添加新账号（后台执行）"""
@@ -2014,29 +2040,38 @@ def _auto_check_loop():
                     "[巡检] %d 个账号额度不足: %s", len(low_accounts), ", ".join(f"{e}({r}%)" for e, r in low_accounts)
                 )
 
-            if len(low_accounts) >= cfg["min_low"]:
-                # 检查是否有任务在跑
+                # 有任务在跑则本轮跳过(下轮再替换,避免重复 kick)
                 if not _playwright_lock.acquire(blocking=False):
-                    logger.info("[巡检] 有任务正在执行，跳过本轮自动轮转")
+                    logger.info("[巡检] 有任务正在执行，本轮跳过即时替换")
                     continue
                 _playwright_lock.release()
 
-                # 将低于阈值的账号标记为 exhausted，rotate 会自动移出并补充
+                # 先标记 exhausted,cmd_check 入口的对账在此之后再看到就会补 kick(双保险)
                 from autoteam.accounts import STATUS_EXHAUSTED, update_account
 
+                emails_to_replace = []
                 for email, remaining in low_accounts:
-                    logger.info("[巡检] %s 剩余 %d%%，标记为 exhausted", email, remaining)
+                    logger.info("[巡检] %s 剩余 %d%%，立即替换", email, remaining)
                     update_account(email, status=STATUS_EXHAUSTED, quota_exhausted_at=time.time())
+                    emails_to_replace.append(email)
 
-                logger.info("[巡检] 触发自动轮转...")
-                from autoteam.manager import cmd_rotate
+                # 失效一个立即轮换一个:逐个 kick+补一个,不等凑 min_low 也不走全量 cmd_rotate。
+                # min_low 字段保留作兼容(当前不参与判断),前端可继续配置但无语义效果。
+                logger.info("[巡检] 触发即时替换 (%d 个)...", len(emails_to_replace))
+                from autoteam.manager import cmd_replace_batch
 
                 try:
-                    _start_task("auto-rotate", cmd_rotate, {"target": 5, "trigger": "auto-check"}, 5)
+                    _start_task(
+                        "auto-replace",
+                        cmd_replace_batch,
+                        {"emails": emails_to_replace, "trigger": "auto-check"},
+                        emails_to_replace,
+                        "auto-check",
+                    )
                 except Exception as e:
-                    logger.error("[巡检] 自动轮转失败: %s", e)
+                    logger.error("[巡检] 即时替换启动失败: %s", e)
             else:
-                logger.info("[巡检] 额度正常，无需轮转")
+                logger.info("[巡检] 额度正常，无需替换")
 
         except Exception as e:
             logger.error("[巡检] 巡检异常: %s", e)

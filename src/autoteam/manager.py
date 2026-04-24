@@ -2090,6 +2090,153 @@ def reinvite_account(chatgpt_api, mail_client, acc):
     return True
 
 
+def _replace_single(chatgpt, mail_client, email, reason=""):
+    """定点替换一个失效子号(内部实现,复用外部传入的 chatgpt_api + mail_client)。
+
+    流程:kick 目标 → 补一个(优先 standby 复用,否则新号)。补位后若 Team 子号已达
+    TEAM_SUB_ACCOUNT_HARD_CAP 则停止,不会超员。
+
+    返回 dict: {kicked: bool, filled_by: email|None, method: "reuse"|"new"|None, error: str|None}
+    """
+    outcome = {"kicked": False, "filled_by": None, "method": None, "error": None}
+
+    if _is_main_account_email(email):
+        outcome["error"] = "skip_main"
+        logger.warning("[替换] 跳过主号: %s", email)
+        return outcome
+
+    # 1. kick 失效账号(新版带 retry,already_absent 也算成功)
+    logger.info("[替换] kick %s (reason=%s)", email, reason or "unspecified")
+    try:
+        kick_status = remove_from_team(chatgpt, email, return_status=True)
+    except Exception as exc:
+        outcome["error"] = f"kick_exception: {exc}"
+        logger.error("[替换] kick %s 抛异常: %s", email, exc)
+        return outcome
+    if kick_status not in ("removed", "already_absent"):
+        outcome["error"] = f"kick_failed: {kick_status}"
+        logger.error("[替换] kick %s 失败 status=%s,不补位", email, kick_status)
+        return outcome
+    outcome["kicked"] = True
+    update_account(email, status=STATUS_STANDBY)
+
+    # 2. 确认当前 Team 非主号子号数,判断是否还有空位
+    try:
+        current_total = get_team_member_count(chatgpt)
+    except Exception as exc:
+        logger.warning("[替换] 获取 Team 成员数抛异常: %s,跳过补位", exc)
+        outcome["error"] = f"count_exception: {exc}"
+        return outcome
+    if current_total < 0:
+        outcome["error"] = "count_failed"
+        return outcome
+    sub_count = current_total - 1  # 减主号
+    if sub_count >= TEAM_SUB_ACCOUNT_HARD_CAP:
+        logger.info("[替换] Team 子号已达 %d/%d,无需补位", sub_count, TEAM_SUB_ACCOUNT_HARD_CAP)
+        return outcome
+
+    # 3. 优先从 standby 复用,排除刚 kick 的同一 email 防止自环
+    email_lc = (email or "").lower()
+    standby_list = [
+        a
+        for a in get_standby_accounts()
+        if a.get("_quota_recovered")
+        and not _is_main_account_email(a.get("email"))
+        and (a.get("email") or "").lower() != email_lc
+    ]
+    for acc in standby_list:
+        skip_reason = _auto_reuse_skip_reason(acc)
+        if skip_reason:
+            logger.info("[替换] 跳过 %s(%s)", acc.get("email"), skip_reason)
+            continue
+        cand_email = acc.get("email")
+        logger.info("[替换] 尝试复用 standby: %s", cand_email)
+        if not chatgpt.browser:
+            chatgpt.start()
+        if reinvite_account(chatgpt, mail_client, acc):
+            outcome["filled_by"] = cand_email
+            outcome["method"] = "reuse"
+            logger.info("[替换] 补位成功(复用): %s → %s", email, cand_email)
+            return outcome
+        # reinvite_account 内部失败已 cleanup,继续下一个候选
+
+    # 4. 无可复用 standby → 创建新号
+    logger.info("[替换] 无可复用 standby,创建新号补位...")
+    if not chatgpt.browser:
+        chatgpt.start()
+    try:
+        new_email = create_new_account(chatgpt, mail_client)
+    except Exception as exc:
+        outcome["error"] = f"create_exception: {exc}"
+        logger.error("[替换] 创建新号抛异常: %s", exc)
+        return outcome
+    if new_email:
+        outcome["filled_by"] = new_email
+        outcome["method"] = "new"
+        logger.info("[替换] 补位成功(新号): %s → %s", email, new_email)
+    else:
+        outcome["error"] = "create_failed"
+        logger.error("[替换] 新号创建失败,席位暂缺")
+    return outcome
+
+
+def cmd_replace_one(email, reason=""):
+    """立即替换一个失效 Team 子号(外部入口,自建 chatgpt + mail)。
+
+    相比 cmd_rotate 全量走一遍 check + 批量补位,这里只针对单个席位做 kick+补一个,
+    响应更快。适合 auto-check 巡检发现失效立即逐个替换的场景。
+    """
+    chatgpt = ChatGPTTeamAPI()
+    chatgpt.start()
+    mail_client = CloudMailClient()
+    mail_client.login()
+    try:
+        return _replace_single(chatgpt, mail_client, email, reason=reason)
+    finally:
+        if chatgpt.browser:
+            chatgpt.stop()
+        try:
+            sync_to_cpa()
+        except Exception as exc:
+            logger.warning("[替换] sync_to_cpa 抛异常(忽略): %s", exc)
+
+
+def cmd_replace_batch(emails, trigger=""):
+    """批量立即替换:逐个 kick+补一个,复用同一个 ChatGPT/mail 实例(省浏览器启停)。
+
+    串行执行,失败不阻塞后续。返回 outcome 列表。
+    用于 auto-check 同轮发现多个失效时一次性处理。
+    """
+    if not emails:
+        return []
+    chatgpt = ChatGPTTeamAPI()
+    chatgpt.start()
+    mail_client = CloudMailClient()
+    mail_client.login()
+    outcomes = []
+    try:
+        for email in emails:
+            try:
+                if not chatgpt.browser:
+                    chatgpt.start()
+                out = _replace_single(chatgpt, mail_client, email, reason=trigger or "batch")
+                outcomes.append({"email": email, **out})
+            except Exception as exc:
+                logger.error("[替换] %s 单个替换抛异常: %s", email, exc)
+                outcomes.append({"email": email, "kicked": False, "filled_by": None, "error": f"exception: {exc}"})
+    finally:
+        if chatgpt.browser:
+            chatgpt.stop()
+        try:
+            sync_to_cpa()
+        except Exception as exc:
+            logger.warning("[替换] sync_to_cpa 抛异常(忽略): %s", exc)
+
+    ok = sum(1 for o in outcomes if o.get("filled_by"))
+    logger.info("[替换] 批量完成 %d/%d 个补位成功(trigger=%s)", ok, len(outcomes), trigger or "-")
+    return outcomes
+
+
 def cmd_rotate(target_seats=5):
     """
     智能轮转 - 保持 Team 始终有 target_seats 个可用成员，尽量少创建新账号。
