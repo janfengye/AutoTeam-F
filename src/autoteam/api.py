@@ -2032,6 +2032,42 @@ def _auto_check_loop():
                 and Path(a["auth_file"]).exists()
             ]
 
+            # Watchdog:active 账号数 < TEAM_SUB_ACCOUNT_HARD_CAP 时自动补位。
+            # 之前的 `if not active: continue` 在 4 个 active 全 kick 进 standby
+            # 之后会让 Team 永远萎缩 —— 因为 _auto_check_loop 只盯 active 的额度,active=0
+            # 时根本不进循环,没人触发补位。结果用户看到 Team 长期只有 2~3 个子号。
+            # 这里走 cmd_rotate 全流程(check→kick exhausted→fill from standby→create new),
+            # 把 Team 恢复到 5 席(主号 + TEAM_SUB_ACCOUNT_HARD_CAP)。
+            from autoteam.manager import TEAM_SUB_ACCOUNT_HARD_CAP
+
+            if len(active) < TEAM_SUB_ACCOUNT_HARD_CAP:
+                if not _playwright_lock.acquire(blocking=False):
+                    logger.info(
+                        "[巡检] active=%d < %d 但有任务在跑,本轮先跳过自动补位",
+                        len(active),
+                        TEAM_SUB_ACCOUNT_HARD_CAP,
+                    )
+                    continue
+                _playwright_lock.release()
+                logger.warning(
+                    "[巡检] active 账号 %d < %d,触发 auto-fill(cmd_rotate 全流程补位)",
+                    len(active),
+                    TEAM_SUB_ACCOUNT_HARD_CAP,
+                )
+                from autoteam.manager import cmd_rotate
+
+                try:
+                    _start_task(
+                        "auto-fill",
+                        cmd_rotate,
+                        {"target_seats": TEAM_SUB_ACCOUNT_HARD_CAP + 1},
+                        TEAM_SUB_ACCOUNT_HARD_CAP + 1,
+                    )
+                except Exception as e:
+                    logger.error("[巡检] auto-fill 启动失败: %s", e)
+                # 触发后本轮不再做"低额度替换",免得跟 cmd_rotate 抢锁
+                continue
+
             if not active:
                 continue
 

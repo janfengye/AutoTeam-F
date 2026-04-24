@@ -2104,11 +2104,14 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 threshold = 10
             status_str, info = check_codex_quota(access_token)
             if status_str == "ok" and isinstance(info, dict):
+                # 不论真假恢复,都写一份最新 last_quota:UI 上看到的额度必须是最新事实,
+                # 否则用户/下游看到的还是上次成功时的旧值(比如 0% 剩 100%)误判可用,
+                # 这正是之前"01544b9745 last_quota.primary_pct=0 但 status=standby 死锁"
+                # 的根因(假恢复分支静默吞了实测结果)。
+                update_account(email, last_quota=info)
                 p_remain = 100 - info.get("primary_pct", 0)
                 if p_remain >= threshold:
                     quota_verified = True
-                    # 顺手写一份新鲜 last_quota,下次 get_standby_accounts 判断更准
-                    update_account(email, last_quota=info)
                 else:
                     logger.warning(
                         "[轮转] %s OAuth 成功但实测 5h 剩余 %d%% < %d%%,判定假恢复",
@@ -2117,6 +2120,11 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                         threshold,
                     )
             elif status_str == "exhausted":
+                # exhausted 路径 check_codex_quota 在 info 里塞了 quota_info 子结构,
+                # 拆出来写本地 last_quota。
+                quota_info = quota_result_quota_info(info) or {}
+                if quota_info:
+                    update_account(email, last_quota=quota_info)
                 logger.warning("[轮转] %s OAuth 成功但实测 exhausted,判定假恢复", email)
             else:
                 logger.warning("[轮转] %s OAuth 成功但额度验证返回 status=%s,保守判定假恢复", email, status_str)
@@ -2229,6 +2237,8 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
                 if access_token:
                     status_str, info = check_codex_quota(access_token)
                     if status_str == "ok" and isinstance(info, dict):
+                        # 实测结果统一刷新 last_quota,避免 UI/下游看到陈旧数据
+                        update_account(cand_email, last_quota=info)
                         p_remain = 100 - info.get("primary_pct", 0)
                         if p_remain >= threshold:
                             quota_ok = True
@@ -2236,6 +2246,9 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
                             logger.info("[替换] 跳过 %s(实测 5h 剩余 %d%% < %d%%)", cand_email, p_remain, threshold)
                             continue
                     elif status_str == "exhausted":
+                        quota_info = quota_result_quota_info(info) or {}
+                        if quota_info:
+                            update_account(cand_email, last_quota=quota_info)
                         logger.info("[替换] 跳过 %s(实测 exhausted)", cand_email)
                         continue
                     # auth_error:token 失效,不是"额度真恢复"的证据,跳过
