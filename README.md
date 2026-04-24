@@ -4,7 +4,7 @@
 
 **面向 ChatGPT Team 的账号轮转与认证同步工具 · Fix + Free 增强版**
 
-基于 [cnitlrt/AutoTeam](https://github.com/cnitlrt/AutoTeam) 的 fork，修掉若干阻塞性 bug，新增**批量生产免费号（Personal）**能力，改善操作体验。
+基于 [cnitlrt/AutoTeam](https://github.com/cnitlrt/AutoTeam) 的 fork，修掉若干阻塞性 bug，新增 **批量生产免费号（Personal）** 能力，改善操作体验。
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![Playwright](https://img.shields.io/badge/Playwright-Chromium-2EAD33?style=for-the-badge&logo=playwright&logoColor=white)](https://playwright.dev)
