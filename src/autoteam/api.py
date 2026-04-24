@@ -2045,13 +2045,23 @@ def _auto_check_loop():
                     continue
                 _playwright_lock.release()
 
-                # 先标记 exhausted,cmd_check 入口的对账在此之后再看到就会补 kick(双保险)
+                # 先标记 exhausted,cmd_check 入口的对账在此之后再看到就会补 kick(双保险)。
+                # 必须同时写 quota_resets_at —— 否则 get_standby_accounts() 看到 None 就默认
+                # _quota_recovered=True,导致后续 rotate/replace 立刻把这个 0% 账号当可复用号
+                # 反复 reinvite 进 Team,席位来回洗同一批耗尽账号永远不换新鲜的。
+                # 阈值默认 5h(18000s),与 check_codex_quota 无返回 resets_at 时的 fallback 一致。
                 from autoteam.accounts import STATUS_EXHAUSTED, update_account
 
+                now_ts = time.time()
                 emails_to_replace = []
                 for email, remaining in low_accounts:
                     logger.info("[巡检] %s 剩余 %d%%，立即替换", email, remaining)
-                    update_account(email, status=STATUS_EXHAUSTED, quota_exhausted_at=time.time())
+                    update_account(
+                        email,
+                        status=STATUS_EXHAUSTED,
+                        quota_exhausted_at=now_ts,
+                        quota_resets_at=now_ts + 18000,
+                    )
                     emails_to_replace.append(email)
 
                 # 失效一个立即轮换一个:逐个 kick+补一个,不等凑 min_low 也不走全量 cmd_rotate。

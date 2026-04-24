@@ -2085,6 +2085,58 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         return False
 
     auth_file = save_auth_file(bundle)
+
+    # OAuth 成功 plan=team 不等于"账号真的活了"。存在一类竞态:刚 kick 的账号在 OpenAI
+    # 端处于 soft-removed/缓存未刷新状态,OAuth 仍能短暂拿到 team workspace token,但配额
+    # 本身没被重置(仍是之前耗尽的 5h)。如果不验,就会把 0% 账号塞回 Team,auto-check 下
+    # 一轮立刻再 kick,反复洗同一批耗尽账号。这里用新 token 实测一次 wham,只有确认 ok 且
+    # 剩余 >= threshold 才算真复用成功;否则判定"假恢复",kick 掉让 Team 席位交给新号。
+    access_token = bundle.get("access_token")
+    quota_verified = False
+    if access_token:
+        try:
+            try:
+                from autoteam.api import _auto_check_config
+                from autoteam.config import AUTO_CHECK_THRESHOLD
+
+                threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
+            except Exception:
+                threshold = 10
+            status_str, info = check_codex_quota(access_token)
+            if status_str == "ok" and isinstance(info, dict):
+                p_remain = 100 - info.get("primary_pct", 0)
+                if p_remain >= threshold:
+                    quota_verified = True
+                    # 顺手写一份新鲜 last_quota,下次 get_standby_accounts 判断更准
+                    update_account(email, last_quota=info)
+                else:
+                    logger.warning(
+                        "[轮转] %s OAuth 成功但实测 5h 剩余 %d%% < %d%%,判定假恢复",
+                        email,
+                        p_remain,
+                        threshold,
+                    )
+            elif status_str == "exhausted":
+                logger.warning("[轮转] %s OAuth 成功但实测 exhausted,判定假恢复", email)
+            else:
+                logger.warning("[轮转] %s OAuth 成功但额度验证返回 status=%s,保守判定假恢复", email, status_str)
+        except Exception as exc:
+            logger.warning("[轮转] %s 额度验证抛异常,保守判定假恢复: %s", email, exc)
+
+    if not quota_verified:
+        # 把这个"假恢复"的账号从 Team 里 kick 掉,避免占席位 + 状态降回 STANDBY 但写一个
+        # 真实的 5h resets_at,这样短期内不会被 get_standby_accounts() 再选中。
+        _cleanup_team_leftover("fake_recovery_quota_not_usable")
+        now_ts = time.time()
+        update_account(
+            email,
+            status=STATUS_STANDBY,
+            auth_file=auth_file,
+            quota_exhausted_at=now_ts,
+            quota_resets_at=now_ts + 18000,
+        )
+        return False
+
     update_account(email, status=STATUS_ACTIVE, last_active_at=time.time(), auth_file=auth_file)
     logger.info("[轮转] 旧账号已恢复: %s", email)
     return True
@@ -2150,6 +2202,54 @@ def _replace_single(chatgpt, mail_client, email, reason=""):
             logger.info("[替换] 跳过 %s(%s)", acc.get("email"), skip_reason)
             continue
         cand_email = acc.get("email")
+
+        # 额度二次验证:不能只信 get_standby_accounts() 的 _quota_recovered(它只看
+        # quota_resets_at 这种粗估时间)。之前有 bug 就是把还在 exhausted 窗口的
+        # standby 反复 reinvite 进 Team,账号一进来就 0% 立马被 kick,把同一批号
+        # 来回洗,席位始终干空。这里直接拿 auth_file 的 access_token 打一次 wham,
+        # 只有 API 确认 "ok 且剩余 >= threshold" 才允许复用。
+        try:
+            from autoteam.config import AUTO_CHECK_THRESHOLD
+
+            try:
+                from autoteam.api import _auto_check_config
+
+                threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
+            except ImportError:
+                threshold = AUTO_CHECK_THRESHOLD
+        except Exception:
+            threshold = 10
+
+        auth_file = acc.get("auth_file")
+        quota_ok = False
+        if auth_file and Path(auth_file).exists():
+            try:
+                auth_data = json.loads(read_text(Path(auth_file)))
+                access_token = auth_data.get("access_token")
+                if access_token:
+                    status_str, info = check_codex_quota(access_token)
+                    if status_str == "ok" and isinstance(info, dict):
+                        p_remain = 100 - info.get("primary_pct", 0)
+                        if p_remain >= threshold:
+                            quota_ok = True
+                        else:
+                            logger.info("[替换] 跳过 %s(实测 5h 剩余 %d%% < %d%%)", cand_email, p_remain, threshold)
+                            continue
+                    elif status_str == "exhausted":
+                        logger.info("[替换] 跳过 %s(实测 exhausted)", cand_email)
+                        continue
+                    # auth_error:token 失效,不是"额度真恢复"的证据,跳过
+                    elif status_str == "auth_error":
+                        logger.info("[替换] 跳过 %s(token auth_error,无法验证额度)", cand_email)
+                        continue
+            except Exception as exc:
+                logger.info("[替换] %s 额度验证抛异常(跳过): %s", cand_email, exc)
+                continue
+        if not quota_ok:
+            # 没 auth_file 或验证没通过都跳过,宁可去创建新号也别把 0% 账号塞回 Team
+            logger.info("[替换] 跳过 %s(无 auth_file 或额度未通过验证)", cand_email)
+            continue
+
         logger.info("[替换] 尝试复用 standby: %s", cand_email)
         if not chatgpt.browser:
             chatgpt.start()
