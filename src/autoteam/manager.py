@@ -622,50 +622,110 @@ def cmd_check():
     return exhausted_list
 
 
-def remove_from_team(chatgpt_api, email, *, return_status=False):
-    """将账号从 Team 中移除"""
+def remove_from_team(chatgpt_api, email, *, return_status=False, lookup_retries=3, retry_interval=3.0):
+    """将账号从 Team 中移除。
+
+    OpenAI 的 /backend-api/accounts/{id}/users 对"刚加入 Team 的新成员"存在同步
+    延迟(注册进 Team 后立刻 GET 可能拿不到新成员)。如果第一次在 members 列表里
+    没找到 target_user_id 就直接判定 already_absent、跳过 DELETE,新号就会被遗留
+    在 Team 里 —— 这正是 fill-personal "实际没踢出但本地记录 PERSONAL" 的真根因。
+
+    为此找不到时会重试 `lookup_retries` 次,每次间隔 `retry_interval` 秒。只有
+    连续多轮都查不到才判定真的 already_absent。这样对于确实已不在 Team 的历史
+    账号,最多多耗 ~lookup_retries*retry_interval 秒(可接受),换来对新加入号
+    踢出流程的可靠性。
+    """
     if _is_main_account_email(email):
         logger.warning("[Team] 跳过移除主号: %s", email)
         return "failed" if return_status else False
 
     account_id = get_chatgpt_account_id()
-    # 先获取成员列表找到 user_id
-    path = f"/backend-api/accounts/{account_id}/users"
-    result = chatgpt_api._api_fetch("GET", path)
-
-    if result["status"] != 200:
-        logger.error("[Team] 获取成员列表失败: %d", result["status"])
+    if not account_id:
+        logger.error("[Team] account_id 为空，无法移除 %s", email)
         return "failed" if return_status else False
 
-    try:
-        data = json.loads(result["body"])
-        members = data.get("items", data.get("users", data.get("members", [])))
-    except Exception:
-        logger.error("[Team] 解析成员列表失败")
-        return "failed" if return_status else False
-
-    # 找到对应邮箱的成员
+    email_lc = (email or "").lower()
     target_user_id = None
-    for member in members:
-        member_email = member.get("email", "")
-        if member_email.lower() == email.lower():
-            target_user_id = member.get("user_id") or member.get("id")
+    total_attempts = max(1, int(lookup_retries) + 1)
+
+    for attempt in range(total_attempts):
+        path = f"/backend-api/accounts/{account_id}/users"
+        result = chatgpt_api._api_fetch("GET", path)
+        status = result.get("status")
+        body_excerpt = (result.get("body") or "")[:200].replace("\n", " ")
+
+        if status != 200:
+            logger.error(
+                "[Team] 获取成员列表失败(第 %d/%d 次): status=%s body=%s",
+                attempt + 1,
+                total_attempts,
+                status,
+                body_excerpt,
+            )
+            # 401/403 是 session/权限类错误,重试也不会变好,快速失败
+            if status in (401, 403):
+                return "failed" if return_status else False
+            if attempt < total_attempts - 1:
+                time.sleep(retry_interval)
+                continue
+            return "failed" if return_status else False
+
+        try:
+            data = json.loads(result["body"])
+            members = data.get("items", data.get("users", data.get("members", [])))
+        except Exception as exc:
+            logger.error(
+                "[Team] 解析成员列表失败(第 %d/%d 次): %s body=%s", attempt + 1, total_attempts, exc, body_excerpt
+            )
+            if attempt < total_attempts - 1:
+                time.sleep(retry_interval)
+                continue
+            return "failed" if return_status else False
+
+        for member in members:
+            if (member.get("email", "") or "").lower() == email_lc:
+                target_user_id = member.get("user_id") or member.get("id")
+                break
+
+        if target_user_id:
+            if attempt > 0:
+                logger.info("[Team] 第 %d 次查询命中 %s → user_id=%s", attempt + 1, email, target_user_id)
             break
 
+        if attempt < total_attempts - 1:
+            logger.info(
+                "[Team] 成员列表里暂无 %s(共 %d 个成员),可能 OpenAI 同步延迟,%.1fs 后重试 (%d/%d)",
+                email,
+                len(members),
+                retry_interval,
+                attempt + 1,
+                total_attempts - 1,
+            )
+            time.sleep(retry_interval)
+
     if not target_user_id:
-        logger.info("[Team] 未在成员列表中找到 %s（可能已移出）", email)
-        # 可能已经不在 team 了
+        logger.info(
+            "[Team] 重试 %d 次后仍未在成员列表中找到 %s,判定为已不在 Team",
+            total_attempts,
+            email,
+        )
         return "already_absent" if return_status else True
 
-    # 删除成员
     delete_path = f"/backend-api/accounts/{account_id}/users/{target_user_id}"
     result = chatgpt_api._api_fetch("DELETE", delete_path)
 
     if result["status"] in (200, 204):
-        logger.info("[Team] 已将 %s 移出 Team", email)
+        logger.info("[Team] 已将 %s 移出 Team (user_id=%s)", email, target_user_id)
         return "removed" if return_status else True
     else:
-        logger.error("[Team] 移除 %s 失败: %d %s", email, result["status"], result["body"][:200])
+        body_excerpt = (result.get("body") or "")[:200].replace("\n", " ")
+        logger.error(
+            "[Team] 移除 %s 失败: status=%s body=%s (user_id=%s)",
+            email,
+            result["status"],
+            body_excerpt,
+            target_user_id,
+        )
         return "failed" if return_status else False
 
 
@@ -2709,6 +2769,50 @@ def _cmd_fill_personal(count):
                 cool_down = random.uniform(30, 60)
                 logger.info("[免费号] 批次间冷却 %.1fs", cool_down)
                 time.sleep(cool_down)
+
+        # === 末批兜底清理 ===
+        # 即使每个子号内部的 remove_from_team 报告成功,OpenAI 的 /users API
+        # 对新加入成员存在同步延迟,首次 GET 可能没列出该成员 → 代码误判 already_absent
+        # 直接跳过 DELETE。结果:账号本地 status=PERSONAL 认证也拿到了,但 Team 席位里
+        # 还挂着 Member(截图里用户看到的正是这种情况)。
+        # 不信任内部 kick 报告,以 Team 真实成员列表为权威,强清所有不在 baseline 的新号。
+        # 即使某些账号已被踢成功,DELETE 一个不存在的 user_id 只会返回 4xx,副作用可控。
+        try:
+            api_final = _ensure_chatgpt()
+            ok_final, current_non_master = _fetch_team_non_master_emails(api_final)
+            if not ok_final:
+                logger.warning("[免费号] 末批兜底:无法拉取 Team 成员列表,跳过强制清理")
+            else:
+                stragglers = sorted(current_non_master - baseline_emails)
+                if not stragglers:
+                    logger.info(
+                        "[免费号] 末批兜底:Team 已回到 baseline(%d 个非主号成员),无需清理",
+                        len(baseline_emails),
+                    )
+                else:
+                    logger.warning(
+                        "[免费号] 末批兜底:Team 仍残留 %d 个新号未被踢出,强制清理: %s",
+                        len(stragglers),
+                        stragglers[:10],
+                    )
+                    cleaned = 0
+                    for stray_email in stragglers:
+                        try:
+                            st = remove_from_team(api_final, stray_email, return_status=True, lookup_retries=1)
+                            logger.info("[免费号] 末批兜底 kick %s → %s", stray_email, st)
+                            if st == "removed":
+                                cleaned += 1
+                        except Exception as exc:
+                            logger.error("[免费号] 末批兜底 kick %s 抛异常: %s", stray_email, exc)
+                    logger.info(
+                        "[免费号] 末批兜底清理完成:实际移除 %d / %d 个,剩余由用户手动处理",
+                        cleaned,
+                        len(stragglers),
+                    )
+        except Exception as exc:
+            logger.error("[免费号] 末批兜底清理出错(不影响已生产账号): %s", exc)
+        finally:
+            _stop_chatgpt()
     finally:
         _stop_chatgpt()
         # 无论主循环以何种方式退出（完成 / 被阻断 / 异常），都汇总一次 + 把已生产的账号同步进 CPA
