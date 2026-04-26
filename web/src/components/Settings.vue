@@ -481,6 +481,73 @@
         </button>
       </div>
     </div>
+
+    <!-- SPEC-2 §席位策略 + 探测节流 -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div class="mb-4">
+        <h2 class="text-lg font-semibold text-white">账号生命周期</h2>
+        <p class="text-sm text-gray-400 mt-1">
+          控制邀请席位偏好(完整 ChatGPT 席位 vs 仅 Codex 席位),以及 sync 巡检识别"被踢"的探测节流。
+        </p>
+      </div>
+
+      <div v-if="lifecycleMessage" class="mb-3 px-4 py-3 rounded-lg text-sm border" :class="lifecycleMessageClass">
+        {{ lifecycleMessage }}
+      </div>
+
+      <div class="mb-4 p-3 bg-gray-800/40 border border-gray-800 rounded">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-sm text-white">邀请席位偏好</span>
+          <span class="text-xs text-gray-400">{{ preferredSeatType === 'codex' ? '锁定 Codex 席位' : '优先 ChatGPT 完整席位' }}</span>
+        </div>
+        <div class="flex gap-2">
+          <button
+            @click="setPreferredSeatType('default')"
+            :class="preferredSeatType === 'default' ? 'bg-blue-600 border-blue-500 text-white' : 'bg-gray-800 border-gray-700 text-gray-300'"
+            class="flex-1 px-3 py-2 border rounded text-sm transition">
+            <div class="font-medium">default</div>
+            <div class="text-xs opacity-75 mt-0.5">优先 PATCH 升级到 ChatGPT 席位(老行为)</div>
+          </button>
+          <button
+            @click="setPreferredSeatType('codex')"
+            :class="preferredSeatType === 'codex' ? 'bg-blue-600 border-blue-500 text-white' : 'bg-gray-800 border-gray-700 text-gray-300'"
+            class="flex-1 px-3 py-2 border rounded text-sm transition">
+            <div class="font-medium">codex</div>
+            <div class="text-xs opacity-75 mt-0.5">锁 codex-only 席位,跳过 PATCH(节约 ChatGPT 席位)</div>
+          </button>
+        </div>
+      </div>
+
+      <div class="p-3 bg-gray-800/40 border border-gray-800 rounded">
+        <div class="text-sm text-white mb-2">sync 探测节流</div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <div class="text-xs text-gray-400 mb-1">并发上限 (1-16)</div>
+            <input
+              v-model.number="syncProbeConcurrency"
+              type="number"
+              min="1" max="16"
+              class="w-full px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-sm text-white" />
+          </div>
+          <div>
+            <div class="text-xs text-gray-400 mb-1">同号去重冷却 (分钟,1-1440)</div>
+            <input
+              v-model.number="syncProbeCooldown"
+              type="number"
+              min="1" max="1440"
+              class="w-full px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-sm text-white" />
+          </div>
+        </div>
+        <div class="flex justify-end mt-3">
+          <button
+            @click="saveSyncProbe"
+            :disabled="lifecycleSaving"
+            class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs rounded">
+            {{ lifecycleSaving ? '保存中...' : '保存探测节流' }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -559,6 +626,54 @@ watch(
   { immediate: true },
 )
 
+// SPEC-2 — 席位偏好 + sync 探测节流(本块独立于上面的 mailForm)
+const preferredSeatType = ref('default')
+const syncProbeConcurrency = ref(5)
+const syncProbeCooldown = ref(30)
+const lifecycleSaving = ref(false)
+const lifecycleMessage = ref('')
+const lifecycleMessageClass = ref('')
+
+function setLifecycleMessage(text, type = 'success') {
+  lifecycleMessage.value = text
+  lifecycleMessageClass.value = type === 'success'
+    ? 'bg-green-500/10 text-green-400 border-green-500/20'
+    : 'bg-red-500/10 text-red-400 border-red-500/20'
+  window.clearTimeout(setLifecycleMessage._t)
+  setLifecycleMessage._t = window.setTimeout(() => { lifecycleMessage.value = '' }, 8000)
+}
+
+async function setPreferredSeatType(value) {
+  if (preferredSeatType.value === value) return
+  lifecycleSaving.value = true
+  try {
+    const resp = await api.putPreferredSeatType(value)
+    preferredSeatType.value = resp.value
+    setLifecycleMessage(resp.message || `已设为 ${resp.value}`)
+  } catch (e) {
+    setLifecycleMessage(e.message || '保存失败', 'error')
+  } finally {
+    lifecycleSaving.value = false
+  }
+}
+
+async function saveSyncProbe() {
+  lifecycleSaving.value = true
+  try {
+    const resp = await api.putSyncProbe({
+      concurrency: syncProbeConcurrency.value,
+      cooldown_minutes: syncProbeCooldown.value,
+    })
+    syncProbeConcurrency.value = resp.concurrency
+    syncProbeCooldown.value = resp.cooldown_minutes
+    setLifecycleMessage(resp.message || '已保存')
+  } catch (e) {
+    setLifecycleMessage(e.message || '保存失败', 'error')
+  } finally {
+    lifecycleSaving.value = false
+  }
+}
+
 onMounted(async () => {
   try {
     const cfg = await api.getAutoCheckConfig()
@@ -569,6 +684,19 @@ onMounted(async () => {
     }
   } catch (e) {
     console.error('加载巡检配置失败:', e)
+  }
+  try {
+    const seat = await api.getPreferredSeatType()
+    preferredSeatType.value = seat?.value || 'default'
+  } catch (e) {
+    console.error('加载邀请席位偏好失败:', e)
+  }
+  try {
+    const sp = await api.getSyncProbe()
+    syncProbeConcurrency.value = sp?.concurrency ?? 5
+    syncProbeCooldown.value = sp?.cooldown_minutes ?? 30
+  } catch (e) {
+    console.error('加载 sync 探测节流失败:', e)
   }
 })
 

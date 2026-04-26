@@ -13,6 +13,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 import autoteam.display  # noqa: F401
+from autoteam.accounts import is_supported_plan, normalize_plan_type
 from autoteam.admin_state import (
     get_admin_email,
     get_admin_session_token,
@@ -21,6 +22,7 @@ from autoteam.admin_state import (
 )
 from autoteam.auth_storage import AUTH_DIR, ensure_auth_dir, ensure_auth_file_permissions
 from autoteam.config import get_playwright_launch_options
+from autoteam.invite import assert_not_blocked  # SPEC-2 shared/add-phone-detection §3 — OAuth 流程复用
 from autoteam.textio import write_text
 
 logger = logging.getLogger(__name__)
@@ -102,17 +104,26 @@ def _exchange_auth_code(auth_code, code_verifier, fallback_email=None):
     claims = _parse_jwt_payload(id_token)
     auth_claims = claims.get("https://api.openai.com/auth", {})
 
+    raw_plan = auth_claims.get("chatgpt_plan_type", "unknown")
     bundle = {
         "access_token": token_data.get("access_token"),
         "refresh_token": token_data.get("refresh_token"),
         "id_token": id_token,
         "account_id": auth_claims.get("chatgpt_account_id", ""),
         "email": claims.get("email", fallback_email or ""),
-        "plan_type": auth_claims.get("chatgpt_plan_type", "unknown"),
+        # SPEC-2 shared/plan-type-whitelist §2.3:plan_type 已归一化为小写;
+        # plan_type_raw 保留 OpenAI 原始字面量便于事后排查;
+        # plan_supported 是白名单判定结果,下游消费方应只读该字段不再自己 .lower() 比对。
+        "plan_type": normalize_plan_type(raw_plan),
+        "plan_type_raw": raw_plan,
+        "plan_supported": is_supported_plan(raw_plan),
         "expired": time.time() + token_data.get("expires_in", 3600),
     }
 
-    logger.info("[Codex] 登录成功: %s (plan: %s)", bundle["email"], bundle["plan_type"])
+    logger.info(
+        "[Codex] 登录成功: %s (plan: %s, supported: %s)",
+        bundle["email"], bundle["plan_type"], bundle["plan_supported"],
+    )
     return bundle
 
 
@@ -565,6 +576,10 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
         elif code_input:
             logger.warning("[Codex] 需要验证码但无 mail_client，无法自动获取")
 
+        # SPEC-2 shared/add-phone-detection §4 (位点 C-P1):about-you 入口前先探针。
+        # 注册流程提交 OTP 后 OpenAI 经常把账号引到 add-phone,等切到 about-you 再发现就太晚。
+        assert_not_blocked(page, "oauth_about_you")
+
         # 处理 about-you 页面（可能出现在 OAuth 流程中）
         if "about-you" in page.url:
             logger.info("[Codex] 检测到 about-you 页面，填写个人信息...")
@@ -612,6 +627,10 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
         for step in range(10):
             if auth_code:
                 break
+
+            # SPEC-2 shared/add-phone-detection §4 (位点 C-P2):consent 循环每轮开头探针。
+            # 不在循环里拦,会被当作"workspace 没选好"反复重试,30s callback 等待白白耗费。
+            assert_not_blocked(page, f"oauth_consent_{step}")
 
             _screenshot(page, f"codex_04_step{step + 1}_before.png")
 
@@ -880,6 +899,10 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
                     break
             except Exception:
                 break
+
+        # SPEC-2 shared/add-phone-detection §4 (位点 C-P3):等 callback 前探针。
+        # add-phone 阻塞 = "callback 永远不来"的根因,30s 等待白白浪费。
+        assert_not_blocked(page, "oauth_callback_wait")
 
         # 等待 redirect callback 获取 auth code
         for _ in range(30):
@@ -1570,7 +1593,12 @@ def quota_result_resets_at(info):
 
 
 def get_quota_exhausted_info(quota_info, *, limit_reached=False):
-    """根据额度快照判断是否已耗尽，并返回耗尽详情。"""
+    """根据额度快照判断是否已耗尽，并返回耗尽详情。
+
+    SPEC-2 shared/quota-classification §4.2:no_quota 优先级**高于** exhausted。
+    `primary_total == 0` / `reset_at == 0 + used_pct == 0` 表示 workspace 未分配配额,
+    返回 window="no_quota" 形态,resets_at 给 24h 占位(不应被用作重试依据)。
+    """
     if not isinstance(quota_info, dict):
         return None
 
@@ -1578,6 +1606,27 @@ def get_quota_exhausted_info(quota_info, *, limit_reached=False):
     weekly_pct = int(quota_info.get("weekly_pct", 0) or 0)
     primary_reset = int(quota_info.get("primary_resets_at", 0) or 0)
     weekly_reset = int(quota_info.get("weekly_resets_at", 0) or 0)
+    primary_total = quota_info.get("primary_total")
+    primary_remaining = quota_info.get("primary_remaining")
+
+    # SPEC-2 shared/quota-classification I4 — no_quota 短路必须先于 exhausted 判定
+    no_quota_signals = []
+    if primary_total == 0:
+        no_quota_signals.append("primary_total==0")
+    elif primary_total is None and primary_pct == 0 and primary_reset == 0 and not limit_reached:
+        # rate_limit 字段缺失 / primary_window 缺失走这一支(上游 quota_info 取值都是 0)
+        no_quota_signals.append("rate_limit_empty")
+    if primary_remaining == 0 and (primary_total == 0 or primary_total is None) and primary_pct == 0:
+        no_quota_signals.append("remaining==0+total==0")
+
+    if no_quota_signals and not limit_reached and primary_pct < 100 and weekly_pct < 100:
+        return {
+            "window": "no_quota",
+            "resets_at": int(time.time() + 86400),  # 24h 占位
+            "quota_info": quota_info,
+            "limit_reached": False,
+            "no_quota_signals": no_quota_signals,
+        }
 
     primary_exhausted = primary_pct >= 100
     weekly_exhausted = weekly_pct >= 100
@@ -1686,15 +1735,37 @@ def check_codex_quota(access_token, account_id=None):
     primary = rate_limit.get("primary_window") or {}
     secondary = rate_limit.get("secondary_window") or {}
 
+    # SPEC-2 shared/quota-classification §2.2 — 扩 primary_total / primary_remaining,
+    # 让 get_quota_exhausted_info 能区分 no_quota(workspace 未分配)与 exhausted(已用完)
+    primary_total_raw = primary.get("limit", primary.get("total"))
+    primary_remaining_raw = primary.get("remaining")
     quota_info = {
         "primary_pct": primary.get("used_percent", 0),
         "primary_resets_at": primary.get("reset_at", 0),
+        "primary_total": primary_total_raw if isinstance(primary_total_raw, (int, float)) else None,
+        "primary_remaining": primary_remaining_raw if isinstance(primary_remaining_raw, (int, float)) else None,
         "weekly_pct": secondary.get("used_percent", 0),
         "weekly_resets_at": secondary.get("reset_at", 0),
     }
 
+    # SPEC-2 shared/quota-classification §4.2 — no_quota 单独分支:rate_limit 字段
+    # 完全缺失 / primary_window 缺失也归 no_quota(空载也是无配额信号)
+    rate_limit_missing = (not rate_limit) or (not primary)
+    if rate_limit_missing:
+        return "no_quota", {
+            "window": "no_quota",
+            "resets_at": int(time.time() + 86400),
+            "quota_info": quota_info,
+            "limit_reached": False,
+            "no_quota_signals": ["rate_limit_or_primary_missing"],
+            "raw_rate_limit": rate_limit,
+        }
+
     exhausted_info = get_quota_exhausted_info(quota_info, limit_reached=bool(rate_limit.get("limit_reached")))
     if exhausted_info:
+        # window="no_quota" 是 get_quota_exhausted_info 内部短路出的形态;独立分类返回
+        if exhausted_info.get("window") == "no_quota":
+            return "no_quota", exhausted_info
         return "exhausted", exhausted_info
 
     return "ok", quota_info

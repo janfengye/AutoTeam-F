@@ -493,7 +493,19 @@ def run():
         # 我们只需读 _seat_type 字段决定落盘的 seat_type 常量。
         chatgpt = ChatGPTTeamAPI()
         chatgpt.start()
-        status, data = chatgpt.invite_member(email, seat_type="default")
+
+        # PREFERRED_SEAT_TYPE: "default"(默认 — 优先 ChatGPT 席位 PATCH 升级)
+        #                     "codex"(锁定 codex-only,跳过 PATCH 升级)
+        try:
+            from autoteam.runtime_config import get_preferred_seat_type
+            preferred = (get_preferred_seat_type() or "default").lower()
+        except Exception:
+            preferred = "default"
+        seat_for_invite = "default" if preferred != "codex" else "usage_based"
+        allow_patch = preferred != "codex"
+        status, data = chatgpt.invite_member(
+            email, seat_type=seat_for_invite, allow_patch_upgrade=allow_patch
+        )
 
         raw_seat = (data or {}).get("_seat_type", "unknown") if isinstance(data, dict) else "unknown"
         seat_label = _seat_label_from_raw(raw_seat)

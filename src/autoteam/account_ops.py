@@ -3,7 +3,7 @@
 import logging
 from pathlib import Path
 
-from autoteam.accounts import find_account, load_accounts, save_accounts
+from autoteam.accounts import STATUS_PERSONAL, find_account, load_accounts, save_accounts
 from autoteam.admin_state import get_chatgpt_account_id
 from autoteam.cloudmail import CloudMailClient
 from autoteam.cpa_sync import delete_from_cpa, list_cpa_files, sync_to_cpa
@@ -71,7 +71,12 @@ def delete_managed_account(
 
     try:
         account_id = get_chatgpt_account_id()
-        if remove_remote:
+        # SPEC-2 FR-H1 (issue #2 独属):personal 状态账号已退出 Team,删除时不需要拉
+        # remote_state(members/invites)。这条短路同时避免 ChatGPTTeamAPI 浏览器启动 +
+        # 30s 网络往返,纯本地操作。
+        is_personal = bool(acc and acc.get("status") == STATUS_PERSONAL)
+        skip_remote = is_personal
+        if remove_remote and not skip_remote:
             if remote_state is not None:
                 members, invites = remote_state
             else:

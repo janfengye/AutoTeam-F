@@ -1362,18 +1362,22 @@ class ChatGPTTeamAPI:
             return "domain_blocked"
         return "other"
 
-    def invite_member(self, email, seat_type="usage_based"):
+    def invite_member(self, email, seat_type="usage_based", *, allow_patch_upgrade=True):
         """邀请成员加入 Team(自带 default → usage_based 兜底 + errored_emails 处理)。
 
         返回 `(status, data)`,其中 `data` 一定是 dict(解析失败封装为 `{"_raw": <text>}`),
         必含字段:
         - `_seat_type` ∈ {"chatgpt","usage_based","unknown"}
             * "chatgpt"     POST 200 + (PATCH default 成功 或 直接 default 邀请成功)
-            * "usage_based" POST 200 但 PATCH 全部失败,仅 codex 席位
+            * "usage_based" POST 200 但 PATCH 全部失败 / allow_patch_upgrade=False,仅 codex 席位
             * "unknown"     POST 本身失败/被业务拒绝(domain/errored)
         - `_error_kind`     最后一次失败的分类(成功时不写)
         - `_errored_emails` POST 200 但 errored_emails 非空时,原样保留 errored_emails 数组,
                              供上游记录失败原因。
+
+        参数:
+        - allow_patch_upgrade: True(默认) 走 usage_based POST + PATCH default 升级;
+          False 表示锁定 codex-only 席位,跳过 PATCH(对应 PREFERRED_SEAT_TYPE="codex")。
 
         兜底逻辑(所有 fallback 都在本函数内完成,调用方拿到结果就是终态):
         - seat_type="default" 时,若 POST 200 但 errored_emails 命中或 PATCH 失败,
@@ -1382,10 +1386,12 @@ class ChatGPTTeamAPI:
           按 _INVITE_POST_RETRY_DELAYS 退避(带 jitter)重试。
         """
         # default 邀请失败时下降到 usage_based(只翻一次,避免无限递归)
-        return self._invite_member_with_fallback(email, seat_type, allow_fallback=True)
+        return self._invite_member_with_fallback(
+            email, seat_type, allow_fallback=True, allow_patch_upgrade=allow_patch_upgrade
+        )
 
-    def _invite_member_with_fallback(self, email, seat_type, *, allow_fallback):
-        status, data = self._invite_member_once(email, seat_type)
+    def _invite_member_with_fallback(self, email, seat_type, *, allow_fallback, allow_patch_upgrade=True):
+        status, data = self._invite_member_once(email, seat_type, allow_patch_upgrade=allow_patch_upgrade)
 
         # default 路径:有任何业务级失败迹象都尝试 usage_based 兜底
         # 1) HTTP 非 200 且不是 domain_blocked(domain_blocked 直接返回让上层换号)
@@ -1407,11 +1413,13 @@ class ChatGPTTeamAPI:
                     err_kind,
                     bool(errored),
                 )
-                return self._invite_member_with_fallback(email, "usage_based", allow_fallback=False)
+                return self._invite_member_with_fallback(
+                    email, "usage_based", allow_fallback=False, allow_patch_upgrade=allow_patch_upgrade
+                )
 
         return status, data
 
-    def _invite_member_once(self, email, seat_type):
+    def _invite_member_once(self, email, seat_type, *, allow_patch_upgrade=True):
         """单一 seat_type 的完整邀请尝试(POST retry → PATCH 升级)。"""
         path = f"/backend-api/accounts/{self.account_id}/invites"
         body = {
@@ -1486,7 +1494,7 @@ class ChatGPTTeamAPI:
 
         # 默认标 usage_based,PATCH 成功再升级为 chatgpt
         data["_seat_type"] = "usage_based"
-        if seat_type == "usage_based":
+        if seat_type == "usage_based" and allow_patch_upgrade:
             invites = data.get("account_invites", []) if isinstance(data, dict) else []
             any_patched = False
             any_invite = False
@@ -1504,6 +1512,9 @@ class ChatGPTTeamAPI:
                     "[ChatGPT] %s PATCH seat_type 全部失败,保留 codex 席位(_seat_type=usage_based)",
                     email,
                 )
+        elif seat_type == "usage_based" and not allow_patch_upgrade:
+            # PREFERRED_SEAT_TYPE="codex" 路径:跳过 PATCH 升级,锁定 codex-only 席位
+            logger.info("[ChatGPT] %s 已锁 codex-only 席位(allow_patch_upgrade=False)", email)
         elif seat_type == "default":
             # 直接 default 邀请,只要 POST 200 + 无 errored 即完整 ChatGPT 席位
             data["_seat_type"] = "chatgpt"

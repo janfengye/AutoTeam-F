@@ -421,7 +421,16 @@ function quota(acc, type) {
   return 100 - (pct || 0)
 }
 
+function isNoQuota(acc) {
+  // SPEC-2 — primary_total=0 表示后端没分配配额(不是耗尽)。UI 上显示"无配额"
+  // 避免误读"100% 剩余"
+  const qi = props.status?.quota_cache?.[acc.email] || acc.last_quota
+  if (!qi) return false
+  return qi.primary_total === 0 || qi.no_quota === true
+}
+
 function quotaPct(acc, type) {
+  if (type === 'primary' && isNoQuota(acc)) return '无配额'
   const val = quota(acc, type)
   return val !== null ? `${val}%` : '-'
 }

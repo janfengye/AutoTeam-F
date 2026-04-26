@@ -85,3 +85,75 @@ def set_register_domain(domain):
     cleaned = (domain or "").strip().lstrip("@").strip()
     set_value("register_domain", cleaned)
     return cleaned
+
+
+# SPEC-2 FR-E2/E3 — sync_account_states 探测被踢识别的并发上限 + 去重冷却。
+# 默认 concurrency=5(单次 sync 最多 5 个账号并发探测 wham/usage),
+# cooldown=30 分钟(同一账号 30 分钟内不重复探测,避免抖动)。
+# 上下界:concurrency [1, 16],cooldown [1, 1440] 分钟。
+_SYNC_PROBE_CONCURRENCY_DEFAULT = 5
+_SYNC_PROBE_COOLDOWN_MINUTES_DEFAULT = 30
+
+
+def get_sync_probe_concurrency():
+    """返回 sync_account_states 内并发探测被踢账号的最大 worker 数。"""
+    raw = get("sync_probe_concurrency", _SYNC_PROBE_CONCURRENCY_DEFAULT)
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _SYNC_PROBE_CONCURRENCY_DEFAULT
+    return max(1, min(16, n))
+
+
+def set_sync_probe_concurrency(value):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = _SYNC_PROBE_CONCURRENCY_DEFAULT
+    n = max(1, min(16, n))
+    set_value("sync_probe_concurrency", n)
+    return n
+
+
+def get_sync_probe_cooldown_minutes():
+    """返回同一账号被探测后多久内不重复探测(分钟)。"""
+    raw = get("sync_probe_cooldown_minutes", _SYNC_PROBE_COOLDOWN_MINUTES_DEFAULT)
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _SYNC_PROBE_COOLDOWN_MINUTES_DEFAULT
+    return max(1, min(1440, n))
+
+
+def set_sync_probe_cooldown_minutes(value):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = _SYNC_PROBE_COOLDOWN_MINUTES_DEFAULT
+    n = max(1, min(1440, n))
+    set_value("sync_probe_cooldown_minutes", n)
+    return n
+
+
+# SPEC-2 FR-G — 邀请席位偏好。
+#   "default" 走 default→usage_based 兜底 + PATCH 升级,优先 ChatGPT 完整席位(老行为,默认)
+#   "codex"   直接 usage_based 邀请,跳过 PATCH,锁 codex-only 席位(节约 ChatGPT 席位时使用)
+_PREFERRED_SEAT_TYPE_DEFAULT = "default"
+_PREFERRED_SEAT_TYPE_VALID = {"default", "codex"}
+
+
+def get_preferred_seat_type():
+    """返回邀请席位偏好。'default'(默认/优先 PATCH 升级 ChatGPT 席位) 或 'codex'(锁 codex-only)。"""
+    raw = get("preferred_seat_type", _PREFERRED_SEAT_TYPE_DEFAULT)
+    val = (str(raw or "") or _PREFERRED_SEAT_TYPE_DEFAULT).strip().lower()
+    if val not in _PREFERRED_SEAT_TYPE_VALID:
+        return _PREFERRED_SEAT_TYPE_DEFAULT
+    return val
+
+
+def set_preferred_seat_type(value):
+    val = (str(value or "") or _PREFERRED_SEAT_TYPE_DEFAULT).strip().lower()
+    if val not in _PREFERRED_SEAT_TYPE_VALID:
+        val = _PREFERRED_SEAT_TYPE_DEFAULT
+    set_value("preferred_seat_type", val)
+    return val

@@ -41,6 +41,7 @@ from autoteam.accounts import (
     delete_account,
     find_account,
     get_standby_accounts,
+    is_supported_plan,
     load_accounts,
     save_accounts,
     update_account,
@@ -65,6 +66,7 @@ from autoteam.codex_auth import (
 from autoteam.config import get_playwright_launch_options
 from autoteam.cpa_sync import sync_from_cpa, sync_main_codex_to_cpa, sync_to_cpa
 from autoteam.identity import random_age, random_birthday, random_full_name, random_password
+from autoteam.invite import RegisterBlocked  # SPEC-2 shared/add-phone-detection §5 — 5 处 OAuth 调用方 catch
 from autoteam.register_failures import record_failure
 from autoteam.textio import read_text, write_text
 
@@ -475,6 +477,33 @@ def _reconcile_team_members(chatgpt_api=None, *, dry_run=False):
     return result
 
 
+def _probe_kicked_account(acc):
+    """SPEC-2 FR-E1 — 单账号探测:wham/usage 401/403 → 被踢;ok / 其他 → 自然待机/未确认.
+
+    返回 status_str(check_codex_quota 5 分类之一)或 None(无法探测)。
+    任何异常吞掉返回 None,让上游降级 STANDBY 旧行为。
+
+    NB: 该函数会从 auth_file 读 access_token,探测时间长(网络往返 + 5s 超时),
+    上游必须用 ThreadPoolExecutor 并发调用,否则 N 个账号串行会让 sync 超 30s。
+    """
+    auth_file = acc.get("auth_file")
+    if not auth_file:
+        return None
+    try:
+        path_obj = Path(auth_file)
+        if not path_obj.exists():
+            return None
+        data = json.loads(path_obj.read_text(encoding="utf-8"))
+        access_token = data.get("access_token") or (data.get("tokens") or {}).get("access_token")
+        if not access_token:
+            return None
+        status, _ = check_codex_quota(access_token)
+        return status
+    except Exception as exc:
+        logger.debug("[同步] _probe_kicked_account(%s) 异常: %s", acc.get("email"), exc)
+        return None
+
+
 def sync_account_states(chatgpt_api=None):
     """根据 Team 实际成员列表同步本地账号状态"""
     account_id = get_chatgpt_account_id()
@@ -515,6 +544,16 @@ def sync_account_states(chatgpt_api=None):
     changed = False
     local_email_set = {a["email"].lower() for a in accounts}
 
+    # SPEC-2 FR-E1~E4 — 区分人工踢出 vs 自然待机:
+    # 不在 Team 的 active 号 → wham/usage 401/403 → AUTH_INVALID(被踢);ok / network → STANDBY(自然)。
+    # 探测有并发上限 5 + 单调用 5s + 整体 30s + 30 分钟 last_quota_check_at 去重。
+    from autoteam.runtime_config import get_sync_probe_concurrency, get_sync_probe_cooldown_minutes
+
+    cooldown_secs = max(60, int(get_sync_probe_cooldown_minutes()) * 60)
+    concurrency = max(1, int(get_sync_probe_concurrency()))
+    need_probe = []
+    now_ts = time.time()
+
     for acc in accounts:
         email = acc["email"].lower()
         in_team = email in team_emails
@@ -539,8 +578,65 @@ def sync_account_states(chatgpt_api=None):
                     account_id,
                 )
                 continue
-            acc["status"] = STATUS_STANDBY
-            changed = True
+            # FR-E3 探测去重:30 分钟内不重复探测,直接降级 STANDBY 走旧行为
+            last_check = float(acc.get("last_quota_check_at") or 0)
+            if (now_ts - last_check) < cooldown_secs:
+                acc["status"] = STATUS_STANDBY
+                changed = True
+                continue
+            # 收集到批量待探测列表,后面用 ThreadPoolExecutor 并发跑
+            if acc.get("auth_file"):
+                need_probe.append(acc)
+            else:
+                # 没 auth_file 无法探测 → 直接降级 STANDBY(等用户重 OAuth)
+                acc["status"] = STATUS_STANDBY
+                changed = True
+
+    # FR-E2 并发探测被踢识别(只对 need_probe 中的账号)
+    if need_probe:
+        import concurrent.futures
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+                future_map = {ex.submit(_probe_kicked_account, acc): acc for acc in need_probe}
+                done, not_done = concurrent.futures.wait(
+                    future_map.keys(), timeout=30.0,
+                    return_when=concurrent.futures.ALL_COMPLETED,
+                )
+                for fut in done:
+                    acc = future_map[fut]
+                    try:
+                        status_str = fut.result(timeout=0.1)
+                    except Exception:
+                        status_str = None
+                    finalize_ts = time.time()
+                    acc["last_quota_check_at"] = finalize_ts
+
+                    if status_str == "auth_error":
+                        acc["status"] = STATUS_AUTH_INVALID
+                        acc["last_kicked_at"] = finalize_ts
+                        logger.warning(
+                            "[同步] %s wham 401/403 → AUTH_INVALID(判定人工踢出)",
+                            acc["email"],
+                        )
+                    elif status_str == "no_quota":
+                        # 不会自然恢复
+                        acc["status"] = STATUS_AUTH_INVALID
+                        logger.warning("[同步] %s wham no_quota → AUTH_INVALID", acc["email"])
+                    else:
+                        # ok / exhausted / network_error / None → 自然待机
+                        acc["status"] = STATUS_STANDBY
+                    changed = True
+
+                # 超时未完成的:保持原 ACTIVE,等下轮(避免误标)
+                for fut in not_done:
+                    acc = future_map[fut]
+                    logger.warning("[同步] %s 探测超时,保留 ACTIVE 等下轮", acc["email"])
+                    fut.cancel()
+        except Exception as exc:
+            logger.warning("[同步] 探测段抛异常,降级所有 need_probe 为 STANDBY: %s", exc)
+            for acc in need_probe:
+                acc["status"] = STATUS_STANDBY
+                changed = True
 
     # Team 中有我们域名但本地无记录的成员 → 自动添加
     if domain_suffix:
@@ -1430,17 +1526,84 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
             logger.info("[注册] kick 成功,等 8s 让 OpenAI workspace default 同步后再 OAuth...")
             time.sleep(8)
 
-        bundle = login_codex_via_browser(email, password, mail_client=mail_client, use_personal=True)
+        # SPEC-2 §3.1.3 — personal 分支 catch RegisterBlocked + plan_supported 检查
+        try:
+            bundle = login_codex_via_browser(email, password, mail_client=mail_client, use_personal=True)
+        except RegisterBlocked as blocked:
+            if blocked.is_phone:
+                logger.error(
+                    "[注册] %s personal OAuth 触发 add-phone (step=%s),从账号池删除",
+                    email, blocked.step,
+                )
+                record_failure(
+                    email,
+                    "oauth_phone_blocked",
+                    f"personal OAuth 阶段触发 add-phone (step={blocked.step})",
+                    step=blocked.step,
+                    stage="run_post_register_oauth_personal",
+                )
+                delete_account(email)
+                _record_outcome("oauth_phone_blocked", reason="personal OAuth 触发 add-phone")
+                return None
+            # is_duplicate 或其他异常子类:OAuth 阶段不应出现 duplicate,记 exception 兜底
+            logger.error("[注册] %s personal OAuth RegisterBlocked: %s", email, blocked.reason)
+            record_failure(email, "exception", f"personal OAuth RegisterBlocked: {blocked.reason}",
+                           stage="run_post_register_oauth_personal")
+            delete_account(email)
+            _record_outcome("oauth_failed", reason=f"unexpected RegisterBlocked: {blocked.reason}")
+            return None
+
         if bundle:
-            auth_file = save_auth_file(bundle)
-            # personal 分支:已主动退出 Team,bundle 是个人 free/plus plan,算 codex 席位
-            update_account(
-                email,
-                status=STATUS_PERSONAL,
-                seat_type="codex",
-                auth_file=auth_file,
-                last_active_at=time.time(),
+            # SPEC-2 shared/plan-type-whitelist §5.2 — plan_supported=False 直接拒,personal 已 leave_workspace 本地无价值
+            plan_supported = bundle.get(
+                "plan_supported", is_supported_plan(bundle.get("plan_type", ""))
             )
+            if not plan_supported:
+                logger.error(
+                    "[注册] %s personal OAuth 拿到 plan_type=%s 不在白名单,从账号池删除",
+                    email, bundle.get("plan_type_raw") or bundle.get("plan_type"),
+                )
+                record_failure(
+                    email, "plan_unsupported",
+                    f"personal OAuth bundle plan_type={bundle.get('plan_type_raw')} 不在白名单",
+                    plan_type=bundle.get("plan_type"),
+                    plan_type_raw=bundle.get("plan_type_raw"),
+                    stage="run_post_register_oauth_personal",
+                )
+                delete_account(email)
+                _record_outcome("plan_unsupported", plan=bundle.get("plan_type"))
+                return None
+
+            auth_file = save_auth_file(bundle)
+            update_fields = {
+                "status": STATUS_PERSONAL,
+                "seat_type": "codex",
+                "auth_file": auth_file,
+                "last_active_at": time.time(),
+                "plan_type_raw": bundle.get("plan_type_raw"),
+            }
+            # SPEC-2 FR-D3 — personal 分支也 quota probe(对称设计):free plan 也可能"未分配 codex 配额"
+            access_token = bundle.get("access_token")
+            if access_token:
+                try:
+                    quota_status, quota_info = check_codex_quota(access_token, account_id=bundle.get("account_id"))
+                    if quota_status == "ok" and isinstance(quota_info, dict):
+                        update_fields["last_quota"] = quota_info
+                    elif quota_status == "no_quota":
+                        # personal free 无配额 — 记一笔但仍保留 PERSONAL,让用户决定删不删
+                        record_failure(
+                            email, "no_quota_assigned",
+                            "personal free plan 无 codex 配额",
+                            stage="run_post_register_oauth_personal",
+                        )
+                except Exception as exc:
+                    record_failure(
+                        email, "quota_probe_network_error",
+                        f"personal quota probe exception: {exc}",
+                        stage="run_post_register_oauth_personal",
+                    )
+            # personal 分支:已主动退出 Team,bundle 是个人 free/plus plan,算 codex 席位
+            update_account(email, **update_fields)
             logger.info("[注册] 免费号就绪: %s (plan=%s)", email, bundle.get("plan_type"))
             _record_outcome("success", plan=bundle.get("plan_type"))
             return email
@@ -1461,24 +1624,132 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
         _record_outcome("oauth_failed", reason="personal Codex OAuth 未返回 bundle")
         return None
 
-    # 原有 Team 流程
-    bundle = login_codex_via_browser(email, password, mail_client=mail_client)
+    # 原有 Team 流程 — SPEC-2 §3.1.2 改造:catch RegisterBlocked + plan_supported 检查 + quota probe
+    try:
+        bundle = login_codex_via_browser(email, password, mail_client=mail_client)
+    except RegisterBlocked as blocked:
+        if blocked.is_phone:
+            logger.error(
+                "[注册] %s Team OAuth 触发 add-phone (step=%s),账号已入 Team 席位标 AUTH_INVALID 待 reconcile",
+                email, blocked.step,
+            )
+            record_failure(
+                email, "oauth_phone_blocked",
+                f"Team OAuth 阶段触发 add-phone (step={blocked.step})",
+                step=blocked.step,
+                stage="run_post_register_oauth_team",
+            )
+            # Team 模式下账号已成功 invite,不能 delete_account(席位仍占着);标 AUTH_INVALID 让 reconcile 接管
+            update_account(
+                email,
+                status=STATUS_AUTH_INVALID,
+                workspace_account_id=get_chatgpt_account_id() or None,
+            )
+            _record_outcome("oauth_phone_blocked", reason="OAuth 阶段触发 add-phone")
+            return None
+        record_failure(email, "exception", f"Team OAuth RegisterBlocked: {blocked.reason}",
+                       stage="run_post_register_oauth_team")
+        update_account(email, status=STATUS_AUTH_INVALID,
+                       workspace_account_id=get_chatgpt_account_id() or None)
+        _record_outcome("oauth_failed", reason=f"unexpected RegisterBlocked: {blocked.reason}")
+        return None
+
     if bundle:
-        auth_file = save_auth_file(bundle)
-        # 注册后 Team bundle 成功拿到,说明 workspace 已同步:seat_type=chatgpt
-        bundle_plan = (bundle.get("plan_type") or "").lower()
-        seat_label = "chatgpt" if bundle_plan == "team" else "codex"
-        update_account(
-            email,
-            status=STATUS_ACTIVE,
-            seat_type=seat_label,
-            auth_file=auth_file,
-            last_active_at=time.time(),
-            workspace_account_id=get_chatgpt_account_id() or None,
+        # SPEC-2 shared/plan-type-whitelist §5 — plan_supported=False:account 已入 Team 但无法用,
+        # 标 AUTH_INVALID + 保留 auth_file 供调试,reconcile 会按 auth_invalid 流程接管
+        plan_supported = bundle.get(
+            "plan_supported", is_supported_plan(bundle.get("plan_type", ""))
         )
-        logger.info("[注册] 账号就绪: %s (seat=%s)", email, seat_label)
-        _record_outcome("success", plan=bundle.get("plan_type"))
-        return email
+        auth_file = save_auth_file(bundle)
+        bundle_plan = bundle.get("plan_type", "unknown")  # 已被 _exchange_auth_code 归一化为小写
+
+        if not plan_supported:
+            logger.error(
+                "[注册] %s Team OAuth 拿到 plan_type=%s 不在白名单 → AUTH_INVALID",
+                email, bundle.get("plan_type_raw") or bundle_plan,
+            )
+            record_failure(
+                email, "plan_unsupported",
+                f"Team OAuth bundle plan_type={bundle.get('plan_type_raw')} 不在白名单",
+                plan_type=bundle_plan,
+                plan_type_raw=bundle.get("plan_type_raw"),
+                stage="run_post_register_oauth_team",
+            )
+            update_account(
+                email,
+                status=STATUS_AUTH_INVALID,
+                seat_type="codex",
+                auth_file=auth_file,
+                plan_type_raw=bundle.get("plan_type_raw"),
+                workspace_account_id=get_chatgpt_account_id() or None,
+            )
+            _record_outcome("plan_unsupported", plan=bundle_plan)
+            return None
+
+        # SPEC-2 FR-D1~D4 — quota probe(与 manual_account._finalize_account 对称)
+        seat_label = "chatgpt" if bundle_plan == "team" else "codex"
+        access_token = bundle.get("access_token")
+        account_id = bundle.get("account_id")
+        update_fields = {
+            "status": STATUS_ACTIVE,
+            "seat_type": seat_label,
+            "auth_file": auth_file,
+            "last_active_at": time.time(),
+            "workspace_account_id": get_chatgpt_account_id() or None,
+            "plan_type_raw": bundle.get("plan_type_raw"),
+        }
+
+        if access_token:
+            try:
+                quota_status, quota_info = check_codex_quota(access_token, account_id=account_id)
+            except Exception as exc:
+                # SPEC-2 FR-D4: probe 异常吞,降级 ACTIVE 但记一笔
+                record_failure(email, "quota_probe_network_error",
+                               f"quota probe exception: {exc}",
+                               stage="run_post_register_oauth_team")
+                quota_status, quota_info = "network_error", None
+
+            if quota_status == "ok" and isinstance(quota_info, dict):
+                update_fields["last_quota"] = quota_info
+            elif quota_status == "exhausted":
+                snapshot = quota_info.get("quota_info") if isinstance(quota_info, dict) else None
+                if snapshot:
+                    update_fields["last_quota"] = snapshot
+                update_fields["status"] = STATUS_EXHAUSTED
+                update_fields["quota_exhausted_at"] = time.time()
+                update_fields["quota_resets_at"] = (
+                    quota_info.get("resets_at") if isinstance(quota_info, dict) else int(time.time() + 18000)
+                )
+            elif quota_status == "no_quota":
+                snapshot = quota_info.get("quota_info") if isinstance(quota_info, dict) else None
+                if snapshot:
+                    update_fields["last_quota"] = snapshot
+                update_fields["status"] = STATUS_AUTH_INVALID
+                record_failure(email, "no_quota_assigned",
+                               "wham/usage 返回 no_quota(workspace 未分配 codex 配额)",
+                               plan_type=bundle_plan,
+                               stage="run_post_register_oauth_team")
+            elif quota_status == "auth_error":
+                update_fields["status"] = STATUS_AUTH_INVALID
+                record_failure(email, "auth_error_at_oauth",
+                               "wham/usage 返回 401/403,token 失效",
+                               stage="run_post_register_oauth_team")
+            elif quota_status == "network_error":
+                # 保留 ACTIVE,等下轮 cmd_check 校准
+                record_failure(email, "quota_probe_network_error",
+                               "wham/usage 网络异常,ACTIVE 状态由下轮 cmd_check 校准",
+                               stage="run_post_register_oauth_team")
+
+        update_account(email, **update_fields)
+        if update_fields["status"] == STATUS_ACTIVE:
+            logger.info("[注册] 账号就绪: %s (seat=%s)", email, seat_label)
+            _record_outcome("success", plan=bundle_plan)
+            return email
+        else:
+            logger.warning("[注册] %s 入池但状态=%s,需要后续处理", email, update_fields["status"])
+            _record_outcome("quota_issue", plan=bundle_plan, status=update_fields["status"])
+            return None
+
     # 部分成功：账号已入 Team(席位被占用)但 auth_file 缺失,需要用户手动"补登录"。
     # 上游 cmd_fill 依 `if email: produced+=1` 按席位计数,所以这里仍返回 email;
     # outcome 打 team_auth_missing 让汇总能显示"这批里有 X 个需要补登录"。
@@ -2461,8 +2732,6 @@ def reinvite_account(chatgpt_api, mail_client, acc):
     if chatgpt_api and chatgpt_api.browser:
         chatgpt_api.stop()
 
-    bundle = login_codex_via_browser(email, password, mail_client=mail_client)
-
     def _cleanup_team_leftover(reason):
         """OAuth 失败/plan 不对时,兜底 kick 账号,避免假 standby。"""
         try:
@@ -2478,17 +2747,53 @@ def reinvite_account(chatgpt_api, mail_client, acc):
         except Exception as exc:
             logger.warning("[轮转] OAuth 失败后 kick %s 抛异常(留给下次对账兜底): %s", email, exc)
 
+    try:
+        bundle = login_codex_via_browser(email, password, mail_client=mail_client)
+    except RegisterBlocked as exc:
+        # OAuth 阶段触发 add-phone / 双重验证 / 重复账号风控 — 不可恢复,锁 AUTH_INVALID
+        # 而非 STANDBY,避免下一轮 rotate 又选中它死循环。
+        logger.warning("[轮转] %s reinvite OAuth 被 add-phone/duplicate 阻断: %s", email, exc)
+        _cleanup_team_leftover("oauth_phone_blocked")
+        update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)
+        try:
+            from autoteam.register_failures import record_failure
+            record_failure(email, "oauth_phone_blocked", stage="reinvite_account", detail=str(exc))
+        except Exception:
+            pass
+        return False
+
     if not bundle:
         logger.warning("[轮转] 旧账号 OAuth 登录失败，保持 standby: %s", email)
         _cleanup_team_leftover("no_bundle")
         update_account(email, status=STATUS_STANDBY)
         return False
 
+    plan_type_raw = bundle.get("plan_type_raw") or bundle.get("plan_type") or ""
     plan_type = (bundle.get("plan_type") or "").lower()
+    if not is_supported_plan(plan_type_raw):
+        # plan_type 不在白名单(self_serve_business_usage_based / enterprise / unknown 等)
+        # → 这种账号即使 OAuth 成功也无法稳定调用 Codex,锁 AUTH_INVALID 而非 standby。
+        logger.warning("[轮转] %s reinvite 后 plan_type=%s 不被支持,标 AUTH_INVALID", email, plan_type_raw)
+        _cleanup_team_leftover(f"plan_unsupported={plan_type_raw}")
+        update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)
+        try:
+            from autoteam.register_failures import record_failure
+            record_failure(email, "plan_unsupported", stage="reinvite_account", detail=f"plan_type={plan_type_raw}")
+        except Exception:
+            pass
+        return False
+
     if plan_type != "team":
-        logger.warning("[轮转] 旧账号登录后 plan=%s，不是 team，恢复失败: %s", plan_type or "unknown", email)
-        _cleanup_team_leftover(f"plan={plan_type or 'unknown'}")
-        update_account(email, status=STATUS_STANDBY)
+        # plan 漂移(白名单内但不是 team,例如 free) — 邀请阶段成功的 Team 席位但 OAuth 拿到的
+        # 是个人 plan,反复 reinvite 也不会变 team。锁 AUTH_INVALID 让下游清账,不再死循环。
+        logger.warning("[轮转] %s reinvite 后 plan=%s 漂移,不是 team,标 AUTH_INVALID", email, plan_type or "unknown")
+        _cleanup_team_leftover(f"plan_drift={plan_type or 'unknown'}")
+        update_account(email, status=STATUS_AUTH_INVALID, auth_file=None)
+        try:
+            from autoteam.register_failures import record_failure
+            record_failure(email, "plan_drift", stage="reinvite_account", detail=f"plan_type={plan_type or 'unknown'}")
+        except Exception:
+            pass
         return False
 
     auth_file = save_auth_file(bundle)
@@ -2542,6 +2847,11 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                     update_account(email, last_quota=quota_info)
                 fail_reason = "exhausted"
                 logger.warning("[轮转] %s OAuth 成功但实测 exhausted,判定假恢复", email)
+            elif status_str == "no_quota":
+                # 没有发放任何配额(primary_total=0 或 rate_limit 字段全空),不是耗尽。
+                # 锁 5h 没意义,直接 AUTH_INVALID 让下游清账,避免反复假恢复。
+                fail_reason = "no_quota_assigned"
+                logger.warning("[轮转] %s reinvite 后未分配配额(no_quota),判定 AUTH_INVALID", email)
             elif status_str == "network_error":
                 # 网络错误不是 token 风控也不是 quota 用尽。当作"未验证",走 exception 分支
                 # 同款处置:不锁 5h(token 还活着),让下一轮自然重试。
@@ -2568,6 +2878,21 @@ def reinvite_account(chatgpt_api, mail_client, acc):
                 quota_exhausted_at=now_ts,
                 quota_resets_at=now_ts + 18000,
             )
+        elif fail_reason == "no_quota_assigned":
+            # 后端没发配额 —— 不是耗尽,锁 5h 没用,锁 AUTH_INVALID 让下游清账。
+            update_account(
+                email,
+                status=STATUS_AUTH_INVALID,
+                auth_file=None,
+                quota_exhausted_at=None,
+                quota_resets_at=None,
+            )
+            try:
+                from autoteam.register_failures import record_failure
+                record_failure(email, "no_quota_assigned", stage="reinvite_account",
+                               detail="primary_total=0 or rate_limit_empty")
+            except Exception:
+                pass
         else:
             # token 风控/异常 —— 锁 5h 没用,token revoke 等不来。降级到 standby 但
             # 不写 quota_exhausted_at/resets_at,让下次有机会重新尝试 OAuth(说不定

@@ -96,6 +96,14 @@ export const api = {
   getRegisterDomain: () => request('GET', '/config/register-domain'),
   setRegisterDomain: (domain, verify = true) => request('PUT', '/config/register-domain', { domain, verify }),
 
+  // SPEC-2 — 邀请席位偏好(default/codex)
+  getPreferredSeatType: () => request('GET', '/config/preferred-seat-type'),
+  putPreferredSeatType: (value) => request('PUT', '/config/preferred-seat-type', { value }),
+
+  // SPEC-2 — sync_account_states 被踢探测节流(并发上限 + 冷却分钟)
+  getSyncProbe: () => request('GET', '/config/sync-probe'),
+  putSyncProbe: (payload) => request('PUT', '/config/sync-probe', payload),
+
   getRegisterFailures: (limit = 50) => request('GET', `/register-failures?limit=${limit}`),
 
   getTeamMembers: () => request('GET', '/team/members'),

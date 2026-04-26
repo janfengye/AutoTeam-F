@@ -593,6 +593,17 @@ class RegisterDomainParams(BaseModel):
     verify: bool = True  # 默认写入前试探一次 CloudMail 是否接受该域
 
 
+class PreferredSeatTypeParams(BaseModel):
+    """SPEC-2 FR-G — 邀请席位偏好。"default"(优先 PATCH 升级 ChatGPT 完整席位) | "codex"(锁 codex-only)"""
+    value: str  # "default" | "codex"
+
+
+class SyncProbeParams(BaseModel):
+    """SPEC-2 FR-E — sync_account_states 被踢探测的并发上限和去重冷却。"""
+    concurrency: int | None = None  # 1..16
+    cooldown_minutes: int | None = None  # 1..1440
+
+
 class DeleteBatchParams(BaseModel):
     emails: list[str]
     continue_on_error: bool = True  # 部分失败时继续剩余账号,False 则遇错即停
@@ -1890,6 +1901,55 @@ def put_register_domain_api(params: RegisterDomainParams):
         )
         resp["leaked_probe"] = leaked_probe
     return resp
+
+
+@app.get("/api/config/preferred-seat-type")
+def get_preferred_seat_type_api():
+    """SPEC-2 FR-G — 读取邀请席位偏好。"""
+    from autoteam.runtime_config import get_preferred_seat_type
+    return {"value": get_preferred_seat_type()}
+
+
+@app.put("/api/config/preferred-seat-type")
+def put_preferred_seat_type_api(params: PreferredSeatTypeParams):
+    """SPEC-2 FR-G — 切换邀请席位偏好(default | codex)。"""
+    from autoteam.runtime_config import set_preferred_seat_type
+    val = (params.value or "").strip().lower()
+    if val not in ("default", "codex"):
+        raise HTTPException(status_code=400, detail="value 必须为 'default' 或 'codex'")
+    saved = set_preferred_seat_type(val)
+    logger.info("[config] preferred_seat_type 已切换为 %s", saved)
+    return {"value": saved, "message": f"邀请席位偏好已设为 {saved}"}
+
+
+@app.get("/api/config/sync-probe")
+def get_sync_probe_api():
+    """SPEC-2 FR-E — 读取 sync_account_states 被踢探测的并发/冷却配置。"""
+    from autoteam.runtime_config import get_sync_probe_concurrency, get_sync_probe_cooldown_minutes
+    return {
+        "concurrency": get_sync_probe_concurrency(),
+        "cooldown_minutes": get_sync_probe_cooldown_minutes(),
+    }
+
+
+@app.put("/api/config/sync-probe")
+def put_sync_probe_api(params: SyncProbeParams):
+    """SPEC-2 FR-E — 更新 sync_account_states 被踢探测的并发/冷却(任一非空字段都生效)。"""
+    from autoteam.runtime_config import (
+        get_sync_probe_concurrency,
+        get_sync_probe_cooldown_minutes,
+        set_sync_probe_concurrency,
+        set_sync_probe_cooldown_minutes,
+    )
+    if params.concurrency is not None:
+        set_sync_probe_concurrency(params.concurrency)
+    if params.cooldown_minutes is not None:
+        set_sync_probe_cooldown_minutes(params.cooldown_minutes)
+    return {
+        "concurrency": get_sync_probe_concurrency(),
+        "cooldown_minutes": get_sync_probe_cooldown_minutes(),
+        "message": "sync 探测配置已更新",
+    }
 
 
 @app.post("/api/sync/accounts")

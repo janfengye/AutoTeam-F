@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -123,7 +122,6 @@ def test_self_check_whitelist_imports() -> None:
     若 PR 改名/删除这些符号,本测试先红 → entrypoint 才不会在容器启动期红。
     """
 
-    from autoteam.api import app  # noqa: F401
     from autoteam.accounts import (  # noqa: F401
         STATUS_ACTIVE,
         STATUS_AUTH_INVALID,
@@ -135,6 +133,7 @@ def test_self_check_whitelist_imports() -> None:
         load_accounts,
         save_accounts,
     )
+    from autoteam.api import app  # noqa: F401
     from autoteam.manager import sync_account_states  # noqa: F401
 
     # 简单的契约校验 — 函数应可调用、状态常量应是字符串

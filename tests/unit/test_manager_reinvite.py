@@ -4,6 +4,11 @@ from autoteam import accounts, manager
 
 
 def test_reinvite_account_uses_unified_oauth_login_and_marks_active(monkeypatch):
+    """OAuth + plan=team + 实测配额 ok → STATUS_ACTIVE。
+
+    SPEC-2 §3.3 给 reinvite_account 加了 quota probe(check_codex_quota),
+    必须 mock 它返回 ok 才能走到 active 分支。
+    """
     updates = []
 
     monkeypatch.setattr(
@@ -14,6 +19,7 @@ def test_reinvite_account_uses_unified_oauth_login_and_marks_active(monkeypatch)
             "access_token": "token-1",
             "refresh_token": "refresh-1",
             "plan_type": "team",
+            "plan_type_raw": "team",
         },
     )
     monkeypatch.setattr(manager, "save_auth_file", lambda bundle: f"/tmp/{bundle['email']}.json")
@@ -22,6 +28,13 @@ def test_reinvite_account_uses_unified_oauth_login_and_marks_active(monkeypatch)
         "update_account",
         lambda email, **kwargs: updates.append((email, kwargs)),
     )
+    # SPEC-2 quota probe — 返回 ok + primary_pct=0(剩余 100%)
+    monkeypatch.setattr(
+        manager,
+        "check_codex_quota",
+        lambda token: ("ok", {"primary_pct": 0, "weekly_pct": 0, "primary_total": 1000}),
+    )
+    monkeypatch.setattr(manager, "get_chatgpt_account_id", lambda: "wsk-1")
     monkeypatch.setattr(manager.time, "time", lambda: 1234567890)
     monkeypatch.setattr(
         manager,
@@ -36,19 +49,20 @@ def test_reinvite_account_uses_unified_oauth_login_and_marks_active(monkeypatch)
     )
 
     assert result is True
-    assert updates == [
-        (
-            "tmp-user@example.com",
-            {
-                "status": accounts.STATUS_ACTIVE,
-                "last_active_at": 1234567890,
-                "auth_file": "/tmp/tmp-user@example.com.json",
-            },
-        )
-    ]
+    # 第一条 update 是 quota probe 写 last_quota,第二条是 active 终态
+    assert len(updates) >= 1
+    final_email, final_kwargs = updates[-1]
+    assert final_email == "tmp-user@example.com"
+    assert final_kwargs["status"] == accounts.STATUS_ACTIVE
+    assert final_kwargs["last_active_at"] == 1234567890
+    assert final_kwargs["auth_file"] == "/tmp/tmp-user@example.com.json"
 
 
-def test_reinvite_account_marks_standby_when_oauth_login_returns_non_team(monkeypatch):
+def test_reinvite_account_marks_auth_invalid_when_oauth_login_returns_non_team(monkeypatch):
+    """SPEC-2 §3.3 plan_drift — 白名单内但 plan!=team → STATUS_AUTH_INVALID(不是 STANDBY)。
+
+    旧行为 STANDBY 死循环踩同一个号 reinvite,SPEC-2 改为 AUTH_INVALID 让下游清账。
+    """
     updates = []
 
     monkeypatch.setattr(
@@ -59,6 +73,7 @@ def test_reinvite_account_marks_standby_when_oauth_login_returns_non_team(monkey
             "access_token": "token-1",
             "refresh_token": "refresh-1",
             "plan_type": "free",
+            "plan_type_raw": "free",
         },
     )
     monkeypatch.setattr(
@@ -79,4 +94,6 @@ def test_reinvite_account_marks_standby_when_oauth_login_returns_non_team(monkey
     )
 
     assert result is False
-    assert updates == [("tmp-user@example.com", {"status": accounts.STATUS_STANDBY})]
+    assert updates == [
+        ("tmp-user@example.com", {"status": accounts.STATUS_AUTH_INVALID, "auth_file": None})
+    ]

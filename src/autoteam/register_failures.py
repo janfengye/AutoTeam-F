@@ -58,13 +58,22 @@ def _save(records):
         pass
 
 
-def record_failure(email, category, reason, **extra):
+def record_failure(email, category, reason="", **extra):
     """追加一条失败记录。
 
-    category: 'phone_blocked' / 'duplicate_exhausted' / 'register_failed' / 'oauth_failed'
-              / 'kick_failed' / 'team_oauth_failed' / 'exception'
-    reason:   面向人的简短描述（会显示在日志和面板）
-    extra:    任意附加字段（attempts, duplicate_swaps, step, url ...）
+    category(原有):
+        'phone_blocked' / 'duplicate_exhausted' / 'register_failed' / 'oauth_failed'
+        / 'kick_failed' / 'team_oauth_failed' / 'exception'
+    category(SPEC-2 新增 — 注册/邀请生命周期相关):
+        'oauth_phone_blocked'        OAuth 阶段触发 add-phone / duplicate(invite.RegisterBlocked)
+        'plan_unsupported'           plan_type 不在白名单(team/free/plus/pro)
+        'no_quota_assigned'          OAuth 成功但后端没发配额(primary_total=0 或 rate_limit 全空)
+        'plan_drift'                 reinvite 后 plan_type 漂移到非 team
+        'auth_error_at_oauth'        post-register quota 探测返回 401/403
+        'quota_probe_network_error'  post-register quota 探测网络错误(允许下次重试)
+
+    reason: 面向人的简短描述,显示在日志和面板。可留空,从 extra.detail 取代。
+    extra:  任意附加字段(attempts, duplicate_swaps, step, url, stage, detail ...)
     """
     with _LOCK:
         records = _load()
@@ -73,7 +82,7 @@ def record_failure(email, category, reason, **extra):
                 "timestamp": time.time(),
                 "email": email or "",
                 "category": category,
-                "reason": reason or "",
+                "reason": reason or extra.get("detail", "") or "",
                 **extra,
             }
         )

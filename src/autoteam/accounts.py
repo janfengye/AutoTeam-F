@@ -24,6 +24,35 @@ SEAT_CHATGPT = "chatgpt"  # 完整 ChatGPT 席位(PATCH invite seat_type=default
 SEAT_CODEX = "codex"  # 仅 Codex 席位(usage_based,PATCH 改 default 失败时保留的兜底)
 SEAT_UNKNOWN = "unknown"  # 未知/未记录,老账号或手动导入默认值
 
+# SPEC-2 §shared/plan-type-whitelist:本系统能正确处理(注册→入池→Codex 调用)的 plan_type 集合。
+# 不在此集合内的字面量(self_serve_business_usage_based / enterprise / unknown 等)
+# 均视为 unsupported,触发 STATUS_AUTH_INVALID + register_failures.category="plan_unsupported"。
+# 修改本集合需经测试验证(quota / seat 行为有变化)。
+SUPPORTED_PLAN_TYPES = frozenset({
+    "team",   # ChatGPT Team workspace,本系统主要工作池
+    "free",   # 已退出 Team 的个人 free,personal 子号路径
+    "plus",   # 个人付费,允许通过 manual_account 手动添加
+    "pro",    # 个人 Pro,同上
+})
+
+
+def normalize_plan_type(plan_type):
+    """归一化用于落盘 / 比对的 plan_type。
+
+    None / 空串 → "unknown",其余统一 .lower().strip()。
+    比对前先归一化,避免 OpenAI 后端大小写漂移(返回 "Team" / "Self_Serve_*")。
+    """
+    if not plan_type:
+        return "unknown"
+    return str(plan_type).strip().lower()
+
+
+def is_supported_plan(plan_type):
+    """判定 plan_type 是否在白名单内。"""
+    if not plan_type:
+        return False
+    return normalize_plan_type(plan_type) in SUPPORTED_PLAN_TYPES
+
 
 def _normalized_email(value):
     return (value or "").strip().lower()
