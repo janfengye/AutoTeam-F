@@ -13,6 +13,7 @@ Authorization: Bearer <API_KEY>
 - `/api/setup/status`
 - `/api/setup/save`
 - `/api/version`
+- `/api/mail-provider/probe`(setup 阶段免鉴权;`API_KEY` 已配置时仍要求 Bearer,见下文)
 
 ## 即时返回接口
 
@@ -21,8 +22,9 @@ Authorization: Bearer <API_KEY>
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/auth/check` | 验证 API Key |
-| GET | `/api/setup/status` | 检查配置是否完整 |
-| POST | `/api/setup/save` | 保存初始配置 |
+| GET | `/api/setup/status` | 检查配置是否完整(按 `MAIL_PROVIDER` 动态切换 `optional`) |
+| POST | `/api/setup/save` | 保存初始配置(provider 互斥写盘) |
+| POST | `/api/mail-provider/probe` | 邮箱后端 3 步探测(fingerprint / credentials / domain_ownership) |
 | GET | `/api/version` | 镜像版本指纹（`git_sha` + `build_time`，免鉴权，用于排查 docker 镜像是否过期） |
 | GET | `/api/status` | 账号状态 + 实时额度 |
 | GET | `/api/accounts` | 所有账号列表 |
@@ -123,6 +125,116 @@ Authorization: Bearer <API_KEY>
 | `callback_source` | `auto` 或 `manual` |
 | `auto_callback_available` | 本地自动回调服务是否启动成功 |
 | `account` | 完成后导入的账号信息 |
+
+## 初始配置 API
+
+### `POST /api/mail-provider/probe`
+
+邮箱后端 3 步探测,SetupPage / Settings 用作切换前置校验。**setup 阶段免 Bearer**(在 `_AUTH_SKIP_PATHS` 白名单);一旦 `API_KEY` 已配置,仍要求 Bearer,且按 IP 限速 60 req/min(超限返 `error_code=RATE_LIMITED` + HTTP 429)。
+
+请求体(共用 schema):
+
+```json
+{
+  "provider": "cf_temp_email | maillab",
+  "step": "fingerprint | credentials | domain_ownership",
+  "base_url": "https://example.com",
+  "username": "admin@example.com",     // 仅 maillab credentials/domain_ownership
+  "password": "...",                   // 仅 maillab credentials/domain_ownership
+  "admin_password": "...",             // 仅 cf_temp_email credentials/domain_ownership
+  "domain": "example.com"              // 仅 domain_ownership
+}
+```
+
+响应通用字段:
+
+```json
+{
+  "ok": true,
+  "step": "fingerprint",
+  "provider": "maillab",
+  "detected_provider": "maillab",
+  "domain_list": ["@a.com"],
+  "warnings": [],
+  "error_code": null,
+  "message": null,
+  "hint": null,
+  "leaked_probe": null,
+  "cleaned": null
+}
+```
+
+`error_code` 取值见下表(失败时 `ok=false`):
+
+| `error_code` | HTTP | 说明 |
+|---|---|---|
+| `PROVIDER_MISMATCH` | 200 | base_url 指纹与 `provider` 不一致(典型 issue#1) |
+| `ROUTE_NOT_FOUND` | 200 | base_url 不是任何已知后端 |
+| `EMPTY_DOMAIN_LIST` | 200 | maillab `domainList` 空 |
+| `UNAUTHORIZED` | 200 | 凭据校验失败 |
+| `CAPTCHA_REQUIRED` | 200 | maillab 启用了登录验证码 |
+| `DOMAIN_REJECTED` | 200 | 创建探测邮箱被后端拒绝(`addVerify=1` 等) |
+| `NETWORK_ERROR` / `TIMEOUT` | 200 | 网络异常 |
+| `RATE_LIMITED` | 429 | 60 req/min 限速触发 |
+
+#### 示例 1:`step=fingerprint`(探测后端归属)
+
+```bash
+curl -X POST http://localhost:8787/api/mail-provider/probe \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"maillab","step":"fingerprint","base_url":"https://m.example.com"}'
+```
+
+成功响应:
+
+```json
+{
+  "ok": true,
+  "detected_provider": "maillab",
+  "domain_list": ["@example.com", "@x.example.com"],
+  "warnings": []
+}
+```
+
+#### 示例 2:`step=credentials`(凭据校验)
+
+cf_temp_email:
+
+```bash
+curl -X POST http://localhost:8787/api/mail-provider/probe \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"cf_temp_email","step":"credentials","base_url":"...","admin_password":"..."}'
+```
+
+maillab:
+
+```bash
+curl -X POST http://localhost:8787/api/mail-provider/probe \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"maillab","step":"credentials","base_url":"...","username":"admin@x.com","password":"..."}'
+```
+
+#### 示例 3:`step=domain_ownership`(域名归属验证)
+
+```bash
+curl -X POST http://localhost:8787/api/mail-provider/probe \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"maillab","step":"domain_ownership","base_url":"...","username":"...","password":"...","domain":"example.com"}'
+```
+
+成功响应:
+
+```json
+{
+  "ok": true,
+  "cleaned": true,
+  "leaked_probe": null
+}
+```
+
+如果探测邮箱删除失败(`cleaned=false`),`leaked_probe` 含 `{"email":"probe-...","account_id":"..."}`,需到管理后台手动删除。
+
+> 内部使用 `autoteam.mail.probe.probe_domain_ownership` helper,与 `/api/config/register-domain`(注册域名验证)共用同一份逻辑,语义对齐。
 
 ## 调用示例
 

@@ -282,21 +282,63 @@ src/autoteam/mail/
 
 ---
 
-## 6. cloud-mail 实现的未知项（实施前必现场验证）
+## 6. cloud-mail 实现的未知项 — close-out
 
-implementer 开工前必须在真实 maillab 实例上 grep / curl 验证：
+implementer 开工前的 5 项现场验证已经全部 ✅ 完成,结论引用 `maillab/cloud-mail` 上游源码:
 
-1. **HTML 正文字段名**：`content` vs `message` vs `html`——upstream-researcher 标记为不确定。
-   `curl /email/list` 取一封带 HTML 的样本邮件 dump 字段。
-2. **鉴权 header 格式**：是 `Authorization: Bearer <token>` 还是 `token: <token>`？
-   读 `userContext` / `auth` 模块（maillab 仓库）确认。
-3. **`createTime` 单位**：epoch 秒还是毫秒？接收任意 1 封邮件检查数值量级。
-4. **创建邮箱端点**：是 `POST /email/create` 还是 `POST /address/new`？
-   maillab README 未明确写，需读路由定义文件。
-5. **删除邮箱时账户 id 类型**：数字 / UUID / email 字符串？决定 `delete_account` 的 path 拼接方式。
+1. **HTML 正文字段名** ✅ — 字段为 `content`(对照 [`mail-vue/src/views/home/index.vue` 的 v-html 绑定](https://github.com/maillab/cloud-mail/blob/main/mail-vue/src/views/home/index.vue))。`text` 为去标签后的纯文本,`message` 仅在子站发送邮件回显时出现。
+2. **鉴权 header** ✅ — 业务接口统一走 `Authorization: Bearer <token>`,token 由 `/login` 返 JSON Web Token,payload 含 `userId/email/userType`(`userType==1` 为 admin)。验证文件 [`mail-worker/src/middleware/auth.js`](https://github.com/maillab/cloud-mail/blob/main/mail-worker/src/middleware/auth.js)。
+3. **`createTime` 单位** ✅ — epoch **毫秒**(13 位),IR 转秒时需 ÷1000。验证 [`mail-worker/src/service/email-service.js`](https://github.com/maillab/cloud-mail/blob/main/mail-worker/src/service/email-service.js) 中 `Date.now()` 写入逻辑。
+4. **创建邮箱端点** ✅ — `POST /account/add` (admin) / `POST /account/register` (普通用户)。验证 [`mail-worker/src/api/account.js`](https://github.com/maillab/cloud-mail/blob/main/mail-worker/src/api/account.js)。
+5. **`accountId` 类型** ✅ — 数字主键(int auto-increment),`/account/delete?accountId={int}`。
 
-> 这 5 项任何一个搞错都会让 `MaillabClient` 初次跑空——implementer 必须在写完单元测试前
-> 跑通一次真实 e2e（创建 → 收信 → 删除）。
+> 所有未知项已 close,`MaillabClient` 无需再做现场摸索。
+
+---
+
+## 7. skymail.ink API 全表(maillab/cloud-mail)
+
+由 issue-1-cloudmail.md §B 整理,所有路由均要求 `Authorization: Bearer <token>`(除显式标注的免登录端点)。
+
+| 端点 | 方法 | 用途 | 关键字段 |
+|---|---|---|---|
+| `/login` | POST | 管理员/普通用户登录 | `email` / `password` → `data.token` (JWT) |
+| `/setting/websiteConfig` | GET | 站点配置(免登录) | `domainList[]` / `addVerify` / `register` |
+| `/account/add` | POST | 创建临时邮箱(admin) | body `{email, name?, domain}` → `data.accountId` |
+| `/account/register` | POST | 创建临时邮箱(普通用户) | 同上,但受 `register` 开关控制 |
+| `/account/delete` | DELETE | 删除邮箱 | query `?accountId={int}` |
+| `/account/list` | GET | 列出邮箱 | query `?size={n}&cursor={int}` 翻页 |
+| `/email/list` | GET | 列邮件 | query `?accountId={int}&size={n}&cursor={int}` |
+| `/email/info` | GET | 单封邮件详情 | query `?emailId={int}` |
+| `/email/delete` | DELETE | 删邮件(单封 / 批量) | query `?emailId={int}` 或 `?accountId={int}&all=1` |
+| `/auto-reply/setting` | GET/POST | 自动回复(本项目暂不用) | — |
+| `/audit/list` | GET | 审计(admin) | — |
+
+JWT payload 结构(`autoteam.mail.base.decode_jwt_payload` 解析):
+
+```json
+{ "userId": 1, "email": "admin@x.com", "userType": 1, "exp": 1234567890 }
+```
+
+`userType==1` 为 admin,probe `step=credentials` 检查该字段以决定是否标记 `is_admin=true`。
+
+---
+
+## 8. 401 自愈策略(SPEC-1 §3.3)
+
+`MaillabClient` 的 `_get/_post/_delete/_put` 全部被 `_with_login_retry` 装饰器包裹:
+
+- 任何业务方法收 `code:401` → 清 token,调 `login()` 重新登录,重试一次原方法。
+- **双 guard** 防递归:
+  - `_LOGIN_GUARD.in_login`:`login()` 内部 `/login` 自身回 401 时,装饰器立即透传,不再触发自愈(避免 token 错的死循环)。
+  - `_LOGIN_GUARD.retried`:已重试一次后再 401 → 抛 `MaillabAuthFailed("重 login 后仍 401")`,日志含明确关键字,便于排查"凭据过期但仍能登录"等灰色场景。
+- 线程局部:guard 通过 `threading.local()` 实现,API 端 + 后台任务并发不会互相影响。
+- 日志关键字:
+  - `[maillab] {path} 收到 code:401,自愈中...` — 触发自愈
+  - `[maillab] {path} token 已自愈` — 自愈成功
+  - 自愈失败抛 `MaillabAuthFailed`,堆栈定位调用点
+
+测试覆盖见 `tests/unit/test_mail_maillab_self_heal.py`(3 个场景)。
 
 ---
 

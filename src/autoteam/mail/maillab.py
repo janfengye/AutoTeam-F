@@ -23,9 +23,11 @@ Email 实体字段映射(已现场验证):
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 
@@ -38,6 +40,53 @@ from autoteam.mail.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class MaillabAuthFailed(Exception):
+    """SPEC-1 §3.3 — 401 自愈失败:重 login 后仍 401。业务层不应再重试。"""
+
+
+# SPEC-1 §3.3 双 guard:
+#   in_login → 当前 thread 正在 login() 内部,_post(/login) 收 401 时**不**触发外层重试,
+#              避免 login → _post → wrapper → login 死循环。
+#   retried  → 当前 thread 已经为本次业务调用做过一次 re-login,再 401 直接抛 MaillabAuthFailed。
+_LOGIN_GUARD = threading.local()
+
+
+def _with_login_retry(method):
+    """SPEC-1 §3.3 — 包装 _get/_post/_delete/_put,响应 code:401 自动 re-login + 重试一次。"""
+
+    @functools.wraps(method)
+    def wrapper(self, path, *args, **kwargs):
+        resp = method(self, path, *args, **kwargs)
+        if not isinstance(resp, dict) or resp.get("code") != 401:
+            return resp
+        # 401 路径 ↓
+        if getattr(_LOGIN_GUARD, "in_login", False):
+            # 我们正在 login() 内部 — 让 login 看到 401 自己抛错,不递归
+            return resp
+        if getattr(_LOGIN_GUARD, "retried", False):
+            # 已经做过一次重试,本次仍 401 → 不再循环
+            raise MaillabAuthFailed(
+                f"maillab {path}: 重 login 后仍 401,请检查 MAILLAB_USERNAME / MAILLAB_PASSWORD"
+            )
+        logger.warning("[maillab] %s 收到 code:401,自愈中...", path)
+        self.token = None
+        try:
+            _LOGIN_GUARD.retried = True
+            self.login()  # login 内部会设 in_login=True,wrapper 不会递归触发
+            resp = method(self, path, *args, **kwargs)
+            # 重试后仍 401:由 retried=True 守卫已无法回收,直接抛
+            if isinstance(resp, dict) and resp.get("code") == 401:
+                raise MaillabAuthFailed(
+                    f"maillab {path}: 重 login 后仍 401,请检查 MAILLAB_USERNAME / MAILLAB_PASSWORD"
+                )
+            logger.info("[maillab] %s token 已自愈", path)
+        finally:
+            _LOGIN_GUARD.retried = False
+        return resp
+
+    return wrapper
 
 
 def _parse_create_time(value) -> int | None:
@@ -96,18 +145,22 @@ class MaillabClient(MailProvider):
             headers["Authorization"] = self.token
         return headers
 
+    @_with_login_retry
     def _get(self, path: str, params: dict | None = None) -> dict:
         r = self.session.get(self._url(path), headers=self._headers(), params=params, timeout=30)
         return self._parse_response(r, path)
 
+    @_with_login_retry
     def _post(self, path: str, body: dict | None = None) -> dict:
         r = self.session.post(self._url(path), headers=self._headers(), json=body, timeout=30)
         return self._parse_response(r, path)
 
+    @_with_login_retry
     def _delete(self, path: str, params: dict | None = None) -> dict:
         r = self.session.delete(self._url(path), headers=self._headers(), params=params, timeout=30)
         return self._parse_response(r, path)
 
+    @_with_login_retry
     def _put(self, path: str, body: dict | None = None) -> dict:
         r = self.session.put(self._url(path), headers=self._headers(), json=body, timeout=30)
         return self._parse_response(r, path)
@@ -131,7 +184,7 @@ class MaillabClient(MailProvider):
     # ------------------------------------------------------------------ auth
 
     def login(self) -> str:
-        """POST /login,获得 JWT token。"""
+        """POST /login,获得 JWT token。SPEC-1 §3.3 — 设 in_login guard 阻止 _with_login_retry 递归。"""
         if not self.base_url:
             raise Exception("maillab 登录失败: 未配置 MAILLAB_API_URL")
         if not self.username or not self.password:
@@ -141,7 +194,11 @@ class MaillabClient(MailProvider):
         # 目前按"无 captcha"的最常见情况实现;若启用 captcha,login() 会以 code!=200 失败,
         # 此时需要在 .env 里设置 MAILLAB_TURNSTILE_TOKEN(暂未实现)。
         body = {"email": self.username, "password": self.password}
-        resp = self._post("/login", body)
+        _LOGIN_GUARD.in_login = True
+        try:
+            resp = self._post("/login", body)
+        finally:
+            _LOGIN_GUARD.in_login = False
         if resp.get("code") != 200:
             raise Exception(f"maillab 登录失败: {resp.get('message') or resp}")
 

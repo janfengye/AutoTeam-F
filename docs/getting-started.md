@@ -20,21 +20,11 @@
 
 ### 1. 搭建临时邮箱后端（二选一）
 
-> **命名说明**:历史上配置项叫 `CLOUDMAIL_*`,但它指向的是 `dreamhunter2333/cloudflare_temp_email`,
-> **不是** `maillab/cloud-mail`(社区里另一个同名项目)。两个后端 API 完全不兼容,需要按你实际部署的那一个填配置。
+> **【重要】先决定后端,再决定填哪一组配置。** 两个后端 API 完全不兼容:`CLOUDMAIL_*` 字段对应 `dreamhunter2333/cloudflare_temp_email`,**不是** `maillab/cloud-mail`(社区里另一个同名项目)。**必须** 在 `.env` 里显式声明 `MAIL_PROVIDER=cf_temp_email` 或 `MAIL_PROVIDER=maillab`,否则可能撞 [issue#1](configuration.md#-协议错配排查issue-1) 错配。
 
-#### 选项 A:`cf_temp_email`(**默认推荐**)
+#### 选项 A:`maillab`(**推荐**,中文社区活跃)
 
-适配 [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email),基于 Cloudflare Workers,搭建简单。
-
-按官方文档完成部署后你会得到:
-- API 地址(如 `https://your-domain.com/api`)→ `CLOUDMAIL_BASE_URL`
-- 管理员密码(`x-admin-auth`)→ `CLOUDMAIL_PASSWORD`
-- 邮箱域名(如 `@your-domain.com`)→ `CLOUDMAIL_DOMAIN`
-
-#### 选项 B:`maillab`
-
-适配 [maillab/cloud-mail](https://github.com/maillab/cloud-mail)(参考 [官方文档](https://doc.skymail.ink/guide/dashboard))。
+适配 [maillab/cloud-mail](https://github.com/maillab/cloud-mail)(参考 [官方文档](https://doc.skymail.ink/guide/dashboard))。一键 Docker / Cloudflare Workers,内置管理后台。
 
 部署完成后,在 `.env` 中显式设置:
 
@@ -44,6 +34,22 @@ MAILLAB_API_URL=https://your-maillab.example.com
 MAILLAB_USERNAME=admin@example.com
 MAILLAB_PASSWORD=your_password
 MAILLAB_DOMAIN=@your-domain.com
+```
+
+#### 选项 B:`cf_temp_email`(经典选项)
+
+适配 [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email),基于 Cloudflare Workers,搭建简单。
+
+按官方文档完成部署后你会得到:
+- API 地址(如 `https://your-domain.com/api`)→ `CLOUDMAIL_BASE_URL`
+- 管理员密码(`x-admin-auth`)→ `CLOUDMAIL_PASSWORD`
+- 邮箱域名(如 `@your-domain.com`)→ `CLOUDMAIL_DOMAIN`
+
+```dotenv
+MAIL_PROVIDER=cf_temp_email
+CLOUDMAIL_BASE_URL=https://your-domain.com/api
+CLOUDMAIL_PASSWORD=your_password
+CLOUDMAIL_DOMAIN=@your-domain.com
 ```
 
 > 切换后业务调用方零改动,工厂会按 `MAIL_PROVIDER` 自动 dispatch。详见 [配置说明](configuration.md#mail-provider-切换)。
@@ -112,7 +118,7 @@ docker compose up -d
 uv run autoteam api
 ```
 
-按提示依次填入(以默认的 `cf_temp_email` 后端为例):
+**推荐使用 Web 面板配置**(SetupPage 已支持 provider 选择 + 一站式校验,见下文 §2.5);CLI 向导仍可用,以默认的 `cf_temp_email` 后端为例:
 
 ```text
 === AutoTeam 首次配置 ===
@@ -125,9 +131,20 @@ uv run autoteam api
   API 鉴权密钥 [回车自动生成]:
 ```
 
-> 选 `maillab` 后,需要直接编辑 `.env` 补 `MAILLAB_API_URL` / `MAILLAB_USERNAME` / `MAILLAB_PASSWORD` / `MAILLAB_DOMAIN`(向导暂未把这几个加入交互列表)。
+选 `maillab` 时,SetupPage 会按 provider 动态切换需要填的字段(`MAILLAB_API_URL` / `MAILLAB_USERNAME` / `MAILLAB_PASSWORD` / `MAILLAB_DOMAIN`),CLI 向导也会按 `MAIL_PROVIDER` 跳过无关字段。
 
 配置会自动验证临时邮箱后端和 CPA 的连通性，失败会提示具体原因。
+
+### 2.5 邮箱后端归属验证
+
+Web 面板的 SetupPage 把邮箱后端配置拆成 4 步状态机,每一步必须前一步通过才能解锁:
+
+1. **后端类型** — 在「cf_temp_email」/「maillab」中选一个;切换会重置后续状态。
+2. **服务器连接** — 填入 `*_BASE_URL` / `MAILLAB_USERNAME`(maillab 才需要)/ `*_PASSWORD`,点击「测试连接」会同时跑指纹嗅探(防止 issue#1 错配)+ 凭据校验。
+3. **域名归属** — 后端探到 `domain_list` 时显示下拉,否则手动输入。点击「验证归属」会创建 `probe-{ts}{uuid}` 探测邮箱并立即删除,确认管理员持有该域名。
+4. **保存配置** — 域名验证通过后才能保存,Settings 页面同样支持后续切换并提示「重启服务后生效」。
+
+错误码与修复方向见 [配置说明 → 错误码对照表](configuration.md#错误码对照表apimail-providerprobe)。
 
 ### Docker 部署
 

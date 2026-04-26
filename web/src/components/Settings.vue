@@ -360,6 +360,127 @@
         </button>
       </div>
     </div>
+
+    <!-- SPEC-1 §FR-008 / AC-017 — 邮箱后端切换 (Settings 复用 SetupPage 4 步状态机) -->
+    <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div class="flex items-center justify-between gap-4 mb-4">
+        <div>
+          <h2 class="text-lg font-semibold text-white">邮箱后端</h2>
+          <p class="text-sm text-gray-400 mt-1">
+            切换或重新配置临时邮箱服务（cf_temp_email / maillab）。SetupPage 完成后所有字段已落盘，这里仅在需要更换服务时使用。
+          </p>
+        </div>
+        <span
+          class="min-w-[72px] px-3 py-1.5 rounded-full text-xs text-center whitespace-nowrap border"
+          :class="mailFormDirty
+            ? 'bg-yellow-500/10 text-yellow-300 border-yellow-500/20'
+            : 'bg-gray-800 text-gray-400 border-gray-700'"
+        >
+          {{ mailFormDirty ? '有改动' : '已配置' }}
+        </span>
+      </div>
+
+      <div v-if="mailMessage" class="mb-4 px-4 py-3 rounded-lg text-sm border" :class="mailMessageClass">
+        {{ mailMessage }}
+      </div>
+
+      <!-- 步骤 1 — Provider 选择 -->
+      <div class="mb-3 p-3 bg-gray-800/40 border border-gray-800 rounded">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-sm text-white">1. 后端类型</span>
+          <span class="text-xs" :class="mailState === 'PROVIDER' ? 'text-yellow-400' : 'text-green-400'">
+            {{ mailState === 'PROVIDER' ? '请选择' : '已选 ' + mailForm.MAIL_PROVIDER }}
+          </span>
+        </div>
+        <div class="flex gap-2">
+          <button
+            v-for="opt in mailProviderOptions" :key="opt.value"
+            @click="selectMailProvider(opt.value)"
+            :class="mailForm.MAIL_PROVIDER === opt.value
+              ? 'bg-blue-600 border-blue-500 text-white'
+              : 'bg-gray-800 border-gray-700 text-gray-300'"
+            class="flex-1 px-3 py-2 border rounded text-sm transition">
+            <div class="font-medium">{{ opt.label }}</div>
+            <div class="text-xs opacity-75 mt-0.5">{{ opt.desc }}</div>
+          </button>
+        </div>
+      </div>
+
+      <!-- 步骤 2 — 服务器连接 -->
+      <div class="mb-3 p-3 rounded border" :class="mailCardClass('CONNECTION')">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-sm text-white">2. 服务器连接</span>
+          <span class="text-xs" :class="mailConnectionClass">{{ mailConnectionStatus }}</span>
+        </div>
+        <div class="space-y-2" :class="mailState === 'PROVIDER' ? 'opacity-40 pointer-events-none' : ''">
+          <input
+            v-model="mailForm[mailBaseUrlKey]"
+            type="text"
+            :placeholder="mailForm.MAIL_PROVIDER === 'maillab' ? 'https://your-maillab.example.com' : 'https://example.com/api'"
+            class="w-full px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-sm text-white" />
+          <input
+            v-if="mailForm.MAIL_PROVIDER === 'maillab'"
+            v-model="mailForm.MAILLAB_USERNAME"
+            type="text"
+            placeholder="管理员邮箱 (MAILLAB_USERNAME)"
+            class="w-full px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-sm text-white" />
+          <input
+            v-model="mailForm[mailPasswordKey]"
+            type="password"
+            :placeholder="mailPasswordKey + ' (留空表示沿用旧密码)'"
+            class="w-full px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-sm text-white" />
+          <button
+            @click="mailTestConnection"
+            :disabled="mailTesting || !canMailTest"
+            class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs rounded">
+            {{ mailTesting ? '测试中...' : '测试连接' }}
+          </button>
+        </div>
+      </div>
+
+      <!-- 步骤 3 — 域名 -->
+      <div class="mb-3 p-3 rounded border" :class="mailCardClass('DOMAIN')">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-sm text-white">3. 域名归属</span>
+          <span class="text-xs" :class="mailDomainClass">{{ mailDomainStatus }}</span>
+        </div>
+        <div class="space-y-2" :class="!mailCanEnterDomain ? 'opacity-40 pointer-events-none' : ''">
+          <select
+            v-if="mailDomainList && mailDomainList.length"
+            v-model="mailSelectedDomain"
+            class="w-full px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-sm text-white">
+            <option v-for="d in mailDomainList" :key="d" :value="stripAtSign(d)">{{ d }}</option>
+          </select>
+          <input
+            v-else
+            v-model="mailSelectedDomain"
+            type="text"
+            placeholder="example.com"
+            class="w-full px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-sm text-white" />
+          <button
+            @click="mailVerifyDomain"
+            :disabled="mailVerifying || !mailSelectedDomain"
+            class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs rounded">
+            {{ mailVerifying ? '验证中...' : '验证归属' }}
+          </button>
+        </div>
+      </div>
+
+      <div class="flex justify-end gap-3">
+        <button
+          @click="resetMailForm"
+          :disabled="mailSaving"
+          class="px-4 py-1.5 bg-gray-800 hover:bg-gray-700 text-sm text-gray-200 rounded-lg border border-gray-700 transition disabled:opacity-50">
+          重置
+        </button>
+        <button
+          @click="saveMailConfig"
+          :disabled="mailSaving || mailState !== 'SAVE'"
+          class="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition disabled:opacity-50">
+          {{ mailSaving ? '保存中...' : '保存邮箱后端配置' }}
+        </button>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -650,4 +771,220 @@ async function save() {
     saving.value = false
   }
 }
+
+// ---------- SPEC-1 §FR-008 / AC-017 邮箱后端切换 ----------
+const mailState = ref('PROVIDER')
+const mailForm = ref({
+  MAIL_PROVIDER: 'cf_temp_email',
+  CLOUDMAIL_BASE_URL: '',
+  CLOUDMAIL_PASSWORD: '',
+  CLOUDMAIL_DOMAIN: '',
+  MAILLAB_API_URL: '',
+  MAILLAB_USERNAME: '',
+  MAILLAB_PASSWORD: '',
+  MAILLAB_DOMAIN: '',
+})
+const mailInitialSnapshot = ref(null)
+const mailDomainList = ref(null)
+const mailSelectedDomain = ref('')
+const mailDetectedProvider = ref(null)
+const mailTesting = ref(false)
+const mailVerifying = ref(false)
+const mailSaving = ref(false)
+const mailMessage = ref('')
+const mailMessageClass = ref('')
+
+const mailProviderOptions = [
+  { value: 'cf_temp_email', label: 'cf_temp_email', desc: 'dreamhunter2333/cloudflare_temp_email' },
+  { value: 'maillab', label: 'maillab', desc: 'maillab/cloud-mail (skymail.ink)' },
+]
+
+const mailBaseUrlKey = computed(() =>
+  mailForm.value.MAIL_PROVIDER === 'maillab' ? 'MAILLAB_API_URL' : 'CLOUDMAIL_BASE_URL'
+)
+const mailPasswordKey = computed(() =>
+  mailForm.value.MAIL_PROVIDER === 'maillab' ? 'MAILLAB_PASSWORD' : 'CLOUDMAIL_PASSWORD'
+)
+const mailDomainKey = computed(() =>
+  mailForm.value.MAIL_PROVIDER === 'maillab' ? 'MAILLAB_DOMAIN' : 'CLOUDMAIL_DOMAIN'
+)
+
+const canMailTest = computed(() => {
+  const baseOk = !!mailForm.value[mailBaseUrlKey.value]
+  const pwdOk = !!mailForm.value[mailPasswordKey.value]
+  if (mailForm.value.MAIL_PROVIDER === 'maillab') {
+    return baseOk && !!mailForm.value.MAILLAB_USERNAME && pwdOk
+  }
+  return baseOk && pwdOk
+})
+
+const mailCanEnterDomain = computed(() => mailState.value === 'DOMAIN' || mailState.value === 'SAVE')
+
+const mailConnectionStatus = computed(() => {
+  if (mailState.value === 'PROVIDER') return '待选 provider'
+  if (mailTesting.value) return '测试中...'
+  if (mailState.value === 'CONNECTION') return '请测试连接'
+  return mailDetectedProvider.value ? `已通过 (${mailDetectedProvider.value})` : '已通过'
+})
+const mailConnectionClass = computed(() => {
+  if (mailState.value === 'PROVIDER' || mailState.value === 'CONNECTION') return 'text-yellow-400'
+  return 'text-green-400'
+})
+
+const mailDomainStatus = computed(() => {
+  if (!mailCanEnterDomain.value) return '需先通过测试连接'
+  if (mailVerifying.value) return '验证中...'
+  if (mailState.value === 'DOMAIN') return '请验证域名归属'
+  return '已通过'
+})
+const mailDomainClass = computed(() => mailState.value === 'SAVE' ? 'text-green-400' : 'text-yellow-400')
+
+const mailFormDirty = computed(() => {
+  if (!mailInitialSnapshot.value) return false
+  return JSON.stringify(mailForm.value) !== mailInitialSnapshot.value
+})
+
+function mailCardClass(targetState) {
+  const order = ['PROVIDER', 'CONNECTION', 'DOMAIN', 'SAVE']
+  const cur = order.indexOf(mailState.value)
+  const tgt = order.indexOf(targetState)
+  if (tgt > cur) return 'bg-gray-800/20 border-gray-800'
+  if (tgt < cur) return 'bg-green-900/10 border-green-900/40'
+  return 'bg-blue-900/10 border-blue-700/40'
+}
+
+function stripAtSign(d) {
+  return (d || '').replace(/^@/, '').trim()
+}
+
+function selectMailProvider(value) {
+  mailForm.value.MAIL_PROVIDER = value
+  mailState.value = 'CONNECTION'
+  mailDetectedProvider.value = null
+  mailDomainList.value = null
+  mailSelectedDomain.value = ''
+  mailMessage.value = ''
+}
+
+function setMailMessage(text, type = 'success') {
+  mailMessage.value = text
+  if (type === 'success') mailMessageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
+  else if (type === 'warning') mailMessageClass.value = 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20'
+  else mailMessageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+  window.clearTimeout(setMailMessage._timer)
+  setMailMessage._timer = window.setTimeout(() => { mailMessage.value = '' }, 10000)
+}
+
+function mailShowError(resp) {
+  setMailMessage(`${resp.error_code || 'ERROR'}: ${resp.message || '未知错误'}` +
+    (resp.hint ? ` — ${resp.hint}` : ''), 'error')
+}
+
+async function mailTestConnection() {
+  mailTesting.value = true
+  mailMessage.value = ''
+  try {
+    const fp = await api.probeMailProvider({
+      provider: mailForm.value.MAIL_PROVIDER,
+      step: 'fingerprint',
+      base_url: mailForm.value[mailBaseUrlKey.value],
+    })
+    if (!fp.ok) { mailShowError(fp); return }
+    mailDetectedProvider.value = fp.detected_provider
+    mailDomainList.value = fp.domain_list
+    if (fp.warnings && fp.warnings.length) {
+      setMailMessage('⚠️ ' + fp.warnings.join('; '), 'warning')
+    }
+
+    const cred = await api.probeMailProvider({
+      provider: mailForm.value.MAIL_PROVIDER,
+      step: 'credentials',
+      base_url: mailForm.value[mailBaseUrlKey.value],
+      username: mailForm.value.MAILLAB_USERNAME,
+      password: mailForm.value.MAILLAB_PASSWORD,
+      admin_password: mailForm.value.CLOUDMAIL_PASSWORD,
+    })
+    if (!cred.ok) { mailShowError(cred); return }
+    mailState.value = 'DOMAIN'
+    if (mailDomainList.value && mailDomainList.value.length === 1) {
+      mailSelectedDomain.value = stripAtSign(mailDomainList.value[0])
+    }
+  } catch (e) {
+    setMailMessage('请求失败: ' + e.message, 'error')
+  } finally {
+    mailTesting.value = false
+  }
+}
+
+async function mailVerifyDomain() {
+  mailVerifying.value = true
+  mailMessage.value = ''
+  try {
+    const own = await api.probeMailProvider({
+      provider: mailForm.value.MAIL_PROVIDER,
+      step: 'domain_ownership',
+      base_url: mailForm.value[mailBaseUrlKey.value],
+      username: mailForm.value.MAILLAB_USERNAME,
+      password: mailForm.value.MAILLAB_PASSWORD,
+      admin_password: mailForm.value.CLOUDMAIL_PASSWORD,
+      domain: mailSelectedDomain.value,
+    })
+    if (!own.ok) { mailShowError(own); return }
+    mailForm.value[mailDomainKey.value] = '@' + mailSelectedDomain.value
+    if (mailForm.value.MAIL_PROVIDER === 'maillab') {
+      mailForm.value.CLOUDMAIL_DOMAIN = mailForm.value.CLOUDMAIL_DOMAIN || ('@' + mailSelectedDomain.value)
+    }
+    mailState.value = 'SAVE'
+    if (own.cleaned === false && own.leaked_probe) {
+      setMailMessage(`⚠️ 探测邮箱回收失败,请到后台手动删除: ${own.leaked_probe.email}`, 'warning')
+    }
+  } catch (e) {
+    setMailMessage('请求失败: ' + e.message, 'error')
+  } finally {
+    mailVerifying.value = false
+  }
+}
+
+async function saveMailConfig() {
+  mailSaving.value = true
+  try {
+    await api.saveSetup({ ...mailForm.value })
+    mailInitialSnapshot.value = JSON.stringify(mailForm.value)
+    // SPEC-1 §AC-017 — 重启提示
+    setMailMessage('保存成功 — 重启服务后生效', 'success')
+  } catch (e) {
+    setMailMessage('保存失败: ' + e.message, 'error')
+  } finally {
+    mailSaving.value = false
+  }
+}
+
+function resetMailForm() {
+  if (!mailInitialSnapshot.value) return
+  mailForm.value = JSON.parse(mailInitialSnapshot.value)
+  mailState.value = 'PROVIDER'
+  mailDomainList.value = null
+  mailSelectedDomain.value = ''
+  mailDetectedProvider.value = null
+  mailMessage.value = ''
+}
+
+async function loadMailSetup() {
+  try {
+    const result = await api.getSetupStatus()
+    if (result?.fields) {
+      for (const f of result.fields) {
+        if (f.key in mailForm.value) {
+          mailForm.value[f.key] = f.default || ''
+        }
+      }
+    }
+    if (result?.provider) mailForm.value.MAIL_PROVIDER = result.provider
+    mailInitialSnapshot.value = JSON.stringify(mailForm.value)
+  } catch (e) {
+    console.error('加载邮箱后端配置失败:', e)
+  }
+}
+
+onMounted(loadMailSetup)
 </script>

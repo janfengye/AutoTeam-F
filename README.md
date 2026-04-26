@@ -33,7 +33,7 @@
 
 | | 功能 | 描述 |
 |---|---|---|
-| 📧 | **自动注册** | 临时邮箱（`cf_temp_email` 或 `maillab` 双后端可切换）+ Playwright 自动注册 |
+| 📧 | **自动注册** | 临时邮箱(`cf_temp_email` 或 `maillab` 双后端,SetupPage 4 步状态机指引切换 + 协议指纹嗅探防错配)+ Playwright 自动注册 |
 | 🆓 | **生产免费号** 🆕 | 批量注册 → 主号踢出 → Personal OAuth，一条龙 |
 | 🔐 | **Codex OAuth** | 自动登录 Codex，Team / Personal 双模式 |
 | 🔑 | **手动 OAuth 导入** | localhost 自动回调，失败可手动粘贴 |
@@ -78,13 +78,13 @@ uv run autoteam api
 uv run autoteam rotate
 ```
 
-首次启动会自动引导配置 临时邮箱后端（`cf_temp_email` 默认 / `maillab` 可选）、CPA、API Key，并验证连通性。两种后端的差异见 [配置说明 · Mail Provider 切换](docs/configuration.md#mail-provider-切换)。
+首次启动会自动引导配置 临时邮箱后端(`cf_temp_email` / `maillab` 双后端,**强烈推荐显式声明 `MAIL_PROVIDER`**)、CPA、API Key,并验证连通性。两种后端的差异见 [配置说明 · Mail Provider 切换](docs/configuration.md#mail-provider-切换)。
 
-> **强烈推荐使用 [`dreamhunter2333/cloudflare_temp_email`](https://github.com/dreamhunter2333/cloudflare_temp_email)**(对应 `MAIL_PROVIDER=cf_temp_email`，默认）。它是 Cloudflare Workers 部署、被广泛验证、与 OpenAI 域名黑名单适配良好。
+> **推荐顺序**:`maillab/cloud-mail`(国内一键部署、社区活跃)→ `dreamhunter2333/cloudflare_temp_email`(经典 Cloudflare Workers 实现)。两者功能等价,根据部署条件选用即可。
 >
-> ⚠️ 如果你之前用的是上游 [cnitlrt/AutoTeam](https://github.com/cnitlrt/AutoTeam) 的 "cloudmail"，那其实是 [`maillab/cloud-mail`](https://github.com/maillab/cloud-mail)。本 fork 把它独立成 `MAIL_PROVIDER=maillab` 后端，需要在 `.env` 里显式设置（不再是默认）。详见 [docs/configuration.md#mail-provider-切换](docs/configuration.md#mail-provider-切换)。
+> ⚠️ 如果你之前用的是上游 [cnitlrt/AutoTeam](https://github.com/cnitlrt/AutoTeam) 的 "cloudmail",那其实是 [`maillab/cloud-mail`](https://github.com/maillab/cloud-mail)。本 fork 把它独立成 `MAIL_PROVIDER=maillab` 后端,需要在 `.env` 里显式设置(不再是默认)。详见 [docs/configuration.md#mail-provider-切换](docs/configuration.md#mail-provider-切换)。
 >
-> 启动时会做轻量协议指纹嗅探，base_url 与 `MAIL_PROVIDER` 错配会**提前 warning**，避免出现"登录成功 → 创建邮箱 401"这种半成功假象（[issue #1](https://github.com/ZRainbow1275/AutoTeam-F/issues/1)）。
+> SetupPage / Settings 提供 4 步状态机引导(provider → 服务器连接 → 域名归属 → 保存),通过 `/api/mail-provider/probe` 提前检测错配 / 凭据 / 域名归属;启动时还会做协议指纹嗅探,base_url 与 `MAIL_PROVIDER` 错配会**直接 abort**,避免"登录成功 → 创建邮箱 401"半成功假象([issue #1](https://github.com/ZRainbow1275/AutoTeam-F/issues/1))。
 
 ### Docker 部署
 

@@ -95,20 +95,21 @@ class CfTempEmailClient(MailProvider):
             body = (r.text or "")[:200]
             raise Exception(f"CloudMail 登录失败: HTTP {r.status_code} {body}")
 
-        # 协议错配嗅探:cf_temp_email 的 /admin/address 应该返回 {results:[...]} 列表;
-        # 如果 base_url 实际上指向 maillab 服务器,catch-all 路由可能也回 200 但响应里
-        # 是 {code, message, data} 这种 maillab 风格,login 假成功后下一步 create 才 401。
-        # 这里提前嗅探,给错配用户一个可读错误,而不是让他们去翻教程踩坑(参考 issue #1)。
+        # SPEC-1 §3.2 — 正向白名单嗅探:cf_temp_email 的 /admin/address 必须返回含 `results`
+        # 字段的 dict。任何缺 results 的响应(空 {}、maillab 风格 {code,...}、null 等)都视为
+        # 协议错配,直接抛错。round-3 漏判的空 dict 也被本次收紧覆盖。
         try:
-            payload = r.json() or {}
+            payload = r.json()
         except Exception:
-            payload = {}
-        if isinstance(payload, dict) and "results" not in payload and ("code" in payload or "data" in payload):
+            payload = None
+        if not isinstance(payload, dict) or "results" not in payload:
+            payload_type = type(payload).__name__ if payload is not None else "None"
             raise Exception(
                 "CloudMail 登录响应不像 dreamhunter2333/cloudflare_temp_email"
-                "(没有 `results` 字段,但出现了 `code`/`data`)。"
-                f"你的 CLOUDMAIL_BASE_URL={self.base_url} 看起来是 maillab/cloud-mail 服务器。"
-                "请在 .env 里设置 MAIL_PROVIDER=maillab 并补齐 MAILLAB_API_URL/USERNAME/PASSWORD/DOMAIN。"
+                f"(响应 {payload_type} 不含 `results` 字段)。"
+                f"你的 CLOUDMAIL_BASE_URL={self.base_url} 可能指向 maillab/cloud-mail 服务器或路由错。"
+                "请确认 .env 中 MAIL_PROVIDER=cf_temp_email 时填的是 dreamhunter2333 后端;"
+                "如果你部署的是 maillab,请改 MAIL_PROVIDER=maillab 并补齐 MAILLAB_API_URL/USERNAME/PASSWORD/DOMAIN。"
             )
 
         self.token = "admin-" + self.admin_password[:6]
@@ -148,14 +149,13 @@ class CfTempEmailClient(MailProvider):
         except Exception:
             pass
 
-        # 协议错配二次防御:同 login() 的嗅探。如果 login 漏掉(catch-all 路由让 /admin/address
-        # 误回 200),这里 /admin/new_address 拿到 maillab 风格 {code:401,message:"身份认证失效"}
-        # 时给出明确切换提示,避免用户卡在"为什么登录成功但创建失败"。
-        if isinstance(data, dict) and "address" not in data and ("code" in data and "message" in data):
+        # SPEC-1 §3.2 — 正向白名单嗅探:任何缺 `address` 字段就报错。
+        # 比 round-3 的"必须同时含 code+message"宽松条件更严,空 dict / null 也被捕获。
+        if not isinstance(data, dict) or "address" not in data:
             raise Exception(
-                f"创建邮箱响应不像 dreamhunter2333/cloudflare_temp_email(收到 maillab 风格 {data})。"
-                "请在 .env 里设置 MAIL_PROVIDER=maillab — cnitlrt/AutoTeam 原版的"
-                "'cloudmail' 实际就是 maillab/cloud-mail。"
+                f"创建邮箱响应不像 cf_temp_email(收到 {data!r})。"
+                "请检查 MAIL_PROVIDER 与 base_url 是否对应;"
+                "如果服务器是 maillab,请改 MAIL_PROVIDER=maillab。"
             )
 
         address = data.get("address")

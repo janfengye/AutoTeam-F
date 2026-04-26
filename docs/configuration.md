@@ -10,15 +10,15 @@ cp .env.example .env
 
 | 配置项 | 说明 | 必填 |
 |--------|------|------|
-| `MAIL_PROVIDER` | 临时邮箱后端,`cf_temp_email`(默认) 或 `maillab` | 否 |
-| `CLOUDMAIL_BASE_URL` | cf_temp_email 后端的 API 地址 | `MAIL_PROVIDER=cf_temp_email` 时是 |
-| `CLOUDMAIL_PASSWORD` | cf_temp_email 后端的管理员密码 | `MAIL_PROVIDER=cf_temp_email` 时是 |
-| `CLOUDMAIL_DOMAIN` | 临时邮箱域名(如 `@example.com`) | 是 |
+| `MAIL_PROVIDER` | 临时邮箱后端,`cf_temp_email`(默认) 或 `maillab` | **是(默认 `cf_temp_email`)** |
+| `CLOUDMAIL_BASE_URL` | cf_temp_email 后端的 API 地址(Web 面板可填) | `MAIL_PROVIDER=cf_temp_email` 时是 |
+| `CLOUDMAIL_PASSWORD` | cf_temp_email 后端的管理员密码(Web 面板可填) | `MAIL_PROVIDER=cf_temp_email` 时是 |
+| `CLOUDMAIL_DOMAIN` | 临时邮箱域名(如 `@example.com`,Web 面板可填) | 是 |
 | `CLOUDMAIL_EMAIL` | 已废弃,保留只为兼容旧 `.env`;不再被使用 | 否 |
-| `MAILLAB_API_URL` | maillab/cloud-mail 后端的 API 地址 | `MAIL_PROVIDER=maillab` 时是 |
-| `MAILLAB_USERNAME` | maillab 主账号邮箱(用于登录) | `MAIL_PROVIDER=maillab` 时是 |
-| `MAILLAB_PASSWORD` | maillab 主账号密码 | `MAIL_PROVIDER=maillab` 时是 |
-| `MAILLAB_DOMAIN` | maillab 创建邮箱时的域名;缺省回落 `CLOUDMAIL_DOMAIN` | 否 |
+| `MAILLAB_API_URL` | maillab/cloud-mail 后端的 API 地址(Web 面板可填) | `MAIL_PROVIDER=maillab` 时是 |
+| `MAILLAB_USERNAME` | maillab 主账号邮箱(Web 面板可填) | `MAIL_PROVIDER=maillab` 时是 |
+| `MAILLAB_PASSWORD` | maillab 主账号密码(Web 面板可填) | `MAIL_PROVIDER=maillab` 时是 |
+| `MAILLAB_DOMAIN` | maillab 创建邮箱时的域名;缺省回落 `CLOUDMAIL_DOMAIN`(Web 面板可填) | 否 |
 | `CPA_URL` | CLIProxyAPI 地址 | 是（留空使用默认 `http://127.0.0.1:8317`） |
 | `CPA_KEY` | CPA 管理密钥 | 是 |
 | `API_KEY` | Web 面板 / API 鉴权密钥 | 是（首次启动可自动生成） |
@@ -56,21 +56,21 @@ cp .env.example .env
 
 ## Mail Provider 切换
 
-AutoTeam 支持两个临时邮箱后端,通过 `MAIL_PROVIDER` 环境变量切换:
+AutoTeam 支持两个临时邮箱后端,通过 `MAIL_PROVIDER` 环境变量切换。**推荐先选 `maillab`,再选 `cf_temp_email`**:
 
-| Provider          | 上游仓库                                 | 适配字段                                                  |
-| ----------------- | ---------------------------------------- | --------------------------------------------------------- |
-| `cf_temp_email`   | `dreamhunter2333/cloudflare_temp_email`  | `CLOUDMAIL_BASE_URL` / `CLOUDMAIL_PASSWORD` / `CLOUDMAIL_DOMAIN` |
-| `maillab`         | `maillab/cloud-mail`                     | `MAILLAB_API_URL` / `MAILLAB_USERNAME` / `MAILLAB_PASSWORD` / `MAILLAB_DOMAIN` |
+| Provider          | 上游仓库                                 | 部署形态                          | 适配字段                                                  |
+| ----------------- | ---------------------------------------- | --------------------------------- | --------------------------------------------------------- |
+| `maillab`(推荐)| `maillab/cloud-mail` (skymail.ink)       | 一键 Docker / Cloudflare Workers,中文社区活跃 | `MAILLAB_API_URL` / `MAILLAB_USERNAME` / `MAILLAB_PASSWORD` / `MAILLAB_DOMAIN` |
+| `cf_temp_email`   | `dreamhunter2333/cloudflare_temp_email`  | 较早一代 Cloudflare Workers 实现 | `CLOUDMAIL_BASE_URL` / `CLOUDMAIL_PASSWORD` / `CLOUDMAIL_DOMAIN` |
 
 > 命名说明:旧版的 `CLOUDMAIL_*` 配置实际指向的是 `cloudflare_temp_email`,
 > 与 `maillab/cloud-mail`(社区里另一个同名项目)是两个不同的后端,因此在
-> v2026-04 起拆分了两套配置。`MAIL_PROVIDER` 缺省为 `cf_temp_email`,与历史行为完全一致。
+> v2026-04 起拆分了两套配置。从 SPEC-1 起,`.env.example` 已强引导显式声明 `MAIL_PROVIDER`。
 
-切换方法:在 `.env` 中显式设置:
+切换方法:在 `.env` 中显式设置(也可以在 Web 面板「设置 → 邮箱后端」中切换):
 
 ```dotenv
-# 用社区 maillab/cloud-mail
+# 推荐:maillab/cloud-mail
 MAIL_PROVIDER=maillab
 MAILLAB_API_URL=https://your-maillab.example.com
 MAILLAB_USERNAME=admin@example.com
@@ -80,6 +80,16 @@ MAILLAB_DOMAIN=@example.com
 
 业务调用方零改动:`from autoteam.cloudmail import CloudMailClient` 仍然有效,
 工厂会按 `MAIL_PROVIDER` 自动 dispatch 到对应 provider 实例。
+
+### 邮箱归属验证
+
+切换 / 首次配置后,SetupPage 会调用 `/api/mail-provider/probe` 探测后端归属:
+
+1. **指纹嗅探(fingerprint)** — 探 `/setting/websiteConfig`(maillab) 或 `/admin/address`(cf_temp_email),返回 `detected_provider` 与 `domain_list`。
+2. **凭据校验(credentials)** — 用管理员密码 (`x-admin-auth`) 或 `/login` 拿 token,确认能登录。
+3. **域名归属(domain_ownership)** — 在目标域名下创建 `probe-{ts}{uuid}` 邮箱并立即删除,验证管理员持有该域名;若 maillab `addVerify=1` 会拒绝创建,需先在管理后台把域名加入白名单。
+
+`/api/config/register-domain`(注册域名)内部使用同一个 `probe.probe_domain_ownership` helper,语义对齐。
 
 ### ⚠️ 协议错配排查(issue #1)
 
@@ -92,11 +102,24 @@ MAILLAB_DOMAIN=@example.com
        {'code': 401, 'message': '身份认证失效,请重新登录'}
 ```
 
-**解决**:在 `.env` 里加一行 `MAIL_PROVIDER=maillab`,把 `CLOUDMAIL_*` 替换为 `MAILLAB_*` 配置(见上表)。
+**修复路径(Web 面板)**:打开 SetupPage / 「设置 → 邮箱后端」 → 选对后端类型 → 「测试连接」(若指纹错配会立即报 `PROVIDER_MISMATCH`)→ 「验证归属」 → 保存。
 
-启动时的协议指纹嗅探(`setup_wizard._sniff_provider_mismatch`)会在 base_url 与 `MAIL_PROVIDER` 不匹配时**提前 warning**;`CfTempEmailClient.login()` / `MaillabClient._parse_response()` 也会在响应特征不对时抛出明确切换提示,不会再出现"半成功"假象。
+**修复路径(命令行)**:在 `.env` 里加一行 `MAIL_PROVIDER=maillab`,把 `CLOUDMAIL_*` 替换为 `MAILLAB_*` 配置(见上表)。
 
-> 推荐:**首选 `cf_temp_email`(dreamhunter2333/cloudflare_temp_email)** — Cloudflare Workers 部署、与 OpenAI 域名黑名单适配良好、社区验证最广。`maillab` 是兼容选项,适合已经部署了它的用户。
+启动时的协议指纹嗅探(`setup_wizard._sniff_provider_mismatch`)会在 base_url 与 `MAIL_PROVIDER` 不匹配时**直接 abort**(`return False`);`CfTempEmailClient.login()` / `MaillabClient._parse_response()` 也会在响应特征不对时抛出明确切换提示,不会再出现"半成功"假象。如需在已知错配场景下临时跳过嗅探,可设 `AUTOTEAM_SKIP_PROVIDER_SNIFF=1`(SPEC-1 §3.4 决策)。
+
+### 错误码对照表(`/api/mail-provider/probe`)
+
+| `error_code` | 说明 | 修复方向 |
+|---|---|---|
+| `PROVIDER_MISMATCH` | base_url 指纹与所选 provider 不匹配 | 切到正确的 provider 后重试 |
+| `ROUTE_NOT_FOUND` | base_url 不是任何已知后端 | 检查 URL 是否包含 /api 前缀 / 协议是否正确 |
+| `EMPTY_DOMAIN_LIST` | maillab `domainList` 空 | 在 maillab 管理后台先添加可用域名 |
+| `UNAUTHORIZED` | 凭据校验失败 | 重置密码或排查管理员账号 |
+| `CAPTCHA_REQUIRED` | maillab 启用了登录验证码 | 暂时关闭 captcha 或改用 admin 直登 |
+| `DOMAIN_REJECTED` | 创建探测邮箱被拒(`addVerify=1` 等) | 先在后台把域名加入白名单 |
+| `RATE_LIMITED` | 60 req/min 限速触发 | 等 1 分钟后重试 |
+| `NETWORK_ERROR` / `TIMEOUT` | 网络异常 | 检查 base_url 可达性 |
 
 ## Playwright 代理
 

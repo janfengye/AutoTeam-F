@@ -6,12 +6,14 @@ import os
 import threading
 import time
 import uuid
+from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from autoteam.config import API_KEY
 from autoteam.textio import read_text
@@ -54,7 +56,13 @@ def api_version() -> VersionResponse:
 # API Key 鉴权中间件
 # ---------------------------------------------------------------------------
 
-_AUTH_SKIP_PATHS = {"/api/auth/check", "/api/setup/status", "/api/setup/save", "/api/version"}
+_AUTH_SKIP_PATHS = {
+    "/api/auth/check",
+    "/api/setup/status",
+    "/api/setup/save",
+    "/api/version",
+    "/api/mail-provider/probe",  # SPEC-1 §3.5 — 条件鉴权:API_KEY 配置后路由内强制 Bearer
+}
 
 
 @app.middleware("http")
@@ -94,10 +102,17 @@ def check_auth(request: Request):
 
 
 class SetupConfig(BaseModel):
+    """`/api/setup/save` 请求体。SPEC-1 §2.1 — 含 cf_temp_email + maillab 两套 mail 字段。"""
+
+    MAIL_PROVIDER: Literal["cf_temp_email", "cloudflare_temp_email", "maillab"] = "cf_temp_email"
     CLOUDMAIL_BASE_URL: str = ""
     CLOUDMAIL_EMAIL: str = ""
     CLOUDMAIL_PASSWORD: str = ""
     CLOUDMAIL_DOMAIN: str = ""
+    MAILLAB_API_URL: str = ""
+    MAILLAB_USERNAME: str = ""
+    MAILLAB_PASSWORD: str = ""
+    MAILLAB_DOMAIN: str = ""
     CPA_URL: str = "http://127.0.0.1:8317"
     CPA_KEY: str = ""
     PLAYWRIGHT_PROXY_URL: str = ""
@@ -105,21 +120,89 @@ class SetupConfig(BaseModel):
     API_KEY: str = ""
 
 
+class ProbeErrorCode(str, Enum):
+    ROUTE_NOT_FOUND = "ROUTE_NOT_FOUND"
+    PROVIDER_MISMATCH = "PROVIDER_MISMATCH"
+    UNAUTHORIZED = "UNAUTHORIZED"
+    FORBIDDEN_DOMAIN = "FORBIDDEN_DOMAIN"
+    CAPTCHA_REQUIRED = "CAPTCHA_REQUIRED"
+    NETWORK = "NETWORK"
+    TIMEOUT = "TIMEOUT"
+    EMPTY_DOMAIN_LIST = "EMPTY_DOMAIN_LIST"
+    UNKNOWN = "UNKNOWN"
+
+
+class MailProviderProbeRequest(BaseModel):
+    """`/api/mail-provider/probe` 请求体。SPEC-1 §2.1。"""
+
+    provider: Literal["cf_temp_email", "maillab"]
+    step: Literal["fingerprint", "credentials", "domain_ownership"]
+    base_url: str = Field(..., min_length=1, max_length=512)
+    admin_password: str = ""
+    username: str = ""
+    password: str = ""
+    domain: str = ""
+    bearer_token: str = ""
+
+    @field_validator("base_url")
+    @classmethod
+    def _normalize_base_url(cls, v: str) -> str:
+        v = v.strip().rstrip("/")
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError("base_url 必须以 http:// 或 https:// 开头")
+        return v
+
+    @field_validator("domain")
+    @classmethod
+    def _normalize_domain(cls, v: str) -> str:
+        return (v or "").strip().lstrip("@")
+
+
+class MailProviderProbeResponse(BaseModel):
+    ok: bool
+    step: Literal["fingerprint", "credentials", "domain_ownership"]
+    error_code: ProbeErrorCode | None = None
+    message: str | None = None
+    hint: str | None = None
+    warnings: list[str] = []
+    detected_provider: Literal["cf_temp_email", "maillab", "unknown"] | None = None
+    domain_list: list[str] | None = None
+    add_verify_open: bool | None = None
+    register_verify_open: bool | None = None
+    is_admin: bool | None = None
+    user_email: str | None = None
+    token_preview: str | None = None
+    probe_email: str | None = None
+    probe_account_id: int | None = None
+    cleaned: bool | None = None
+    leaked_probe: dict | None = None
+
+
+_CF_MAIL_KEYS = {"CLOUDMAIL_BASE_URL", "CLOUDMAIL_PASSWORD", "CLOUDMAIL_DOMAIN"}
+_MAILLAB_KEYS = {"MAILLAB_API_URL", "MAILLAB_USERNAME", "MAILLAB_PASSWORD", "MAILLAB_DOMAIN"}
+
+
 @app.get("/api/setup/status")
 def get_setup_status():
-    """检查配置是否完整"""
+    """检查配置是否完整 — SPEC-1 §3.6:按 provider 动态标 optional。"""
     from autoteam.setup_wizard import REQUIRED_CONFIGS, _read_env
 
     env = _read_env()
+    provider = (env.get("MAIL_PROVIDER") or os.environ.get("MAIL_PROVIDER") or "cf_temp_email").strip().lower()
     fields = []
     all_ok = True
     for key, prompt, default, optional in REQUIRED_CONFIGS:
+        # 不属于当前 provider 的 mail 字段强制 optional
+        if provider == "maillab" and key in _CF_MAIL_KEYS:
+            optional = True
+        elif provider in ("cf_temp_email", "cloudflare_temp_email") and key in _MAILLAB_KEYS:
+            optional = True
         val = env.get(key, "") or os.environ.get(key, "")
         ok = bool(val)
         if not ok and not optional:
             all_ok = False
         fields.append({"key": key, "prompt": prompt, "default": default, "optional": optional, "configured": ok})
-    return {"configured": all_ok, "fields": fields}
+    return {"configured": all_ok, "fields": fields, "provider": provider}
 
 
 @app.post("/api/setup/save")
@@ -136,8 +219,20 @@ def post_setup_save(config: SetupConfig):
     if not data.get("API_KEY"):
         data["API_KEY"] = _secrets.token_urlsafe(24)
 
+    # SPEC-1 §3.6 — 按 provider 互斥写入,避免无关字段污染 .env
+    provider = (data.get("MAIL_PROVIDER") or "cf_temp_email").strip().lower()
+    if provider in ("cf_temp_email", "cloudflare_temp_email"):
+        skip_keys = set(_MAILLAB_KEYS)
+    elif provider == "maillab":
+        # CLOUDMAIL_DOMAIN 保留作 maillab 的 fallback;仅跳过 base_url/password
+        skip_keys = {"CLOUDMAIL_BASE_URL", "CLOUDMAIL_PASSWORD"}
+    else:
+        skip_keys = set()
+
     clearable_fields = {"PLAYWRIGHT_PROXY_URL", "PLAYWRIGHT_PROXY_BYPASS"}
     for key, value in data.items():
+        if key in skip_keys:
+            continue
         if value or key in clearable_fields:
             _write_env(key, value)
             os.environ[key] = value
@@ -172,6 +267,93 @@ def post_setup_save(config: SetupConfig):
     API_KEY = data["API_KEY"]
 
     return {"message": "配置保存成功", "api_key": data["API_KEY"], "configured": True}
+
+
+# ---------------------------------------------------------------------------
+# Mail Provider 在线探测 (SPEC-1 §3.5) — 三步分阶段验证
+# ---------------------------------------------------------------------------
+
+_probe_rate_buckets: dict[str, list[float]] = {}
+_probe_rate_lock = threading.Lock()
+
+
+def _enforce_probe_rate_limit(request: Request, max_per_min: int = 60):
+    """SPEC §NFR-速率限制:setup 阶段 (无 API_KEY) 单 IP 60 req/min,防扫描。"""
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    with _probe_rate_lock:
+        bucket = _probe_rate_buckets.setdefault(ip, [])
+        bucket[:] = [t for t in bucket if now - t < 60]
+        if len(bucket) >= max_per_min:
+            raise HTTPException(status_code=429, detail="probe 请求过频,请稍后再试")
+        bucket.append(now)
+
+
+@app.post("/api/mail-provider/probe", response_model=MailProviderProbeResponse)
+def post_mail_provider_probe(req: MailProviderProbeRequest, request: Request):
+    """SPEC-1 §3.5 — 三步分阶段:fingerprint → credentials → domain_ownership。
+
+    鉴权策略:
+      - API_KEY 未配置(setup 阶段):放行,但走 IP 速率限制
+      - API_KEY 已配置:强制 Bearer(_AUTH_SKIP_PATHS 已加白,这里手工二次校验)
+    """
+    from autoteam.config import API_KEY as _key
+
+    if _key:
+        auth_header = request.headers.get("authorization", "")
+        if not (auth_header.startswith("Bearer ") and auth_header[7:] == _key):
+            raise HTTPException(status_code=401, detail="API_KEY 已配置,请提供 Bearer token")
+    else:
+        _enforce_probe_rate_limit(request)
+
+    from autoteam.mail import probe as mail_probe
+
+    try:
+        if req.step == "fingerprint":
+            result = mail_probe.probe_fingerprint(req.base_url, req.provider)
+        elif req.step == "credentials":
+            result = mail_probe.probe_credentials(
+                req.base_url,
+                req.provider,
+                username=req.username,
+                password=req.password,
+                admin_password=req.admin_password,
+            )
+        else:  # domain_ownership
+            result = mail_probe.probe_domain_ownership(
+                req.base_url,
+                req.provider,
+                bearer_token=req.bearer_token,
+                admin_password=req.admin_password,
+                domain=req.domain,
+                username=req.username,
+                password=req.password,
+            )
+    except mail_probe.ProbeError as exc:
+        return MailProviderProbeResponse(
+            ok=False,
+            step=req.step,
+            error_code=ProbeErrorCode(exc.error_code) if exc.error_code in ProbeErrorCode.__members__ else ProbeErrorCode.UNKNOWN,
+            message=exc.message,
+            hint=exc.hint,
+        )
+    except Exception as exc:  # noqa: BLE001 — 兜底
+        logger.exception("[probe] %s 异常: %s", req.step, exc)
+        return MailProviderProbeResponse(
+            ok=False,
+            step=req.step,
+            error_code=ProbeErrorCode.UNKNOWN,
+            message=str(exc),
+        )
+
+    # ProbeResult → ProbeResponse(忽略内部 bearer_token,前端不持有)
+    payload = {k: v for k, v in vars(result).items() if k != "bearer_token"}
+    if "error_code" in payload and payload["error_code"]:
+        try:
+            payload["error_code"] = ProbeErrorCode(payload["error_code"])
+        except ValueError:
+            payload["error_code"] = ProbeErrorCode.UNKNOWN
+    return MailProviderProbeResponse(**payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1665,6 +1847,11 @@ def put_register_domain_api(params: RegisterDomainParams):
     """
     更新子号注册域名。verify=True（默认）会试探性调用 CloudMail new_address 验证服务端是否接受此域，
     成功则立即删除探测地址再保存；失败把 CloudMail 原始错误透传给前端。
+
+    SPEC-1 §FR-005 — 与 `/api/mail-provider/probe?step=domain_ownership` 共享回收语义:
+    本路径走 `CloudMailClient` 抽象(已对齐 maillab/cf_temp_email),
+    `probe.probe_domain_ownership` 走无状态 HTTP 直连,二者最终行为一致(创建 + 立即 DELETE,
+    回收失败 leaked_probe 透传)。改 probe 时需同步检查本函数。
     """
     from autoteam.cloudmail import CloudMailClient
     from autoteam.runtime_config import set_register_domain

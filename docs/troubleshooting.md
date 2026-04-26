@@ -202,3 +202,36 @@ PLAYWRIGHT_PROXY_URL=socks5://username:password@host.docker.internal:1080
 ### 刷新后数据没更新
 
 点击侧边栏底部的「刷新数据」按钮手动刷新。
+
+### 配置保存后 401 创建邮箱失败
+
+issue#1 错配的典型表现:配置时填的是 maillab 的 `*_BASE_URL`,但 `MAIL_PROVIDER` 还是默认的 `cf_temp_email` → 启动校验在 `/admin/address` catch-all 路由上误回 200,但创建邮箱阶段被 maillab 拒回 `code:401`。
+
+修复路径见 [配置说明 → ⚠️ 协议错配排查](configuration.md#-协议错配排查issue-1) 与 [SetupPage 4 步状态机](getting-started.md#25-邮箱后端归属验证)。
+
+## 邮箱后端
+
+### 5 个常见错配场景与对应 `error_code`
+
+| 场景 | 触发条件 | 报错 `error_code` | 修复 |
+|---|---|---|---|
+| issue#1 错配 | 选 `cf_temp_email` 但 base_url 是 maillab(或反向) | `PROVIDER_MISMATCH` | SetupPage 切换 provider 后重试 |
+| 域名后台为空 | maillab `/setting/websiteConfig.domainList` 为空 | `EMPTY_DOMAIN_LIST` | 在 maillab 后台先添加可用域名 |
+| 凭据错误 | 管理员密码或 username/password 错 | `UNAUTHORIZED` | 重置密码或确认主账号 |
+| 启用了登录验证码 | maillab 后台 captcha = ON | `CAPTCHA_REQUIRED`(warning) | 关闭 captcha 或改用 admin 直登 |
+| 域名未授权 | maillab 设置了 `addVerify=1` 拒绝创建非白名单域名 | `DOMAIN_REJECTED` | 在管理后台添加域名白名单 |
+
+### 紧急逃生口
+
+如果嗅探阻断了你已确认无误的配置,可以临时:
+
+```bash
+export AUTOTEAM_SKIP_PROVIDER_SNIFF=1
+uv run autoteam api
+```
+
+仅在确诊误报时使用,生产环境不建议长期开启。
+
+### maillab 401 自愈
+
+`MaillabClient` 业务方法被装饰器包裹,任何一次响应 `code:401` 会自动触发 re-login 并重试。如果重试仍 401,会抛 `MaillabAuthFailed`(日志关键字 `[maillab] token 已自愈` 表示自愈成功)。详细策略见 [mail-provider-design.md §8](mail-provider-design.md#8-401-自愈策略)。
