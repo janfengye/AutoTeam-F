@@ -168,7 +168,9 @@ class TestUninitializedSeatI5:
         assert not mock_smoke.called, "正常 ok 路径不应触发 smoke"
 
     def test_cheap_codex_smoke_alive_on_response_created_frame(self):
-        """smoke 200 + iter_lines 第一帧含 response.created → ("alive", None)。"""
+        """smoke 200 + iter_lines 第一帧含 response.created → alive。
+        Round 11:detail 由 None 升级为 dict,含 model + response_text + raw_event。
+        """
         from autoteam import codex_auth
 
         fake_resp = MagicMock()
@@ -184,7 +186,8 @@ class TestUninitializedSeatI5:
             result, detail = codex_auth.cheap_codex_smoke("test-token", account_id="acc-1")
 
         assert result == "alive"
-        assert detail is None
+        # Round 11:alive detail 可以是 None (cache hit) 或 dict (live network)
+        assert detail is None or isinstance(detail, dict)
 
     def test_cheap_codex_smoke_401_returns_auth_invalid(self):
         """smoke HTTP 401 → ("auth_invalid", "http_401")。"""

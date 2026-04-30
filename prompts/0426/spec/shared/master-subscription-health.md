@@ -4,11 +4,11 @@
 
 | 字段 | 内容 |
 |---|---|
-| 名称 | Master ChatGPT Team 母号订阅降级探针(三层判定 + 5min 缓存 + 触发位点矩阵 + retroactive 重分类) |
-| 版本 | **v1.1 (2026-04-28 Round 9 — 加 §11 retroactive 5 触发点矩阵 + §12 grace 期 JWT 解析 + §13 M-I1 endpoint 守恒规约)** |
-| 主题归属 | `is_master_subscription_healthy()` 函数契约 + 三层探针 + 缓存策略 + 5 个触发位点 + 5 个误判缓解 + retroactive helper 5 触发点 + grace 期 JWT 解析 + endpoint 守恒 |
-| 引用方 | PRD-7(Round 8 master-team-degrade-oauth-rejoin) / Round 9 task `04-28-account-usability-state-correction` / spec-2-account-lifecycle.md v1.6 §3.7 / `./account-state-machine.md` v2.0 §4.4 / FR-M1~M4 / **AC-B1~AC-B8** |
-| 共因 | Round 8 PRD §1 外部根因 — `eligible_for_auto_reactivation: true` 等价 Stripe `cancel_at_period_end=true` 后周期已过;Round 9 共因 — retroactive helper 仅挂 cmd_reconcile 一处导致 stale-active |
+| 名称 | Master ChatGPT Team 母号订阅降级探针(三层判定 + 5min 缓存 + 触发位点矩阵 + retroactive 重分类 + grace 期 healthy=True) |
+| 版本 | **v1.4.1 (2026-04-29 Round 11 五轮 spec-update — §15.6 关系表新增 `OAUTH_SUBPROCESS_TIMEOUT_S` 行,显式标注与 M-OA-backoff 维度区别(单次上界 vs 失败间隔下界);引用方加 `oauth-subprocess-timeout.md` v1.0.0 与 `account-state-machine.md` v2.1.2 §4.7;纯 spec 增量,无代码改动)** |
+| 主题归属 | `is_master_subscription_healthy()` 函数契约 + 三层探针 + 缓存策略 + 5 个触发位点 + 5 个误判缓解 + retroactive helper 5 触发点 + grace 期 JWT 解析(双路径:OAuth id_token + web access_token)+ endpoint 守恒 + **subscription_grace healthy=True 状态(Round 11)** |
+| 引用方 | PRD-7(Round 8) / Round 9 task `04-28-account-usability-state-correction` / **Round 11 task `04-28-round11-master-resub-models-validate`(一轮 + 二轮 + 五轮)** / spec-2-account-lifecycle.md **v1.7** §3.7 / `./account-state-machine.md` **v2.1.2** §4.4 / §4.7 / `./oauth-workspace-selection.md` **v1.5.0** §4.4 / `./oauth-subprocess-timeout.md` **v1.0.0** / `./realtime-probe.md` v1.0 / FR-M1~M4 / AC-B1~AC-B8 / **Round 11 AC1~AC4** |
+| 共因 | Round 8 PRD §1 外部根因 — `eligible_for_auto_reactivation: true` 在 grace 期内立即为 true(**Round 11 user Q1 实证**:ChatGPT 网页 team 权限仍可用),v1.0/v1.1 误把它等价于 "cancel_at_period_end=true 且 period 已过";Round 9 共因 — retroactive helper 仅挂 cmd_reconcile 一处导致 stale-active;**Round 11 二轮共因** — v1.2 `_load_admin_id_token` 仅读 `accounts/codex-main-*.json`(OAuth 重登路径),用户走 web session 路径时永远拿不到 id_token → grace_until 解不出 → fallback 误判 cancelled。实证 dump 显示 web access_token JWT 不含 `chatgpt_subscription_active_until` 但含 `chatgpt_plan_type`,需用此字段做 fallback grace 判定。 |
 | 不在范围 | OAuth 显式选 personal workspace(见 [`./oauth-workspace-selection.md`](./oauth-workspace-selection.md)) / wham/usage 配额分类(见 [`./quota-classification.md`](./quota-classification.md)) / 自动续费 / 多母号支持(超 PRD-7 Out of Scope) |
 
 ---
@@ -21,7 +21,8 @@
 | `master subscription` | master account 在 OpenAI 后端持有的 ChatGPT Team 订阅(由 Stripe 计费),其状态决定子号 invite 后能否拿到 `plan_type=team` |
 | `subscription healthy` | 订阅处于 `active` 状态,可继续生产子号 |
 | `subscription degraded` | 订阅 cancel 但 workspace 实体仍存在,`/backend-api/accounts` items[*].`eligible_for_auto_reactivation == True`;子号 invite 后必拿 `plan_type=free` |
-| `eligible_for_auto_reactivation` | OpenAI 内部字段,语义对应 Stripe `subscription.cancel_at_period_end=true` 且 period 已过(订阅 inactive 但仍可一键续订) — research/master-subscription-probe.md §1.2 |
+| `eligible_for_auto_reactivation` | OpenAI 内部字段,**Round 11 修正**:对应 Stripe `subscription.cancel_at_period_end=true`(grace 期内**立即**为 true,不是 "period 已过"才置位)。Round 11 user Q1 实证:该字段为 true 时 ChatGPT 网页 team 权限仍有效,新 invite 在 grace 期内仍能拿 plan_type=team。详见 §14 subscription_grace 状态。 |
+| `subscription_grace` | **(Round 11 healthy=True 状态;v1.3 双信号源)** master 母号 `eligible_for_auto_reactivation=true` 且**任一**条件成立:(a) admin id_token JWT 的 `chatgpt_subscription_active_until > now()`(OAuth 路径,有倒计时);(b) admin access_token JWT 的 `chatgpt_plan_type ∈ {team, business, enterprise, edu}`(web session 路径,无倒计时但权益仍生效)。订阅在 grace 期内,新 invite 仍能拿 plan_type=team,fail-fast 入口对此状态放行(因 healthy=True) |
 | `三层探针` | (L1) `eligible_for_auto_reactivation` authoritative 主探针 / (L2) 新邀请子号 plan_type corroborating 反推 / (L3) `/billing` 401/404 + workspace `/settings.plan != "team"` safety net |
 
 ---
@@ -35,7 +36,12 @@ from typing import Literal, Optional, TypedDict
 
 MasterHealthReason = Literal[
     "active",                  # 健康 — 可继续生产子号
-    "subscription_cancelled",  # eligible_for_auto_reactivation=True
+    "subscription_grace",      # (Round 11 v1.3) eligible_for_auto_reactivation=True 且任一信号有效:
+                               # (a) JWT chatgpt_subscription_active_until > now (有倒计时,OAuth id_token);
+                               # (b) JWT chatgpt_plan_type ∈ {team, business, enterprise, edu} (无倒计时,web access_token);
+                               # healthy=True,可继续生产子号 (新 invite 仍 plan_type=team)
+    "subscription_cancelled",  # eligible_for_auto_reactivation=True 且双信号都失败:
+                               # grace_until 缺失/已过期 + plan_type ∈ {free, None}
     "workspace_missing",       # /accounts 找不到目标 workspace(实体已删 / account_id 漂移)
     "role_not_owner",          # current_user_role != account-owner / admin
     "auth_invalid",             # /accounts 401/403,master session 已失效
@@ -107,16 +113,18 @@ def is_master_subscription_healthy(
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "cache": {
     "<master_account_id_uuid>": {
-      "healthy": false,
-      "reason": "subscription_cancelled",
-      "probed_at": 1777699200.0,
+      "healthy": true,
+      "reason": "subscription_grace",
+      "probed_at": 1777357190.0,
       "evidence": {
         "raw_account_item": { "...": "..." },
         "http_status": 200,
-        "current_user_role": "account-owner"
+        "current_user_role": "account-owner",
+        "plan_type_jwt": "team",
+        "grace_until": 1777699200.0
       }
     }
   }
@@ -127,12 +135,12 @@ def is_master_subscription_healthy(
 
 | 字段 | 类型 | 约束 |
 |---|---|---|
-| `schema_version` | int | 当前 1;未来 schema 不兼容时 +1,旧缓存读到不同版本时整体丢弃(treat as miss) |
+| `schema_version` | int | **当前 2(v1.3 升级)**;v1 仅支持 grace_until 解析,v1.3 加 plan_type fallback 后旧 v1 cache 持久化的 cancelled 误判必须作废。`_load_cache` 检测到 `data.get("schema_version") != CACHE_SCHEMA_VERSION` 时整体丢弃返回空 cache(treat as miss),触发新一轮 force_refresh。**未来 schema 不兼容时继续 +1**。 |
 | `cache` | dict[str, entry] | key 是 master account_id(UUID);允许多 master 共存(将来 E3 多母号扩展) |
 | `entry.healthy` | bool | True/False,与函数返回 healthy 一致 |
-| `entry.reason` | str | 6 个 MasterHealthReason 字面量之一 |
+| `entry.reason` | str | 7 个 MasterHealthReason 字面量之一 |
 | `entry.probed_at` | float | 实测 epoch seconds;cache_age = `time.time() - probed_at` |
-| `entry.evidence` | dict | 写盘前裁剪敏感字段(token / cookie 不入盘);默认仅写 `raw_account_item` 子集 + http_status |
+| `entry.evidence` | dict | 写盘前裁剪敏感字段(token / cookie 不入盘);默认仅写 `raw_account_item` 子集 + http_status + (v1.3 新增)`plan_type_jwt` + `grace_until`(诊断字段,JWT 解出值,grace_until 可能 None) |
 
 **裁剪规则**:`raw_account_item` 落盘时只保留 `id / structure / current_user_role / eligible_for_auto_reactivation / name / workspace_name`,丢弃 OpenAI 后端可能附带的 token/email/seat 列表等(避免把 token 写入磁盘)。
 
@@ -323,7 +331,7 @@ if not healthy:
 
 - **M-I1**:`is_master_subscription_healthy` 永不抛异常(任何 Exception 归为 `network_error` 返回)
 - **M-I2**:`auth_invalid` 与 `network_error` 严格区分;**401/403 是 auth_invalid 唯一来源**;5xx / Timeout / Connection 必落 network_error
-- **M-I3**:`healthy == True ⇔ reason == "active"`(严格双向蕴含;任何代码路径不能让 `healthy=True` 配 `reason != "active"`,反之亦然)
+- **M-I3**:**(Round 11 v1.2 BREAKING 扩展)** `healthy == True ⇔ reason ∈ {"active", "subscription_grace"}`;`healthy == False ⇔ reason ∈ {"subscription_cancelled", "workspace_missing", "role_not_owner", "auth_invalid", "network_error"}`。**v1.0/v1.1** 旧约束 `healthy == True ⇔ reason == "active"` 仅在 v1.2 之前有效;Round 11 引入 subscription_grace 后扩展为两枚字面量。任何代码路径不能让 `healthy=True` 配上面"healthy=False"反集合中的 reason,反之亦然。
 - **M-I4**:cache 命中时**不发起任何 HTTP 调用**(L1 / L3 / billing 都不调);命中后 evidence 中 `cache_hit=True` + `cache_age_seconds is not None`
 - **M-I5**:cache miss 时**最多发 2 次 HTTP**(L1 + 可选 L3);L2(invite 反推)由 OAuth 既有路径承担,本函数不主动 invite
 - **M-I6**:落盘 evidence **不含** access_token / refresh_token / cookie / `__Secure-next-auth.session-token` 等敏感字段;只允许 `raw_account_item` 的白名单子集(§2.3 裁剪规则)
@@ -839,7 +847,466 @@ def get_admin_master_health(force_refresh: bool = False):
 
 ---
 
-**文档结束。** 工程师据此可直接编写 `is_master_subscription_healthy` 函数 + 5 处接入 + retroactive helper(5 触发点)+ M-I1 endpoint 守恒 + 单测,无需额外决策。
+## 14. subscription_grace healthy=True 状态(v1.2 Round 11 新增)
+
+### 14.1 背景与根因
+
+v1.0 / v1.1 把 `eligible_for_auto_reactivation == True` 直接等价于 `subscription_cancelled`(healthy=False),fail-fast 入口对 cancelled 一律 503。**Round 11 user Q1 实证发现**:该字段在 `cancel_at_period_end=True` 后**立即**置为 true(grace 期内),而**不是** "period 已过" 才置位 — ChatGPT 网页端 team 权限仍可用,新 invite 仍能拿 plan_type=team。
+
+**结果**(Round 11 实证):
+- master_health 误把 healthy 母号判 cancelled
+- fail-fast 入口(api.py:fill 任务、manager.py M-T1/M-T2)503 拒绝合法 fill 请求
+- UI banner 红色 critical 误导用户去续费
+
+**修复策略**(Round 11 Approach A,见 task PRD `Decision (ADR-lite)`):在 `_classify_l1` 中对 `eligible_for_auto_reactivation == True` 的 case 分两支处理 — `grace_until > now` → `subscription_grace`(healthy=True),否则 → `subscription_cancelled`(healthy=False)。
+
+### 14.2 决策矩阵(v1.3 双信号源升级)
+
+| `eligible_for_auto_reactivation` | grace_until JWT(id_token 主路径) | plan_type JWT(access_token fallback) | (healthy, reason) | 备注 |
+|---|---|---|---|---|
+| `False / null / missing` | (任意) | (任意) | `(True, "active")` | 主号订阅活跃 |
+| `True` | `grace_until > now` | (任意) | `(True, "subscription_grace")` | **OAuth 路径** — 有倒计时,Codex 重登场景 |
+| `True` | `grace_until <= now` | `team / business / enterprise / edu` | `(True, "subscription_grace")` | **混合路径** — grace_until 已过期但当前权益仍是付费层(罕见,JWT 滞后)|
+| `True` | None / 解析失败 | `team / business / enterprise / edu` | `(True, "subscription_grace")` | **v1.3 新增 web session 路径** — 无倒计时,常见(用户走 state.json 登录) |
+| `True` | `grace_until <= now` | `free / None / 其他` | `(False, "subscription_cancelled")` | grace 已过且权益已降级,真 cancelled |
+| `True` | None / 解析失败 | `free / None / 其他` | `(False, "subscription_cancelled")` | **保守失败** — 双信号都失败,按 cancelled 处理 |
+
+**关键**:`subscription_grace` 是**双信号 OR**(任一信号有效即 grace);`subscription_cancelled` 是**双信号 AND**(两信号都失败才 cancelled)。
+
+**不变量蕴含**:
+- `M-I15` v1.3 调整:`reason == "subscription_grace"` 时 `evidence.grace_until > now()` **OR** `evidence.plan_type_jwt ∈ {team, business, enterprise, edu}` 至少其一成立(原 v1.2 严格要求 grace_until > now,v1.3 放宽)
+- `M-I17` (新增 v1.3):`reason == "subscription_grace" + evidence.grace_until is None` 时,`evidence.plan_type_jwt` 必须 ∈ 付费层集合(M-I15 的对偶约束 — 无 grace_until 时必须有 plan_type 兜底证据)
+
+### 14.3 实施位点(v1.3 双路径 fallback)
+
+**主修改点**(预计 ~50 行):
+
+```python
+# src/autoteam/master_health.py:_classify_l1
+
+def _classify_l1(items, account_id, *, id_token=None):
+    target = next((it for it in items if it.get("id") == account_id), None)
+    if not target:
+        return False, "workspace_missing", {"items_count": len(items)}
+    role = (target.get("current_user_role") or "").lower()
+    if role and role not in _OWNER_ROLES:
+        return False, "role_not_owner", {"current_user_role": role, "raw_item": target}
+
+    if target.get("eligible_for_auto_reactivation") is True:
+        # 路径 1:OAuth id_token JWT 含 chatgpt_subscription_active_until → 有倒计时
+        grace_until = extract_grace_until_from_jwt(id_token) if id_token else None
+        now = time.time()
+        if grace_until and grace_until > now:
+            return True, "subscription_grace", {
+                "current_user_role": role,
+                "raw_item": target,
+                "grace_until": grace_until,
+                "grace_remain_seconds": grace_until - now,
+            }
+        # 路径 2(v1.3 新增):web access_token JWT 仅含 chatgpt_plan_type → 无倒计时
+        plan_type = extract_plan_type_from_jwt(id_token) if id_token else None
+        _PAID_PLAN_TYPES = ("team", "business", "enterprise", "edu")
+        if plan_type in _PAID_PLAN_TYPES:
+            return True, "subscription_grace", {
+                "current_user_role": role,
+                "raw_item": target,
+                "grace_until": grace_until,    # 可能 None,前端不显示倒计时
+                "plan_type_jwt": plan_type,    # 区分 grace 来源(诊断用)
+            }
+        return False, "subscription_cancelled", {
+            "current_user_role": role,
+            "raw_item": target,
+            "grace_until": grace_until,
+            "plan_type_jwt": plan_type,
+        }
+
+    return True, "active", {"current_user_role": role, "raw_item": target}
+```
+
+**helper 复用**(Round 9 / Round 11 一轮已实现):
+- `extract_grace_until_from_jwt(token)` — 解 `https://api.openai.com/auth.chatgpt_subscription_active_until` claim;Round 9 v1.1 已实现,token 既可以是 access_token 也可以是 id_token(只要 payload 含此 claim)
+- `_read_access_token_from_auth_file()` — codex-main-*.json 解析,Round 9 v1.1 已实现
+
+**v1.3 新增 helper**:
+
+```python
+def extract_plan_type_from_jwt(token):
+    """从 JWT payload 解析 chatgpt_plan_type → lowercase 字符串。
+
+    v1.3:ChatGPT web access_token 不含 chatgpt_subscription_active_until claim,
+    但含 chatgpt_plan_type 表示当前权益层级。grace 期内此字段仍为 "team" 等付费层。
+
+    返回:
+        小写字符串 ("team", "free", "business" 等) — 字段存在
+        None — token 缺失 / 字段缺失 / 格式错 / 解析失败 (永不抛)
+    """
+```
+
+**`_load_admin_id_token` 签名变更(v1.3)**:
+
+```python
+def _load_admin_id_token(chatgpt_api=None) -> str | None:
+    """加载用于解 grace 信号的 JWT token。
+
+    优先级(v1.3):
+      1. chatgpt_api.access_token(ChatGPT web JWT,/api/auth/session 拿到,
+         含 chatgpt_plan_type claim) — **走 web session 路径的用户主路径**
+      2. accounts/codex-main-*.json 最近修改文件的 id_token
+         (含 chatgpt_subscription_active_until + chatgpt_plan_type 双 claim) — OAuth 重登路径兜底
+      3. None
+    """
+```
+
+**`is_master_subscription_healthy` 调用处**:`_load_admin_id_token(chatgpt_api)` — 把外层传入的 chatgpt_api 透传给 helper。
+
+**实测事实(2026-04-28 dump)** — ChatGPT web access_token JWT payload 完整 keys:
+```
+['aud', 'client_id', 'exp', 'https://api.openai.com/auth', 'https://api.openai.com/profile',
+ 'iat', 'iss', 'jti', 'nbf', 'pwd_auth_time', 'scp', 'session_id', 'sl', 'sub']
+```
+`https://api.openai.com/auth` claims:
+```
+['chatgpt_account_id', 'chatgpt_account_user_id', 'chatgpt_compute_residency',
+ 'chatgpt_plan_type', 'chatgpt_user_id', 'is_signup', 'user_id', 'verified_org_ids']
+```
+**无** `chatgpt_subscription_active_until`,**有** `chatgpt_plan_type: "team"`(grace 期内的关键信号)。
+
+### 14.4 fail-fast 入口零改动 — 守恒自动正确
+
+**关键**:fail-fast 入口现行代码语义为 `if not healthy and reason == "subscription_cancelled": raise 503`。在 Round 11 修改后,grace 期内 `healthy=True, reason="subscription_grace"` → `not healthy` 为 False → **自动跳过 fail-fast**,无需改动:
+
+- `api.py:fill_team_task` / `fill_personal_task`(M-T3 入口)
+- `manager.py:_run_post_register_oauth(use_personal=False)` 入口(M-T2)
+- `manager.py:_run_post_register_oauth(use_personal=True)` 入口(M-T1)
+
+**仅需保证 `_pw_executor.run` 包装层与单测保护**(见 §14.7 单测期望)。
+
+### 14.5 retroactive helper 撤回路径扩展(关联 §11)
+
+Round 9 v1.1 §11 retroactive helper `_apply_master_degraded_classification` 在母号续费回 healthy 时撤回 GRACE → ACTIVE。Round 11 后,**healthy 路径扩展为两枚 reason**:
+
+```python
+# manager.py:_apply_master_degraded_classification (Round 11 调整)
+
+def _apply_master_degraded_classification(workspace_id=None, grace_until=None, *, chatgpt_api=None, dry_run=False):
+    healthy, reason, evidence = is_master_subscription_healthy(chatgpt_api)
+    # Round 11:撤回路径触发条件扩展为 "active" OR "subscription_grace"
+    if reason in ("active", "subscription_grace"):
+        # 把所有 status=GRACE 且 master_account_id_at_grace == 当前 account_id 的子号
+        # 转回 ACTIVE,清空 grace_*
+        ...
+        return {"reverted_active": [...]}
+    if reason == "subscription_cancelled":
+        # 既有 GRACE 进入路径不变(子号转 GRACE / GRACE 到期转 STANDBY)
+        ...
+```
+
+**理由**:
+- master 在 `subscription_grace` 期内,**新 invite 仍能拿 plan_type=team**(Round 11 user Q1 实证)
+- 既然新子号都能正常 ACTIVE,那既有的 GRACE 子号(它们当时被标 GRACE 是因为 master 旧路径误判 cancelled)也应该撤回 ACTIVE
+- 直到 grace_until 真正过期(转 cancelled),retroactive 才会再次把它们打成 GRACE
+
+### 14.6 缓存策略对齐(v1.3 升级)
+
+**v1.2 的处理(回顾)**:`reason` 字段 enum 扩展为 6 个字面量(增 `subscription_grace`),schema_version 保持 1。
+
+**v1.3 强制升级**:**schema_version 1 → 2**。理由:v1.2 的 cache 在用户走 web session 路径时持久化了大量 `subscription_cancelled` 误判 entry(因 v1.2 `_load_admin_id_token` 仅读 codex-main-*.json,web 用户永远拿不到 token)。如不升级 schema,deploy v1.3 后旧 cache 仍会让 banner 显示红色 cancelled 直到 cache TTL(5min)自然过期 — 用户体验不连续。
+
+升级行为(由 `_load_cache` 现有逻辑承担,无需额外代码):
+1. 启动后 `_load_cache` 读到 `data["schema_version"] == 1` ≠ `CACHE_SCHEMA_VERSION (2)` → 整体丢弃,返回空 cache
+2. 首次 `is_master_subscription_healthy` 调用走 cache miss 路径 → 实测 + 写新 schema 2 cache
+3. 旧 cache 文件在第一次写盘时被新结构整体覆盖
+
+**evidence 持久化字段扩展**(v1.3):
+- 新增 `plan_type_jwt`(可选,可能 "team" / "free" / None,None 时不写盘以节省磁盘)
+- `grace_until` 持久化路径不变(Round 11 v1.2 已支持)
+- cache 命中时 `_build_evidence` 必须从 raw_ev 还原 `plan_type_jwt` 到 ev,与 grace_until 还原同等处理
+
+### 14.7 单测期望(Round 11 一轮 ≥6 + 二轮 +8 = 总 ≥14)
+
+**一轮(v1.2,grace_until OAuth 路径)**:
+
+| 测试 | 说明 |
+|---|---|
+| `test_classify_l1_grace_period_returns_healthy` | mock items + id_token JWT 含 chatgpt_subscription_active_until = now+7d,断言 (True, "subscription_grace", evidence) + evidence.grace_remain_seconds > 0 |
+| `test_classify_l1_grace_expired_returns_cancelled` | mock JWT grace_until = now-1d 且无 plan_type 兜底,断言 (False, "subscription_cancelled") + evidence.grace_until 仍提供 |
+| `test_classify_l1_id_token_missing_returns_cancelled_conservatively` | id_token=None,eligible_for_auto_reactivation=True,断言保守落 cancelled |
+| `test_classify_l1_jwt_parse_failure_returns_cancelled` | id_token 不是合法 JWT(随机字符串),断言保守落 cancelled |
+| `test_fail_fast_entry_grace_not_503` | mock master_health 返回 (True, "subscription_grace", ...),POST `/api/tasks/fill` 不被 503 |
+| `test_retroactive_helper_grace_reason_reverts_active` | mock master_health 返回 subscription_grace,acc.status=GRACE,断言 helper 把它撤回 ACTIVE |
+
+**v1.3 二轮新增(`_load_admin_id_token` chatgpt_api fallback + plan_type 路径)**:
+
+| 测试 | 说明 |
+|---|---|
+| `test_load_admin_id_token_uses_chatgpt_api_access_token_first` | chatgpt_api.access_token 存在时优先返回 web JWT,不去读 codex-main-*.json — 直接保护用户报告的 bug 路径 |
+| `test_load_admin_id_token_falls_back_to_codex_main_json` | chatgpt_api.access_token=None / api 缺 attr / api=None 三种 fallback 触发,正确读 codex-main-*.json |
+| `test_load_admin_id_token_returns_none_when_both_missing` | 两源都缺失返回 None,不抛异常(M-I1 守恒)|
+| `test_classify_l1_grace_via_chatgpt_api_access_token` | 端到端回归:无 codex-main + chatgpt_api.access_token JWT 含 grace_until → (True, "subscription_grace", ...)|
+| `test_extract_plan_type_from_jwt_returns_team` | helper 大小写归一化:"Team"/"team"/"BUSINESS" → "team"/"team"/"business",验证 .lower() 处理 |
+| `test_extract_plan_type_from_jwt_returns_none_when_missing` | helper 异常路径(≥9 种):None / 空串 / 非字符串 / 单段 token / base64 失败 / 非 JSON / claims 缺失 / 字段缺失 / 空字符串 / 非字符串值 — 永不抛 |
+| `test_classify_l1_grace_via_plan_type_fallback_when_grace_until_missing` | **核心修复回归**:JWT 只有 chatgpt_plan_type=team 而无 grace_until,仍返回 (True, "subscription_grace") + evidence.plan_type_jwt="team" |
+| `test_classify_l1_cancelled_when_plan_type_free_fallback` | 边界守恒:plan_type=free 不被误判 grace,正确 cancelled,evidence.plan_type_jwt="free" 如实暴露 |
+
+### 14.8 Round 11 新增不变量(v1.3 调整)
+
+- **M-I14**:`healthy == True ⇔ reason ∈ {"active", "subscription_grace"}`(M-I3 v1.2 形式,严格双向蕴含,v1.3 不变)
+- **M-I15** **(v1.3 调整)**:`reason == "subscription_grace"` 时 `evidence.grace_until > time.time()` **OR** `evidence.plan_type_jwt ∈ {team, business, enterprise, edu}` 至少其一成立。原 v1.2 严格要求 `grace_until > now`,v1.3 因 web session 路径无 grace_until,放宽为双信号 OR。
+- **M-I16** **(v1.3 调整)**:`reason == "subscription_grace"` 时 `evidence.grace_remain_seconds` **可选**(原 v1.2 必然存在);若存在必须 > 0(向下取整,负值视作实施 bug);若 grace_until 为 None,grace_remain_seconds 也应缺失,前端不渲染倒计时。
+- **M-I17** **(v1.3 新增)**:`reason == "subscription_grace" + evidence.grace_until is None` 时,`evidence.plan_type_jwt` 必须 ∈ 付费层集合 `{team, business, enterprise, edu}`。即"无 grace_until 时必须有 plan_type 兜底证据"— 这是 M-I15 的对偶约束,防止 plan_type fallback 路径返回 grace 时 evidence 缺少证据字段。
+
+### 14.9 与 §13 endpoint 守恒的关系(v1.3 双路径示例)
+
+**OAuth 路径(有倒计时)**:
+
+```json
+{
+  "healthy": true,
+  "reason": "subscription_grace",
+  "evidence": {
+    "current_user_role": "account-owner",
+    "raw_account_item": {...},
+    "grace_until": 1777699200.0,
+    "grace_remain_seconds": 604800.0,
+    "plan_type_jwt": "team",
+    "probed_at": 1777094400.0,
+    "cache_hit": false
+  }
+}
+```
+
+**Web session 路径(v1.3 新增,无倒计时)**:
+
+```json
+{
+  "healthy": true,
+  "reason": "subscription_grace",
+  "evidence": {
+    "current_user_role": "account-owner",
+    "raw_account_item": {
+      "id": "bac969ea-468b-4ff4-8d7a-6f4f183394d9",
+      "structure": "workspace",
+      "current_user_role": "account-owner",
+      "eligible_for_auto_reactivation": true,
+      "name": "Icoulsysad"
+    },
+    "plan_type_jwt": "team",
+    "http_status": 200,
+    "probed_at": 1777357190.0,
+    "cache_hit": false
+  }
+}
+```
+注意:web session 响应中 evidence **不含** `grace_until` / `grace_remain_seconds`(只有 `plan_type_jwt: "team"` 作为 grace 证据)。
+
+**UI 渲染契约**(`MasterHealthBanner.vue` + `useStatus.js`):
+- `healthy=true + reason="subscription_grace"` → severity="warning",黄色 banner
+- `evidence.grace_until` 存在且 > now → 显示倒计时(`grace · 7d 12h`)
+- `evidence.grace_until` 缺失 → 不显示倒计时(`v-if="graceCountdown"` 守卫,`formatGraceRemain(undefined) === ""`),banner 仍黄色
+- `evidence.plan_type_jwt`(诊断用)— 不直接渲染,可在 `evidenceLine` 调试展开时显示
+
+---
+
+## 15. OAuth 连续失败 backoff(v1.4 Round 11 二轮新增,M-OA-backoff)
+
+### 15.1 背景与根因
+
+Round 11 二轮实证:某次 master 母号 grace 期内,workspace 选择页 consent loop 因页面变化点不到 button → callback 30s timeout → 18 次连续 OAuth 失败 → `accounts.json` 累积 18 条 status=auth_invalid 子号 + 18 条 cloudmail 邮箱浪费(每条 invite/register/oauth 流程都消耗一个邮箱配额)。
+
+根因 A:fill 巡检每 30 分钟无脑触发 `cmd_rotate`(仅看 active < HARD_CAP),不感知 OAuth 是否已稳定失败。
+根因 B:即使 master_health 母号探针正常(grace 期内 healthy=True),OAuth 子流程仍可能因 consent 页面 / cookie / network 等独立路径失败,master_health 无法预测此类故障。
+
+**结论**:需要一条独立于母号 health 的失败堆积保护机制 — 监测 OAuth 失败实际累积速率,达阈值后强制延长 fill 冷却,逼迫人工介入。
+
+### 15.2 决策矩阵
+
+| 触发条件 | 行为 | log 级别 |
+|---|---|---|
+| `len(active) >= TEAM_SUB_ACCOUNT_HARD_CAP` | 不进 backoff 检查(active 已满,fill 自然不触发)| - |
+| `len(active) < HARD_CAP` 且 `cooldown_remaining > 0` | 走原 cooldown 分支,不进 backoff 检查 | info |
+| `len(active) < HARD_CAP` 且 `cooldown_remaining <= 0` 且最近 2h 内 `master_aid` 上 status=auth_invalid 账号数 < 3 | 走原 fill 触发分支(`cmd_rotate`)| warning(原 fill log)|
+| `len(active) < HARD_CAP` 且 `cooldown_remaining <= 0` 且最近 2h 内 `master_aid` 上 status=auth_invalid 账号数 ≥ 3 | **触发 backoff** — `_auto_fill_last_trigger_ts = now - cooldown + 4h`,本轮 `continue` 不触发 fill,下一轮 cooldown_remaining ≈ 4h 内仍 > 0 | **warning**(显式标记需人工介入)|
+| backoff 检查内部抛异常(罕见,如 `get_chatgpt_account_id` 失败)| `logger.warning("[巡检] OAuth backoff 检查异常: %s,按原逻辑继续", exc)` 不进 backoff,走原 fill | warning |
+
+### 15.3 实施位点
+
+**位置**:`src/autoteam/api.py:2858-2893`(`_auto_check_loop` cooldown 通过分支后、playwright lock 获取前)。
+
+**完整决策段**(实施期 1:1 对齐):
+
+```python
+# api.py:2858+
+else:
+    # Round 11 — OAuth 连续失败 backoff:
+    # 最近 2 小时内 master workspace 累积 ≥3 个 auth_invalid 账号 → fill 已稳定失败,
+    # 延长有效冷却到 4 小时,避免每 30 分钟无脑循环浪费 cloudmail 邮箱 + 累积僵尸账号。
+    backoff_triggered = False
+    try:
+        from autoteam.accounts import STATUS_AUTH_INVALID
+        from autoteam.admin_state import get_chatgpt_account_id
+
+        master_aid = get_chatgpt_account_id() or ""
+        recent_window = 2 * 3600  # 2 小时
+        recent_failures = [
+            a for a in accounts
+            if a.get("status") == STATUS_AUTH_INVALID
+            and (a.get("workspace_account_id") or "") == master_aid
+            and (a.get("created_at") or 0) >= now_ts - recent_window
+        ]
+        if len(recent_failures) >= 3:
+            # 强制延长冷却,记 last_trigger_ts 让下次巡检也走 cooldown 分支
+            _auto_fill_last_trigger_ts = now_ts - _AUTO_FILL_COOLDOWN_SECONDS + 4 * 3600
+            logger.warning(
+                "[巡检] active=%d < %d 但近 2h 累积 %d 个 OAuth 失败账号 → "
+                "backoff 生效,延长冷却到 4h(避免无谓循环)。"
+                "请检查 codex_auth consent 页面或 master 订阅",
+                len(active), TEAM_SUB_ACCOUNT_HARD_CAP, len(recent_failures),
+            )
+            backoff_triggered = True
+    except Exception as exc:
+        logger.warning("[巡检] OAuth backoff 检查异常: %s,按原逻辑继续", exc)
+
+    if backoff_triggered:
+        continue
+    # ... 原 fill 触发逻辑 ...
+```
+
+### 15.4 契约字段(7-section 模板)
+
+#### Scope / Trigger
+
+`api.py:_auto_check_loop` 后台线程每巡检循环、cooldown 通过(`cooldown_remaining <= 0`)的分支起始;只在 `len(active) < TEAM_SUB_ACCOUNT_HARD_CAP` 时才进入(active 已满时 fill 自然不触发,无需 backoff)。
+
+#### Signatures
+
+无新公开函数(纯内联决策块),依赖既有 helper:
+- `autoteam.admin_state.get_chatgpt_account_id() -> str | None` — 取当前 master account_id
+- `autoteam.accounts.STATUS_AUTH_INVALID: Literal["auth_invalid"]` — 状态枚举
+- 全局 `_auto_fill_last_trigger_ts: float`(api.py 模块级 mutable)— 最近一次 fill 触发时戳
+- 全局 `_AUTO_FILL_COOLDOWN_SECONDS: int`(api.py 模块级常量)— 基础冷却期(实施期为 1800 / 30min)
+
+#### Contracts
+
+| 字段 | 值 | 注 |
+|---|---|---|
+| `recent_window` | `2 * 3600`(秒)| 滑动窗口大小,最近 2h |
+| `failure_threshold` | `3`(条)| ≥3 触发 |
+| `cooldown_extension_target` | `now - _AUTO_FILL_COOLDOWN_SECONDS + 4 * 3600`(秒)| `_auto_fill_last_trigger_ts` 推到此值,下一轮 `cooldown_remaining ≈ 4h - (round_interval)` 仍 > 0 |
+| 实际效果冷却 | 触发后 4h 内不再 fill(基础 cooldown 30min,扩展后实际 ≈ 4h)| **若任务文档说 8h**,实测 cooldown 4h(代码 4 \* 3600);8h 是"基础 cooldown 4h + 扩展 4h"误解,实际代码为 30min 基础 + 4h 强制扩展 = 4h |
+| 过滤条件 | `status=AUTH_INVALID` AND `workspace_account_id == master_aid` AND `created_at >= now - 2h` | 多 master 切换场景下,只算当前 master 失败 — workspace 隔离保证 |
+
+#### Validation & Error Matrix
+
+| 异常 | 处理 | 后果 |
+|---|---|---|
+| `get_chatgpt_account_id()` 抛(admin_state 文件读取失败)| `try/except` 内层捕获,`logger.warning` | backoff 不触发,走原 fill 路径 |
+| `accounts` list 为 None(罕见,run-time 状态)| `for a in accounts` 抛 → `try/except` 兜底 | 同上 |
+| `master_aid` 为空字符串(admin_state 未配置)| 比较 `(workspace_account_id or "") == ""` 仍正确 — 只匹配同样空 workspace 的失败子号(数据上几乎不可能 ≥3)| backoff 大概率不触发 |
+
+#### Good / Base / Bad Cases
+
+**Good case**(backoff 正确触发):
+- 02:00 fill 触发 → 20 个 OAuth 失败(全 auth_invalid + master_aid="abc123")
+- 02:30 巡检 cooldown 通过 → 检测最近 2h 内 20 条 auth_invalid + master_aid match → 触发 backoff,延长到 ~06:30
+- 02:30 ~ 06:30 之间所有巡检都走 cooldown 分支,不触发 fill → 不再浪费邮箱
+
+**Base case**(失败但不到阈值,正常 fill):
+- 02:00 fill 触发 → 1 个 OAuth 失败(偶发的 cloudmail 5xx)
+- 02:30 巡检 cooldown 通过 → recent_failures=1 < 3 → backoff 不触发,fill 正常运行 → 多数情况下下批 OAuth 恢复正常
+
+**Bad case**(backoff 未触发但应触发 — 防御失败场景):
+- 多 master 切换:旧 master "old-aid" 上有 5 条 auth_invalid;切到新 master "new-aid" 后,backoff 检查 master_aid == "new-aid",旧失败不计入 → backoff 不触发,fill 正常跑(切换 master 后清零是预期行为)
+
+#### Tests Required
+
+测试文件:`tests/unit/test_round11_oauth_failure_backoff.py`(7 cases,与 spec 决策矩阵 1:1 对应)
+
+| Case | 文件:测试名 | 关键断言 |
+|---|---|---|
+| OA-T1 status=AUTH_INVALID 一致性 | `TestRunPostRegisterOauthTeamNoBundle.test_run_post_register_oauth_team_no_bundle_marks_auth_invalid` | bundle 缺失分支 status 必须 AUTH_INVALID 不是 ACTIVE(防御 fill 计数器误算)|
+| OA-T2 锚 grep 防回归 | `TestRunPostRegisterOauthTeamNoBundle.test_manager_source_no_bundle_branch_uses_auth_invalid` | `Round 11 — OAuth bundle 缺失分支` 锚后 1200 字符内必含 `status=STATUS_AUTH_INVALID`,不含 `status=STATUS_ACTIVE` |
+| OA-T3 backoff 触发 | `TestAutoCheckLoopOauthBackoff.test_auto_check_loop_oauth_backoff_triggers_when_3_recent_failures` | 3 条最近 2h auth_invalid + master 一致 → triggered=True;new_ts 让下一轮 cooldown_remaining > 0 |
+| OA-T4 时间窗 | `TestAutoCheckLoopOauthBackoff.test_auto_check_loop_oauth_backoff_skipped_when_failures_old` | 3 条 auth_invalid 全 3h+ 前 → triggered=False,failures=0 |
+| OA-T5 阈值严格 | `TestAutoCheckLoopOauthBackoff.test_auto_check_loop_oauth_backoff_skipped_when_only_2_failures` | 2 条最近失败 < 阈值 3 → triggered=False |
+| OA-T6 workspace 隔离 | `TestAutoCheckLoopOauthBackoff.test_auto_check_loop_oauth_backoff_skipped_when_failures_other_workspace` | 3 条最近 auth_invalid 但 workspace_account_id != master_aid → triggered=False(隔离守恒)|
+| OA-T7 锚 grep 防回归 | `TestAutoCheckLoopOauthBackoff.test_api_source_contains_backoff_logic` | `api.py` 必含 `Round 11 — OAuth 连续失败 backoff` + `len(recent_failures) >= 3` + `recent_window = 2 * 3600` + `4 * 3600` |
+
+#### Wrong vs Correct
+
+**Wrong example**(无 backoff,fill 无脑循环):
+
+```python
+# 旧 _auto_check_loop:
+if cooldown_remaining > 0:
+    continue  # 冷却分支
+else:
+    # ❌ 直接 _start_task("auto-fill", cmd_rotate, ...)
+    # 失败连续累积 18 条都不感知,每 30min 仍触发 → 浪费 cloudmail × 36 / 18h
+    _start_task("auto-fill", cmd_rotate, ...)
+```
+
+**Correct example**(backoff 守护):
+
+```python
+else:
+    backoff_triggered = False
+    try:
+        master_aid = get_chatgpt_account_id() or ""
+        recent_failures = [
+            a for a in accounts
+            if a.get("status") == STATUS_AUTH_INVALID
+            and (a.get("workspace_account_id") or "") == master_aid
+            and (a.get("created_at") or 0) >= now_ts - 2 * 3600
+        ]
+        if len(recent_failures) >= 3:
+            _auto_fill_last_trigger_ts = now_ts - _AUTO_FILL_COOLDOWN_SECONDS + 4 * 3600
+            logger.warning("...backoff 生效...")
+            backoff_triggered = True
+    except Exception as exc:
+        logger.warning("[巡检] OAuth backoff 检查异常: %s", exc)
+    if backoff_triggered:
+        continue  # ✅ 跳过本轮 fill
+    # 原 fill 逻辑 ...
+```
+
+### 15.5 不变量(M-OA-backoff)
+
+> **M-OA-backoff(强制)**:`_auto_check_loop` 在 cooldown 通过(`cooldown_remaining <= 0`)的分支起始,**必须先做 OAuth 失败计数检查**,再决定是否进 fill:
+>
+>   1. 取 `master_aid = get_chatgpt_account_id() or ""`
+>   2. 计 `recent_failures` = `[a for a in accounts if status==AUTH_INVALID and workspace_account_id==master_aid and created_at >= now-2h]`
+>   3. `if len(recent_failures) >= 3`:
+>      - `_auto_fill_last_trigger_ts = now - cooldown + 4h`
+>      - `logger.warning(...)` 显式标记
+>      - `continue`(跳过本轮 fill)
+>   4. 检查异常 → `logger.warning` 吞掉,走原 fill(不阻塞主流程)
+>
+> 等价**禁止**:
+>   - 不做 backoff 检查,cooldown 通过即触发 fill
+>   - 把 `recent_window` / `threshold` / `cooldown_extension` 变成 runtime 可调参数(写死,不暴露 API 给调用方调,避免误配)
+>   - workspace 隔离丢失(忘了 `workspace_account_id == master_aid` 过滤)→ 多 master 切换误触发
+>
+> 等价**允许**:
+>   - backoff 检查内部异常时**不**触发 backoff(优先保证 fill 不被无效检查误阻断)
+>   - 同一时间点累积 >> 3 条失败仍只触发一次(`continue` 跳过本轮即可)
+>
+> 与 §14 subscription_grace 关系:**完全独立**,subscription_grace 是母号 health 概念(grace 期内 healthy=True 自动放行 OAuth);M-OA-backoff 是 fill 频率保护(无论母号 health 如何,只要子号 OAuth 实际失败堆积就 backoff)。两者任一触发都能阻止无谓循环。
+
+### 15.6 与既有机制的关系
+
+| 既有机制 | 关系 |
+|---|---|
+| §14 subscription_grace 状态(母号 health)| 独立,grace 期内 healthy=True 不阻 fill,但 backoff 仍守 fill 频率 |
+| §6 master health cache(5min TTL)| 独立,cache 仅保护 health 探针自身,不影响 backoff 计数 |
+| `_AUTO_FILL_COOLDOWN_SECONDS` 基础冷却(30min)| 配合,基础冷却负责 30min 内不重复触发,backoff 在此之上加 4h 强约束 |
+| §11 retroactive helper RT-1~RT-5 5 触发点 | 独立,retroactive 修正 active stale-grace 状态;backoff 关注 fill 失败频率 |
+| reconcile 5min 兜底(spec-2 §3.5)| 独立,reconcile 清理 workspace 残留;backoff 阻止生产新失败 |
+| **`OAUTH_SUBPROCESS_TIMEOUT_S` 单次 OAuth 上界(`oauth-subprocess-timeout.md` v1.0.0)** | **维度不同,正交** — 本 §15 M-OA-backoff 是**多次失败间隔下界**(2h 窗口 ≥3 失败 → 4h cooldown);`OAUTH_SUBPROCESS_TIMEOUT_S` 是**单次 OAuth 子进程上界**(默认 200s,P95 < 180s + 余量)。两者并存:本常量保单次 OAuth 不被错误地早 abort,M-OA-backoff 保多次失败累积时不浪费 cloudmail 配额。详见 `oauth-subprocess-timeout.md` §4.3。 |
+| **§4.7 OAuth issuer ledger TTL(`account-state-machine.md` v2.1.2)** | **正交但相关** — 本 §15 backoff 是 fill 频率守护(每个失败计入 4h cooldown);issuer ledger TTL 是后端最终一致性窗口(几小时 +,kick 后 issuer 端 `oai-oauth-session.workspaces[]` 不立即清空)。两者相关性:OAuth retry 5 次累计 ~215s 远短于 ledger TTL,需依赖 `use_personal=True` 强切 personal workspace(`oauth-workspace-selection.md` v1.5.0 §4.4)绕开 ledger 滞后,此路径外加 M-OA-backoff 双重保护。 |
+
+---
+
+**文档结束。** 工程师据此可直接编写 `is_master_subscription_healthy` 函数 + 5 处接入 + retroactive helper(5 触发点)+ M-I1 endpoint 守恒 + **subscription_grace healthy=True 状态(Round 11)** + **OAuth 连续失败 backoff(Round 11 二轮)** + 单测,无需额外决策。
 
 ---
 
@@ -849,3 +1316,7 @@ def get_admin_master_health(force_refresh: bool = False):
 |---|---|---|
 | v1.0 | 2026-04-27 Round 8 | 初版 — 三层探针(L1 主 / L2 反推 / L3 副)+ 5 触发位点(M-T1~T5)+ 5min cache + 5 误判缓解(FN-A~E + FP-A~E)+ 10 不变量(M-I1~I10)。源自 `.trellis/tasks/04-27-master-team-degrade-oauth-rejoin/research/master-subscription-probe.md` §1-§7。配套 PRD-7 Approach A R1 母号订阅探针落地。 |
 | **v1.1** | **2026-04-28 Round 9** — 加 retroactive 5 触发点 + grace 期 + endpoint 守恒。(1) §0 元数据 bump,引用方加 Round 9 task / spec-2 v1.6 / state-machine v2.0 / AC-B1~AC-B8;(2) **新增 §11 Retroactive 触发位点矩阵** — 抽 helper `_apply_master_degraded_classification(workspace_id, grace_until)` 5 触发点 RT-1~RT-5(lifespan / `_auto_check_loop` / `cmd_check` / `sync_account_states` / `cmd_rotate`)+ RT-6 既有(cmd_reconcile),全部走 5min cache,失败 logger.warning 不阻塞调用方;(3) **新增 §12 Grace 期处理** — `parse_grace_until_from_auth_file()` 从子号 JWT id_token `chatgpt_subscription_active_until` 解析 grace_until + 决策表 7 行(进入 GRACE / 转 STANDBY / 撤回 ACTIVE / 跳过路径)+ grace_until 守恒规约(仅 helper 退出态时清空);(4) **新增 §13 M-I1 endpoint 守恒** — `/api/admin/master-health` 永不返回 5xx,`ChatGPTTeamAPI.start()` 失败映射 auth_invalid 200 OK,probe 异常映射 network_error 200 OK,双保险 try/except,4 个单测覆盖。Round 8 既有 §1~§10 内容(M-T1~T5 / M-I1~I10 / 三层探针 / 5min cache)不变。配套 Round 9 task `04-28-account-usability-state-correction` Approach B 决策(ADR-lite)落地。 |
+| **v1.2** | **2026-04-28 Round 11** — 修复 master_health 守恒 disconnect bug。(1) §0 元数据 bump,引用方加 Round 11 task / spec-2 v1.7 / state-machine v2.1 / realtime-probe v1.0 / AC1~AC4;(2) **§1 修正 `eligible_for_auto_reactivation` 语义** — 从 v1.0/v1.1 的"period 已过"改为"grace 期内立即为 true"(Round 11 user Q1 实证:ChatGPT 网页 team 权限仍可用),共因加 Round 11 user Q1;(3) **§2.1 MasterHealthReason Literal 扩** 6 个字面量(增 `subscription_grace`);(4) **§7 M-I3 不变量 BREAKING 扩展** — `healthy=True ⇔ reason ∈ {"active", "subscription_grace"}`;(5) **新增 §14 subscription_grace healthy=True 状态** — 决策矩阵(eligible_for_auto_reactivation=true × {grace_until > now / grace_until ≤ now / id_token 缺失} → reason)+ 主修改点(`_classify_l1` ~30 行 grace 判定)+ fail-fast 入口零改动(healthy=True 自动放行 — 不动 api.py:fill / manager.py M-T1/M-T2)+ retroactive helper 撤回路径扩展(reason ∈ ("active", "subscription_grace") 都触发 GRACE → ACTIVE)+ 缓存 schema 兼容(reason enum 扩 1 项,schema_version 仍 1)+ 6 个单测期望(grace 期内 / grace 已过期 / id_token 缺失 / JWT 解析失败 / fail-fast 不 503 / retroactive 撤回)+ 3 新不变量(M-I14/M-I15/M-I16)。Round 8/9 既有 §1~§13 内容不变,仅 §14 增量 + §1/§2.1/§7 局部修订。配套 Round 11 task `04-28-round11-master-resub-models-validate` Approach A 决策(ADR-lite)落地。 |
+| **v1.4** | **2026-04-28 Round 11 二轮收尾** — OAuth 连续失败 backoff 独立机制。**根因**:Round 11 二轮实测 18 条 OAuth 连续失败堆积,每 30min fill 巡检无脑触发 `cmd_rotate`,即使 master_health 母号探针 grace 期内 healthy=True 也无法预测 consent 页面 / cookie / network 等独立路径失败。**修复**:(1) §0 元数据 bump v1.3 → v1.4,version 注 + 引用方加二轮收尾;(2) **新增 §15 OAuth 连续失败 backoff** — 在 `_auto_check_loop` cooldown 通过分支起始加失败计数检查,`recent_window=2h` + `master_aid` workspace 隔离 + `threshold≥3` 触发 → `_auto_fill_last_trigger_ts = now - cooldown + 4h` 实际效果 4h 内不再 fill;7 section 完整覆盖(Scope / Signatures / Contracts / Error Matrix / Good-Base-Bad / Tests Required / Wrong-vs-Correct);7 个测试 case(`tests/unit/test_round11_oauth_failure_backoff.py`)。(3) **新不变量 M-OA-backoff** — `_auto_check_loop` 必须先做失败计数检查再决定是否触发 fill;workspace 隔离不能丢;backoff 检查内部异常吞掉走原 fill 路径。(4) **§15.6 与既有机制的关系** — 与 §14 subscription_grace、§6 master health cache、§11 retroactive helper、reconcile 5min 兜底全部正交独立。(5) **未改动**:Round 8/9/11 一轮既有 §1~§14 内容全部保持,仅 §15 增量。 |
+| **v1.4.1** | **2026-04-29 Round 11 五轮 spec-update** — §15.6 关系表新增 `OAUTH_SUBPROCESS_TIMEOUT_S` 与 `account-state-machine.md` §4.7 issuer ledger TTL 两行交叉引用,纯 spec 增量,无代码改动。**为什么加**:Round 11 五轮新建 `oauth-subprocess-timeout.md` v1.0.0(模块级常量 `OAUTH_SUBPROCESS_TIMEOUT_S = 200`,`manager.py:82`),与本 §15 M-OA-backoff 维度不同(单次上界 vs 失败间隔下界)需显式标注以避免读者混淆;同时 `account-state-machine.md` v2.1.2 §4.7 新增 OAuth issuer ledger TTL 现象与本 §15 fill 频率守护正交但相关(retry 5 次 215s << ledger TTL),需在关系表中点明。**改动**:(1) §0 元数据 bump v1.4 → v1.4.1,version 注 + 引用方加 oauth-subprocess-timeout v1.0.0 + account-state-machine v2.1.2 §4.7 + oauth-workspace-selection v1.5.0 §4.4 + Round 11 五轮 task;(2) §15.6 关系表追加 2 行(`OAUTH_SUBPROCESS_TIMEOUT_S` 单次 OAuth 上界 / §4.7 OAuth issuer ledger TTL),正交关系标注清晰。**未改动**:Round 8/9/11 一轮/二轮 §1~§15.5 + §15.6 既有 5 行内容全部保持,仅 §15.6 表追加 2 行 + §0 元数据局部修订。配套 Round 11 五轮 task `04-28-round11-master-resub-models-validate` trellis-update-spec 阶段。 |
+| **v1.3** | **2026-04-28 Round 11 二轮** — JWT 双信号源 + cache schema 升级。**根因**:v1.2 `_load_admin_id_token` 仅读 `accounts/codex-main-*.json`,用户走 web session(state.json)路径时该文件不存在 → grace_until 永远解不出 → fallback 误判 cancelled。**实测 dump**(2026-04-28):ChatGPT web access_token JWT 不含 `chatgpt_subscription_active_until` claim,但含 `chatgpt_plan_type` claim 反映当前权益层级。**修复**:(1) §0 元数据 bump v1.2 → v1.3,共因加 Round 11 二轮根因;(2) **§1 `subscription_grace` 概念扩展为双信号源** — grace_until JWT(OAuth 路径,有倒计时)OR plan_type ∈ 付费层(web session 路径,无倒计时);(3) **§2.1 MasterHealthReason 注释扩展** — `subscription_grace` 注双信号 OR、`subscription_cancelled` 注双信号 AND 失败;(4) **§2.3 cache schema 1 → 2 强制升级** — v1.2 cache 持久化的 cancelled 误判必须作废,`_load_cache` 检测到不一致整体丢弃;(5) **§14.2 决策矩阵扩展** — 加 plan_type fallback 行,标"OAuth 路径""web session 路径""混合路径"分类;(6) **§14.3 实施位点更新** — `_load_admin_id_token(chatgpt_api=None)` 签名变化加 access_token 优先,新增 `extract_plan_type_from_jwt(token)` helper,主流程 _classify_l1 加 plan_type fallback 分支(~20 行新增);(7) **§14.6 缓存策略升级** — schema 升级行为说明 + evidence 持久化加 `plan_type_jwt` 字段;(8) **§14.7 单测期望** — 一轮 6 个保留 + 二轮新增 8 个(`_load_admin_id_token` chatgpt_api fallback 3 + `extract_plan_type_from_jwt` helper 2 + classify_l1 plan_type 路径 2 + `test_classify_l1_grace_via_chatgpt_api_access_token` 集成 1);(9) **§14.8 不变量调整** — M-I15 v1.3 放宽为双信号 OR、M-I16 grace_remain_seconds 改为可选、新增 M-I17(grace_until is None 时 plan_type_jwt 必须 ∈ 付费层);(10) **§14.9 endpoint 响应示例** — 加 web session 路径示例 + UI 渲染契约(无 grace_until 时不显示倒计时,banner 仍黄色)。Round 8/9/11 一轮既有 §1~§13 + §14.1/§14.4/§14.5 内容不变。配套 Round 11 task `04-28-round11-master-resub-models-validate` 二轮修复落地。 |

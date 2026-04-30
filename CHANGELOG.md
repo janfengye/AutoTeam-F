@@ -2,6 +2,33 @@
 
 本文档记录 AutoTeam-F 相对上游 [cnitlrt/AutoTeam](https://github.com/cnitlrt/AutoTeam) 的差异以及版本演进。日期采用 ISO 8601。
 
+## [Unreleased] — 2026-04-30
+
+### ⚠️ Upstream-break:ChatGPT 改了免费号 workspace 注册逻辑,当前 fork 已无可靠免费号获取途径
+
+> Round 11 真号自验阶段(`prompts/0426/verify/round11-review-report.md` AC7)实地复现:**OpenAI 后端调整了 personal/free workspace 的选择与 plan 下发逻辑** — 旧路径"邀请进 Team → 主号 kick → personal OAuth → 拿 `plan_type=free` bundle"在 5 次外层重试 + `oauth_workspace.ensure_personal_workspace_selected` 主动 POST `/api/accounts/workspace/select` + session_token 注入跳过 /log-in 三层加固后**仍无法稳定拿到 free plan**:bundle.plan_type 现总是回落到 `team`,而 `default_workspace_id` 即便 select 成功也不再切回 Personal,后端最终一致性窗口被收紧。
+>
+> 表象:点 Web 面板"生成免费号"会跑完整套注册→踢出→OAuth,最终 5 次重试全部拿到 plan_type=team,record_failure 写 `OAUTH_PLAN_DRIFT_PERSISTENT`,账号被标 STANDBY 留池。无 token 损失但**也拿不到任何可用的 free 子号**。
+>
+> 影响范围:README 标 🆕 的 **"生产免费号(Personal)"** 整条链路当前**事实失效**,需等 OpenAI 后端再次变更或社区给出新绕过路径。Team 子号注册不受影响。
+>
+> 已留底层钩子:`src/autoteam/oauth_workspace.py` / `manager._run_post_register_oauth` 5 次重试 + session_token 注入 + plan_drift 累计的代码全部保留,后续如发现新路径直接复用即可。
+
+### Round 11:Master Grace 真 healthy + 子号实时探活 + cheap_codex_smoke 模型分级
+
+> 起因:Round 8 spec 把 `eligible_for_auto_reactivation=true` 等价于"period 已过 + 必拿 free",这是错的。用户实证 grace 期内 ChatGPT 网页 team 权限仍可用 → master_health 应判 `subscription_grace`(healthy=True),而 Round 9 的 GRACE 子号状态机漏改了这个 master_health 守恒位 → 入口 `api.py:2491` / `manager.py:1590, 1819` 一律 503 fail-fast,grace 期母号仍能用但 fork 拒新 invite。本轮 Approach A:不动 fail-fast 入口,只扩 `_classify_l1` 把 grace 拆出来。
+
+- **feat(master-health): `subscription_grace` healthy=True 状态** — `master_health.py:_classify_l1` 加 `id_token` 参数,从 `accounts/codex-main-*.json` 最近修改文件读 admin id_token,`extract_grace_until_from_jwt` 解出 grace_until;`eligible_for_auto_reactivation is True` 时分两支:`grace_until > now` → `(True, "subscription_grace", {grace_until, grace_remain_seconds})`;否则 → `(False, "subscription_cancelled", ...)`。M-I3 守卫 + 缓存命中 + 实时探活双侧守卫扩 `healthy_reasons = ("active", "subscription_grace")`;`_apply_master_degraded_classification` 撤回路径触发条件由 `reason == "active"` 扩为 `reason in ("active", "subscription_grace")`,对齐 §4.6 联动表 L-2/L-5。
+- **feat(realtime-probe): 子号实时探活按钮** — `api.py:1839` 新增 `POST /api/accounts/{email}/probe`,并行 `check_codex_quota` + `cheap_codex_smoke`,落 `last_quota_check_at` + `last_quota`,**不修改 status**(RT-I1)。`Dashboard.vue:144` 每行 AtButton(canProbe 守卫)调 `probeAccount(email)`,toast.success/warn/info 三态显示 + emit refresh。
+- **feat(codex-smoke): 真实对话内容验证** — `cheap_codex_smoke(access_token, account_id=None, *, model="gpt-5", max_output_tokens=64)` 加 model + max_output_tokens 参数;`_cheap_codex_smoke_network` 读完整 SSE 流累积 `output_text.delta` + 见到 `response.completed` 时停止读流并解析 `usage.output_tokens`;返回 `("alive", {"model", "response_text", "raw_event", "tokens"})` dict 替代旧 str。
+- **feat(api): `GET /api/accounts/{email}/models`** — 用 access_token 调 `chatgpt.com/backend-api/models`;401/403 透传 401;timeout → 503;其他 5xx/4xx → 502。
+- **fix(chatgpt_api): `_api_fetch` header sanitize** — Layer 1 ISO-8859-1 round-trip 清洗 + None skip + bytes decode + Layer 2 `logger.warning` 诊断。独立 P0 阻塞修复,实测过程中发现的 admin 重登路径 bug。
+- **fix(round-10): 主号 Codex OAuth via session_token 落登录页修复** — 之前提交 `2525f56`,本轮在 spec 里同步落地 `prompts/0426/spec/shared/oauth-subprocess-timeout.md` + 测试 `tests/unit/test_round11_session_token_injection.py`。
+- **frontend(banner+card): grace 黄色 + 倒计时** — `useStatus.js:masterHealthSeverity()` `subscription_grace → 'warning'`;`MasterHealthBanner.vue` 文案 "母号订阅在 grace 期 · 仍可正常使用" + effectiveGraceUntil computed 优先用 evidence.grace_until 显示倒计时;`PoolHealthCard.vue` masterTone 加 grace 橙色 + "Grace 期内" 标签。
+- **spec 升级**:`master-subscription-health.md` v1.1 → **v1.2**(新增 §14 subscription_grace + 9 子节 + M-I14/15/16);`account-state-machine.md` v2.0 → **v2.1**(新增 §4.6 母号×子号 GRACE 联动表 L-1~L-10);`realtime-probe.md` **新建 v1.0**(308 行,RT-I1~I9);`spec-2-account-lifecycle.md` v1.6 → **v1.7**;`oauth-workspace-selection.md` 微调对齐 grace。
+- **测试**:Round 11 新增 26 cases(8 grace + 6 smoke + 8 probe + 4 header sanitize),`pytest tests/unit -q` → **256 passed**,`ruff check src tests/unit prompts` → **All checks passed**。
+- **AC7 BLOCKED**:真号注册自验在第 5 次重试仍拿 plan_type=team 时定位到上面 ⚠️ upstream-break,作为本 Round 的硬发现写入 CHANGELOG + README,代码修复无指向。
+
 ## [Unreleased] — 2026-04-26
 
 ### docker-guard:镜像守卫四道防线(SPEC-3)

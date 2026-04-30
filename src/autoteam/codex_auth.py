@@ -156,6 +156,61 @@ def _write_auth_file(filepath, bundle):
     return str(filepath)
 
 
+def _inject_personal_session_cookies(context, session_token):
+    """
+    把注册阶段的 chatgpt.com __Secure-next-auth.session-token 注入到
+    chatgpt.com + auth.openai.com 双域,让 personal OAuth 跳过 /log-in 表单。
+
+    Round 11 四轮:
+    - 单注入 auth.openai.com 域不够 —— NextAuth 跨域 issuer 校验严格,
+      /oauth/authorize 不认 chatgpt.com 颁发的 token。
+    - 必须双域同时注入,然后先 goto chatgpt.com 让服务端 next-auth API 校验
+      session 并写齐配套 cookies,再 goto auth_url 进入 OAuth。
+
+    切片规则与 SessionCodexAuthFlow._inject_auth_cookies / chatgpt_api._build_session_cookies
+    保持一致:>3800 字节切两段 .0/.1,否则单个 cookie。
+    """
+    if not session_token:
+        return
+
+    def _build(domain):
+        if len(session_token) > 3800:
+            return [
+                {
+                    "name": "__Secure-next-auth.session-token.0",
+                    "value": session_token[:3800],
+                    "domain": domain,
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "Lax",
+                },
+                {
+                    "name": "__Secure-next-auth.session-token.1",
+                    "value": session_token[3800:],
+                    "domain": domain,
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "Lax",
+                },
+            ]
+        return [
+            {
+                "name": "__Secure-next-auth.session-token",
+                "value": session_token,
+                "domain": domain,
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "Lax",
+            }
+        ]
+
+    cookies = _build("chatgpt.com") + _build("auth.openai.com")
+    context.add_cookies(cookies)
+
+
 def _click_primary_auth_button(page, field, labels):
     """
     只点击当前输入框所在表单的主按钮，避免误点 Continue with Google/Apple/Microsoft。
@@ -265,13 +320,232 @@ def _wait_for_otp_submit_result(page, timeout=12):
     return "pending", None
 
 
-def login_codex_via_browser(email, password, mail_client=None, *, use_personal=False):
+def _typewrite_credential(page, locator, value, *, delay_ms=50, post_sleep=1.0):
+    """逐字符 keyboard.type 填入 credential,触发 React onChange 事件链.
+
+    Round 11 五轮 — 阶段 2 fresh re-login 必备:
+    OpenAI auth /log-in 页 React 表单对 Playwright fill() 不友好 —— fill 一次性
+    setValue,不触发 input 事件 → React internal state 不更新 → Continue 按钮变灰禁用。
+    keyboard.type 逐字符模拟真用户击键,触发 onChange/onInput 完整事件链。
+
+    注:注册流的 /create-account/password 页用 fill() 是 OK 的(不同 React form impl);
+    本 helper 仅用于 fresh login (/log-in) 阶段。
+    """
+    try:
+        locator.click()
+        time.sleep(0.3)
+        # 清空可能预填的内容
+        try:
+            locator.press("Control+A")
+            locator.press("Delete")
+        except Exception:
+            pass
+        time.sleep(0.2)
+        page.keyboard.type(value, delay=delay_ms)
+        time.sleep(post_sleep)
+        return True
+    except Exception as exc:
+        logger.warning("[Codex] _typewrite_credential 失败: %s", exc)
+        return False
+
+
+def _perform_fresh_relogin_in_context(context, email, password, mail_client, *, used_email_ids):
+    """阶段 2 — fresh chatgpt.com login.
+
+    Round 11 五轮 Option A:
+    阶段 1(silent step-0 + cookie 注入)拿到 plan_type=team 或 bundle=None 时,
+    说明 chatgpt.com session_token 内嵌的 user identity 已被锁死在原 Team workspace,
+    NextAuth refresh 不能切。唯一兜底:清空 OAuth context 所有 cookies,做一次完整的
+    chatgpt.com 登录(email + password),拿到 Personal-bound 全新 session,再走 OAuth。
+
+    流程:
+    1. context.clear_cookies() — 清空 stale 的 chatgpt.com / auth.openai.com 双域 session
+    2. goto chatgpt.com/auth/login,过 Cloudflare
+    3. 用 _typewrite_credential(keyboard.type)填 email + password — 不用 fill() 避免灰按钮
+    4. 处理 OTP(若 mail_client 可用)
+    5. 等 chatgpt.com 登录完成
+
+    Returns:
+        bool — True 表示 fresh login 成功(context 现持有新 session),False 表示失败
+    """
+    logger.info("[Codex] 阶段 2 fresh re-login 开始: 清空 context cookies → 重新登录 chatgpt.com")
+
+    try:
+        context.clear_cookies()
+    except Exception as exc:
+        logger.warning("[Codex] 清空 context cookies 失败: %s", exc)
+
+    # 重新刷邮箱 ID snapshot,fresh login 阶段不复用阶段 1 的旧 snapshot
+    fresh_email_id_before = 0
+    if mail_client:
+        try:
+            _pre = mail_client.search_emails_by_recipient(email, size=1)
+            if _pre:
+                fresh_email_id_before = _pre[0].get("emailId", 0)
+        except Exception:
+            pass
+
+    page = context.new_page()
+    try:
+        page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded", timeout=60000)
+        time.sleep(5)
+
+        # 过 Cloudflare(若有)
+        for _i in range(12):
+            try:
+                if "verify you are human" not in page.content()[:2000].lower():
+                    break
+            except Exception:
+                break
+            logger.info("[Codex] fresh re-login 等待 Cloudflare...(%ds)", _i * 5)
+            time.sleep(5)
+
+        # 点击 "登录" / "Log in" 按钮(若 chatgpt.com 首页落在欢迎页)
+        try:
+            login_btn = page.locator(
+                'button:has-text("登录"), button:has-text("Log in"), a:has-text("Log in"), a:has-text("登录")'
+            ).first
+            if login_btn.is_visible(timeout=3000):
+                login_btn.click()
+                time.sleep(3)
+        except Exception:
+            pass
+
+        _screenshot(page, "codex_relogin_01_login_page.png")
+
+        # === Email 步骤 ===
+        try:
+            ei = page.locator(
+                'input[name="email"], input[id="email-input"], input[id="email"], input[type="email"]'
+            ).first
+            if ei.is_visible(timeout=8000):
+                logger.info("[Codex] fresh re-login: 用 keyboard.type 填入 email...")
+                if not _typewrite_credential(page, ei, email):
+                    logger.warning("[Codex] fresh re-login: keyboard.type email 失败")
+                    return False
+                _click_primary_auth_button(page, ei, ["Continue", "继续"])
+                time.sleep(3)
+                _screenshot(page, "codex_relogin_02_after_email.png")
+            else:
+                logger.warning("[Codex] fresh re-login: email input 不可见")
+        except Exception as exc:
+            logger.warning("[Codex] fresh re-login email 步骤异常: %s", exc)
+
+        # === Password 步骤(关键:/log-in 页) ===
+        try:
+            pi = page.locator('input[name="password"], input[type="password"]').first
+            if pi.is_visible(timeout=8000):
+                if password:
+                    logger.info("[Codex] fresh re-login: 用 keyboard.type 填入 password...")
+                    if not _typewrite_credential(page, pi, password):
+                        logger.warning("[Codex] fresh re-login: keyboard.type password 失败")
+                        return False
+                    _click_primary_auth_button(page, pi, ["Continue", "继续", "Log in"])
+                    time.sleep(5)
+                else:
+                    # 无密码 → 一次性验证码登录
+                    otp_btn = page.locator(
+                        'button:has-text("一次性验证码"), button:has-text("one-time"), button:has-text("email login")'
+                    ).first
+                    if otp_btn.is_visible(timeout=3000):
+                        logger.info("[Codex] fresh re-login: 无密码,点击一次性验证码登录")
+                        otp_btn.click()
+                        time.sleep(3)
+                _screenshot(page, "codex_relogin_03_after_password.png")
+        except Exception as exc:
+            logger.warning("[Codex] fresh re-login password 步骤异常: %s", exc)
+
+        # === 可能 OTP ===
+        try:
+            ci = page.locator(_OTP_INPUT_SELECTORS).first
+            if ci.is_visible(timeout=5000) and mail_client:
+                logger.info("[Codex] fresh re-login: 需要 OTP,等待 emailId > %d 的新邮件...", fresh_email_id_before)
+                otp = None
+                otp_email_id = 0
+                t0 = time.time()
+                while time.time() - t0 < 120:
+                    for em in mail_client.search_emails_by_recipient(email, size=5):
+                        eid = em.get("emailId", 0)
+                        if eid <= fresh_email_id_before or eid in used_email_ids:
+                            continue
+                        sender = (em.get("sendEmail") or "").lower()
+                        if "openai" not in sender and "chatgpt" not in sender:
+                            continue
+                        subj = (em.get("subject") or "").lower()
+                        if "invited" in subj or "invitation" in subj:
+                            continue
+                        otp = mail_client.extract_verification_code(em)
+                        if otp:
+                            otp_email_id = eid
+                            break
+                    if otp:
+                        break
+                    time.sleep(3)
+                if otp:
+                    used_email_ids.add(otp_email_id)
+                    logger.info("[Codex] fresh re-login: 获取到 OTP %s", otp)
+                    ci.fill(otp)
+                    time.sleep(0.5)
+                    page.locator(
+                        'button[type="submit"], button:has-text("Continue"), button:has-text("继续")'
+                    ).first.click()
+                    time.sleep(5)
+                    _screenshot(page, "codex_relogin_04_after_otp.png")
+                else:
+                    logger.warning("[Codex] fresh re-login: 未获取到 OTP")
+        except Exception:
+            pass
+
+        # === 等 chatgpt.com 登录完成 ===
+        # 成功条件:URL 不再含 /auth/login,且页面可正常渲染
+        for _i in range(15):
+            cur = page.url or ""
+            if "auth/login" not in cur and "/log-in" not in cur:
+                logger.info("[Codex] fresh re-login: 登录完成,当前 URL: %s", cur[:120])
+                _screenshot(page, "codex_relogin_05_logged_in.png")
+                return True
+            time.sleep(2)
+
+        # 还停在 login 页 — 失败
+        logger.warning("[Codex] fresh re-login: 等待登录完成超时,当前 URL: %s", page.url[:120])
+        _screenshot(page, "codex_relogin_05_timeout.png")
+        return False
+    except Exception as exc:
+        logger.warning("[Codex] fresh re-login 异常: %s", exc)
+        return False
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
+def login_codex_via_browser(
+    email,
+    password,
+    mail_client=None,
+    *,
+    use_personal=False,
+    chatgpt_session_token=None,
+):
     """
     通过 Playwright 自动完成 Codex OAuth 登录。
     mail_client: CloudMailClient 实例，用于自动读取登录验证码。
     use_personal: 若为 True，则走"个人账号"流程 —— 不注入 Team _account cookie，
                   workspace 选择时跳过 Team 直接用 Personal。用于已退出 Team 的子账号生成 free plan 的 rt/at。
+    chatgpt_session_token: 注册阶段从 chatgpt.com 抽出的 __Secure-next-auth.session-token,
+                           在 use_personal=True 时注入 auth.openai.com 跳过 /log-in 表单。
+                           沿用 SessionCodexAuthFlow._inject_auth_cookies 的注入模式(主号专用扩展给子号)。
     返回 auth bundle: {access_token, refresh_token, id_token, account_id, email, plan_type}
+
+    Round 11 五轮 Option A — 两阶段 personal OAuth:
+      阶段 1(快路径):有 chatgpt_session_token → silent step-0 双域注入 + NextAuth refresh,
+                       直接 goto auth_url。注册→未踢出场景大部分用得上。
+                       拿到 plan_type=free 直接返回。
+      阶段 2(fresh re-login fallback):阶段 1 拿到 plan != free 或 bundle=None,
+                       说明 session_token 内嵌 user identity 锁死原 Team。清空 OAuth context
+                       所有 cookies,做一次完整 chatgpt.com 登录(keyboard.type 逐字符,
+                       绕过 React 灰按钮),拿 Personal-bound 全新 session,再走 OAuth → plan=free。
     """
     code_verifier, code_challenge = _generate_pkce()
     state = secrets.token_urlsafe(16)
@@ -282,7 +556,12 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
 
     auth_url = _build_auth_url(code_challenge, state)
 
-    logger.info("[Codex] 开始 OAuth 登录: %s", email)
+    logger.info(
+        "[Codex] 开始 OAuth 登录: %s (use_personal=%s, session_token=%s)",
+        email,
+        use_personal,
+        "yes" if chatgpt_session_token else "no",
+    )
 
     auth_code = None
 
@@ -293,12 +572,40 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         )
 
+        # Round 11 四轮 — Personal 模式 session_token 注入(silent step-0):
+        # 实测刚踢出 Team 的新号在 OAuth /log-in 页 fill email 后 Continue 按钮变灰禁用,
+        # login flow 永远卡在 email 步骤,bundle=None。根因疑似 Playwright fill() 的
+        # input 事件被 OpenAI auth /log-in React 表单的 anti-bot 检测识别。
+        # 单纯把 session_token 灌到 auth.openai.com 不够 —— NextAuth 对加密 token
+        # 跨域 issuer 校验严格,/oauth/authorize 不认 chatgpt.com 颁发的 token。
+        # 必须做"silent step-0":把 token 灌到 chatgpt.com 域,先 goto chatgpt.com
+        # 让服务端 _next-auth API 校验 session 并写一套配套 cookies(oai-did /
+        # __cflb / cf_clearance / _puid 等),然后再 goto auth_url。OpenAI auth
+        # backend 看到来自 chatgpt.com 的有效会话引荐 → 直接跳过 /log-in 进 consent。
+        # 同时 auth.openai.com 域也注入一份(冗余兜底),双域同步 SessionCodexAuthFlow。
+        if use_personal and chatgpt_session_token:
+            _inject_personal_session_cookies(context, chatgpt_session_token)
+            logger.info(
+                "[Codex] personal 模式注入 __Secure-next-auth.session-token (len=%d) 到 chatgpt.com + auth.openai.com",
+                len(chatgpt_session_token),
+            )
+
         # === Step 0: 先登录 ChatGPT 并切换到 Team workspace ===
-        # 仅 Team 模式需要:登录前注入 _account cookie 引导登录进入 Team workspace。
-        # personal 模式 chatgpt_account_id="" 无 cookie 可注入,step-0 反而会留下半成品
-        # session(新账号 ChatGPT 登录 12s 内通常走不完) → auth_url 在同 context 下会看到
-        # "欢迎回来"页,邮箱灰禁、consent 循环误点 Continue → OpenAI 返回 Operation timed out。
-        # 所以 personal 模式直接跳过 step-0,auth_url 在干净 context 里自己走邮箱/密码/OTP。
+        # Team 模式:登录前注入 _account cookie 引导登录进入 Team workspace。
+        #
+        # Round 11 三轮 — Personal 模式也需要 step-0:
+        # 历史注释说"personal 模式跳过 step-0 因为 chatgpt_account_id="" 无 cookie 可注入"。
+        # 但实测发现刚踢出 Team 的新号在 OpenAI auth backend 端 oai-oauth-session.workspaces=[]
+        # (server-side 状态),直接走 auth_url 时 /oauth/authorize → /log-in → 永远循环,
+        # 即便 consent loop 点 10 次 Continue,URL 仍卡在 /log-in 没有 auth_code。
+        #
+        # 根因:OpenAI 只在用户在 chatgpt.com 实际登录后才在 OAuth session 端 populate workspaces。
+        # 新号注册流走 chatgpt.com 是另一个 browser context;OAuth 这个新 context 第一次访问
+        # auth.openai.com,session 端没有任何 workspace 关联 → /oauth/authorize 拒绝颁 token。
+        #
+        # 修复:personal 模式也走 step-0,先 chatgpt.com 登录建立 Personal workspace 上下文,
+        # auth.openai.com session 端 workspaces[] 被 populate 后,auth_url 即可正常 consent。
+        # 区别:不注入 _account cookie(没有 Team workspace_id),让 chatgpt.com 自动用 Personal。
 
         # 在登录开始前记录当前最新邮件 ID,后续只接受比这个更新的
         _email_id_before_login = 0
@@ -311,7 +618,72 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
                 pass
 
         if use_personal:
-            logger.info("[Codex] personal 模式: 跳过 step-0 ChatGPT 预登录,直接走 auth_url")
+            if chatgpt_session_token:
+                # Round 11 四轮 — silent step-0:cookie 已注入双域,只需 goto chatgpt.com
+                # 让服务端 next-auth API 校验 session 并写齐配套 cookies(oai-did / _puid /
+                # __cflb 等),OpenAI auth backend 看到来自 chatgpt.com 的有效会话引荐 →
+                # /oauth/authorize 不再走 /log-in 表单,直接 consent。
+                #
+                # 进一步:踢出 Team 后,session_token 内 user.workspace 字段还指向 Team,
+                # OAuth 仍拿到 plan_type=team。call /api/auth/session 强制 NextAuth 刷新
+                # session,把 user.workspace 切到 Personal。然后再走 OAuth 才能拿 plan=free。
+                logger.info("[Codex] personal 模式 silent step-0: cookie 注入后访问 chatgpt.com 验证 session...")
+                _silent_page = context.new_page()
+                try:
+                    _silent_page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(5)
+                    # 过 Cloudflare(若有)
+                    for _i in range(8):
+                        html_lower = _silent_page.content()[:2000].lower()
+                        if "verify you are human" not in html_lower and "challenge" not in (_silent_page.url or "").lower():
+                            break
+                        logger.info("[Codex] silent step-0 等待 Cloudflare... (%ds)", _i * 5)
+                        time.sleep(5)
+
+                    # 强制 NextAuth session refresh:踢出 Team 后必须刷新 user.workspace
+                    # 才能让 OAuth 拿 plan=free 而非缓存的 plan=team。
+                    try:
+                        refresh_resp = _silent_page.evaluate(
+                            """
+                            async () => {
+                                const r = await fetch('/api/auth/session?update', { credentials: 'include', cache: 'no-store' });
+                                const ct = r.headers.get('content-type') || '';
+                                if (!ct.includes('application/json')) return { ok: r.ok, status: r.status, raw: 'non-json' };
+                                const data = await r.json();
+                                return { ok: r.ok, status: r.status, hasUser: !!data?.user, plan: data?.user?.plan ?? null };
+                            }
+                            """
+                        )
+                        logger.info("[Codex] silent step-0 NextAuth session refresh 结果: %s", refresh_resp)
+                    except Exception as refresh_exc:
+                        logger.warning("[Codex] silent step-0 NextAuth refresh 异常(忽略): %s", refresh_exc)
+
+                    # 再调一次 backend-api/accounts/check,触发 server-side workspace 重新判定
+                    try:
+                        accounts_resp = _silent_page.evaluate(
+                            """
+                            async () => {
+                                const r = await fetch('/backend-api/accounts/check', { credentials: 'include', cache: 'no-store' });
+                                return { status: r.status };
+                            }
+                            """
+                        )
+                        logger.info("[Codex] silent step-0 accounts/check 结果: %s", accounts_resp)
+                    except Exception as ck_exc:
+                        logger.debug("[Codex] silent step-0 accounts/check 异常(忽略): %s", ck_exc)
+
+                    cur = _silent_page.url or ""
+                    logger.info("[Codex] silent step-0 完成 URL: %s", cur[:120])
+                    _screenshot(_silent_page, "codex_00b_silent_session_validate.png")
+                except Exception as exc:
+                    logger.warning("[Codex] silent step-0 异常(继续走 OAuth): %s", exc)
+                finally:
+                    try:
+                        _silent_page.close()
+                    except Exception:
+                        pass
+            else:
+                logger.info("[Codex] personal 模式: 无 session_token,跳过 step-0,直接走 auth_url")
         else:
             if chatgpt_account_id:
                 context.add_cookies(
@@ -630,6 +1002,77 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
             except Exception as e:
                 logger.error("[Codex] about-you 处理失败: %s", e)
 
+        # Round 11 三轮 — Personal 模式: pre-consent workspace_select.
+        # 历史:
+        #   Round 8 加 explicit workspace_select 是因为"default 不会自动 unset"研究结论,
+        #   想强制把 default 切到 Personal 再 consent。
+        #   Round 11 二轮把 workspace_select 前置到 consent loop 之前,绕过"consent loop 1-2
+        #   步抓到 auth_code → workspace_select 永远不被调用"的 bug。
+        #
+        # Round 11 三轮发现:刚踢出 Team 的新号在 OpenAI auth backend 端
+        # `oai-oauth-session.workspaces=[]`(server-side 状态),/workspace UI 显示
+        # "Workspaces not found in client auth session" 错误。force_select_personal_via_ui
+        # 把浏览器 goto /workspace,落在错误页 → consent loop 找不到 consent button →
+        # 永远 bundle=None,5 次外层重试全失败。
+        #
+        # 修复:把 pre-consent workspace_select 改成"尽力而为"——
+        #   1. 如果 workspaces[] 非空,正常 POST /api/accounts/workspace/select 切 personal
+        #   2. 如果 workspaces[] 空(刚踢出场景),不再 goto /workspace UI(肯定错),而是直接
+        #      跳过 → 让 consent loop 在 auth_url 上自然运行。OAuth backend 用 default
+        #      workspace 颁 token,如果 plan!=free,外层 5 次重试 + bundle plan_type 校验
+        #      会拦下来,等后端最终一致性同步(回归 Round 4/e760be9 8s sleep 行为)
+        #   3. 任何情况 finally 强制 goto auth_url,确保 consent loop 入口正确
+        if use_personal:
+            try:
+                from autoteam.oauth_workspace import (
+                    ensure_personal_workspace_selected as _pre_consent_ws_select,
+                )
+
+                # 用当前页面状态(login + about-you 完成,session cookie 已建立)调 workspace/select.
+                # auth_url 作为 fallback 的 base 用,正常成功不会用到.
+                pre_ws_ok, pre_ws_fail, pre_ws_ev = _pre_consent_ws_select(
+                    page,
+                    consent_url=auth_url,
+                    skip_ui_fallback_on_empty=True,  # Round 11 三轮 — 空 workspaces[] 不再 goto /workspace UI
+                )
+                if pre_ws_ok:
+                    logger.info(
+                        "[Codex] Personal mode pre-consent workspace_select 成功 — "
+                        "后续 consent 应颁 plan=free token"
+                    )
+                else:
+                    logger.warning(
+                        "[Codex] Personal mode pre-consent workspace_select 失败 "
+                        "fail_category=%s evidence=%s,继续走 consent loop(由外层重试兜底)",
+                        pre_ws_fail,
+                        json.dumps(pre_ws_ev, ensure_ascii=False)[:300],
+                    )
+                _screenshot(page, "codex_03e_pre_consent_workspace_select.png")
+            except Exception as exc:
+                logger.warning(
+                    "[Codex] Personal mode pre-consent workspace_select 异常: %s,"
+                    "继续 consent loop",
+                    exc,
+                )
+
+            # Round 11 三轮 — 仅在浏览器停留在 /workspace 错误页时导航回 auth_url。
+            # /workspace 路径出错(force_select_personal_via_ui 走该 URL 但 server 返
+            # "Workspaces not found in client auth session"),consent loop 找不到按钮永远 bundle=None。
+            # 但若浏览器在 /log-in / /password / about-you 等正常 OAuth 流程页,goto(auth_url) 会
+            # **重置** login 表单状态(email/password 输入清空),consent loop 再也跑不通。
+            # 所以只针对已知的 /workspace 错误页恢复,其他保持 page 当前状态让流程自然跑完。
+            try:
+                current_url = (page.url or "")
+                if "/workspace" in current_url:
+                    logger.info(
+                        "[Codex] pre-consent 后浏览器停在 /workspace 错误页,导航回 auth_url 恢复 consent flow (current_url=%s)",
+                        current_url[:120],
+                    )
+                    page.goto(auth_url, wait_until="domcontentloaded", timeout=15000)
+                    time.sleep(2)
+            except Exception as exc:
+                logger.warning("[Codex] 导航回 auth_url 失败: %s,consent loop 仍尝试", exc)
+
         # 处理多个授权/同意页面（可能有多步）
         for step in range(10):
             if auth_code:
@@ -643,6 +1086,49 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
 
             # 在任何页面中，如果有 workspace/组织选择，先选 Team（personal 模式下选个人）
             try:
+                # Round 11 — 与 cnitlrt/AutoTeam upstream codex_auth.py:772-815 对齐:
+                # consent loop 每个 step 起始先用 upstream-style 健壮检测,避免页面变 workspace
+                # 选择页时被当成 "consent button 不可见" → break → 30s callback 等待白白消耗。
+                # Team 模式优先用 upstream helper;personal 模式留给 ensure_personal_workspace_selected
+                # 在 consent loop 之后兜底(L916+)。
+                if not use_personal:
+                    from autoteam.oauth_workspace import (
+                        _is_workspace_selection_page as _ws_is_selection_page,
+                    )
+                    from autoteam.oauth_workspace import (
+                        _select_team_workspace as _ws_select_team,
+                    )
+
+                    workspace_name_upstream = get_chatgpt_workspace_name()
+                    if _ws_is_selection_page(page):
+                        _screenshot(page, f"codex_04_workspace_{step + 1}_before.png")
+                        logger.info(
+                            "[Codex] 检测到工作空间选择页 (step %d, upstream),尝试选择: %s",
+                            step + 1,
+                            workspace_name_upstream,
+                        )
+                        upstream_selected = _ws_select_team(page, workspace_name_upstream)
+                        _screenshot(page, f"codex_04_workspace_{step + 1}_after.png")
+                        if upstream_selected:
+                            # 选完 workspace 后点"继续"按钮提交
+                            try:
+                                cont_btn = page.locator(
+                                    'button:has-text("继续"), button:has-text("Continue")'
+                                ).first
+                                if cont_btn.is_visible(timeout=3000):
+                                    cont_btn.click()
+                                    time.sleep(3)
+                                    logger.info("[Codex] 已点击继续 (step %d, upstream)", step + 1)
+                            except Exception:
+                                pass
+                            continue
+                        else:
+                            logger.warning(
+                                "[Codex] upstream-style 无法选择 workspace '%s' (step %d),回退现有 JS/locator 路径",
+                                workspace_name_upstream,
+                                step + 1,
+                            )
+
                 page_text = page.inner_text("body")[:1000]
 
                 # personal 模式：检测到工作空间选择页时，直接选 Personal
@@ -672,7 +1158,7 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
                             pass
                         continue
 
-                # 选择 Team workspace（用配置的名称精确匹配）
+                # 选择 Team workspace（用配置的名称精确匹配）— upstream-style 检测失败后的 JS/locator 兜底
                 workspace_name = "" if use_personal else get_chatgpt_workspace_name()
                 # 检测"选择一个工作空间"页面，点击 Team workspace
                 if workspace_name and (
@@ -758,7 +1244,7 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
                     except Exception:
                         pass
 
-                # Organization 页面的下拉选择
+                # Organization 页面的下拉选择 — 与 upstream codex_auth.py:798-813 对齐
                 if "organization" in page.url:
                     dropdown = page.locator("[aria-expanded], [aria-haspopup]").first
                     if dropdown.is_visible(timeout=2000):
@@ -907,8 +1393,10 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
             except Exception:
                 break
 
-        # Round 8 — SPEC-2 v1.5 §3.4.7 + shared/oauth-workspace-selection.md §4.1:
-        # personal OAuth 需要在 consent 循环之后、callback 之前**主动**选 personal workspace,
+        # Round 11 二轮 — pre-consent workspace_select 已前置(line 632+);此处作为兜底:
+        # consent loop 自然结束(auth_code 未抓到,可能 workspace_select 仍未触发后端 default 切换)
+        # 时再调一次 workspace_select。
+        # Round 8 原始动机:personal OAuth 需要在 callback 之前**主动**选 personal workspace,
         # 否则 issuer 按 default_workspace_id(sticky 指向 Team)颁 token,拿到 plan_type=team。
         # 三层兜底:HTTP /api/accounts/workspace/select(主路径)→ Playwright UI fallback →
         # 失败则返回 fail_category 由外层 5 次重试承担。
@@ -921,6 +1409,7 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
                 ws_ok, ws_fail_category, ws_evidence = ensure_personal_workspace_selected(
                     page,
                     consent_url=consent_url_for_select,
+                    skip_ui_fallback_on_empty=True,  # Round 11 三轮 — 同 pre-consent
                 )
                 if ws_ok:
                     logger.info("[Codex] personal workspace 选择成功,继续等 callback")
@@ -975,33 +1464,242 @@ def login_codex_via_browser(email, password, mail_client=None, *, use_personal=F
                 pass
             raise
 
+        # Round 11 五轮 Option A — 阶段 1 完成,先尝试 exchange + plan 校验
+        # 校验在 with sync_playwright() 块内做,失败时可以直接 fallback 到阶段 2
+        # (使用同一 context,清空 cookies 后重新登录)而不需要重新启动 Playwright。
+        stage1_bundle = None
+        if auth_code:
+            stage1_bundle = _exchange_auth_code(auth_code, code_verifier, fallback_email=email)
+            if stage1_bundle:
+                stage1_plan = (stage1_bundle.get("plan_type") or "").lower()
+                logger.info(
+                    "[Codex] 阶段 1 OAuth 完成: plan_type=%s account_id=%s",
+                    stage1_plan or "unknown",
+                    stage1_bundle.get("account_id"),
+                )
+
+        # 阶段 1 直接成功的判断:Team 路径不校验 plan,有 bundle 即可;
+        # personal 路径仅 plan == "free" 算阶段 1 真成功。
+        stage1_ok = bool(stage1_bundle) and (
+            (not use_personal) or (stage1_bundle.get("plan_type") or "").lower() == "free"
+        )
+
+        # 阶段 2 触发条件 — 仅 personal 模式 + 阶段 1 失败(bundle=None 或 plan != free)
+        # 触发后:context.clear_cookies() + fresh chatgpt.com login + 重新走 OAuth
+        if (not stage1_ok) and use_personal:
+            stage1_plan = (
+                (stage1_bundle.get("plan_type") or "").lower() if stage1_bundle else "none"
+            )
+            logger.warning(
+                "[Codex] 阶段 1 拿到 plan=%s(期望 free)bundle=%s,触发阶段 2 fresh re-login fallback",
+                stage1_plan,
+                "yes" if stage1_bundle else "no",
+            )
+
+            # === 阶段 2 入口 ===
+            # 1) 清空 cookies + fresh chatgpt.com login(用 keyboard.type 绕过灰按钮)
+            relogin_ok = _perform_fresh_relogin_in_context(
+                context,
+                email,
+                password,
+                mail_client,
+                used_email_ids=_used_email_ids,
+            )
+            if not relogin_ok:
+                logger.warning("[Codex] 阶段 2 fresh re-login 未成功,放弃")
+                browser.close()
+                return None
+
+            # 2) 重新生成 PKCE + state(原 auth_code 已 used,新 OAuth 必须用新 code_verifier)
+            stage2_code_verifier, stage2_code_challenge = _generate_pkce()
+            stage2_state = secrets.token_urlsafe(16)
+            stage2_auth_url = _build_auth_url(stage2_code_challenge, stage2_state)
+
+            # 3) 重新走 OAuth — 在同一 context 内开新 page 监听 callback
+            stage2_auth_code = None
+
+            def _on_request_stage2(request):
+                nonlocal stage2_auth_code
+                url = request.url
+                if f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" in url:
+                    parsed = urllib.parse.urlparse(url)
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    stage2_auth_code = qs.get("code", [None])[0]
+                    if stage2_auth_code:
+                        logger.info("[Codex] 阶段 2 捕获到 auth code!")
+
+            def _on_response_stage2(response):
+                nonlocal stage2_auth_code
+                url = response.url
+                if (
+                    f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" in url
+                    and not stage2_auth_code
+                ):
+                    parsed = urllib.parse.urlparse(url)
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    stage2_auth_code = qs.get("code", [None])[0]
+                    if stage2_auth_code:
+                        logger.info("[Codex] 阶段 2 从 response 捕获到 auth code!")
+
+            stage2_page = context.new_page()
+            stage2_page.on("request", _on_request_stage2)
+            stage2_page.on("response", _on_response_stage2)
+            try:
+                stage2_page.goto(stage2_auth_url, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(3)
+                _screenshot(stage2_page, "codex_relogin_06_oauth_start.png")
+
+                # 因为 context 现在持有 fresh Personal-bound session,
+                # /oauth/authorize 通常直接进 consent。
+                # 简化的 consent loop(沿用现有 page 的 consent 处理逻辑)
+                for s2_step in range(10):
+                    if stage2_auth_code:
+                        break
+
+                    # add-phone 探针
+                    try:
+                        assert_not_blocked(stage2_page, f"oauth_consent_stage2_{s2_step}")
+                    except Exception:
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
+                        raise
+
+                    _screenshot(stage2_page, f"codex_relogin_07_consent_step{s2_step + 1}.png")
+
+                    # workspace 选择页(personal 路径)
+                    try:
+                        page_text = stage2_page.inner_text("body")[:1000]
+                        if (
+                            "选择一个工作空间" in page_text
+                            or "Select a workspace" in page_text
+                            or "选择工作空间" in page_text
+                        ):
+                            logger.info("[Codex] 阶段 2 检测到 workspace 选择页 (step %d)", s2_step + 1)
+                            try:
+                                personal_btn = stage2_page.locator("text=/个人|Personal/").first
+                                if personal_btn.is_visible(timeout=2000):
+                                    personal_btn.click(force=True)
+                                    time.sleep(1)
+                                    cont_btn = stage2_page.locator(
+                                        'button:has-text("继续"), button:has-text("Continue")'
+                                    ).first
+                                    if cont_btn.is_visible(timeout=3000):
+                                        cont_btn.click()
+                                        time.sleep(3)
+                                    continue
+                            except Exception as exc:
+                                logger.warning("[Codex] 阶段 2 选 Personal 失败: %s", exc)
+                    except Exception:
+                        pass
+
+                    # 同意/继续按钮
+                    try:
+                        consent_btn = stage2_page.locator(
+                            'button:has-text("继续"), button:has-text("Continue"), button:has-text("Allow")'
+                        ).first
+                        if consent_btn.is_visible(timeout=5000):
+                            logger.info("[Codex] 阶段 2 点击同意按钮 (step %d)", s2_step + 1)
+                            consent_btn.click()
+                            time.sleep(5)
+                        else:
+                            break
+                    except Exception:
+                        break
+
+                # 等 callback
+                for _ in range(30):
+                    if stage2_auth_code:
+                        break
+                    try:
+                        cur2 = stage2_page.url
+                        if f"localhost:{CODEX_CALLBACK_PORT}/auth/callback" in cur2:
+                            parsed = urllib.parse.urlparse(cur2)
+                            qs = urllib.parse.parse_qs(parsed.query)
+                            stage2_auth_code = qs.get("code", [None])[0]
+                            if stage2_auth_code:
+                                logger.info("[Codex] 阶段 2 从 URL 捕获到 auth code!")
+                                break
+                    except Exception:
+                        pass
+                    time.sleep(1)
+
+                if not stage2_auth_code:
+                    _screenshot(stage2_page, "codex_relogin_08_no_callback.png")
+                    logger.warning(
+                        "[Codex] 阶段 2 未获取到 auth code,当前 URL: %s",
+                        (stage2_page.url or "")[:120],
+                    )
+            finally:
+                try:
+                    stage2_page.close()
+                except Exception:
+                    pass
+
+            browser.close()
+
+            if not stage2_auth_code:
+                logger.warning("[Codex] 阶段 2 OAuth 失败,放弃")
+                return None
+
+            stage2_bundle = _exchange_auth_code(
+                stage2_auth_code, stage2_code_verifier, fallback_email=email
+            )
+            if not stage2_bundle:
+                logger.warning("[Codex] 阶段 2 _exchange_auth_code 失败")
+                return None
+
+            stage2_plan = (stage2_bundle.get("plan_type") or "").lower()
+            logger.info(
+                "[Codex] 阶段 2 OAuth 完成: plan_type=%s account_id=%s",
+                stage2_plan or "unknown",
+                stage2_bundle.get("account_id"),
+            )
+
+            if stage2_plan != "free":
+                logger.warning(
+                    "[Codex] 阶段 2 仍拿到 plan_type=%s(期望 free),返回 None 由外层 5 次重试兜底",
+                    stage2_plan or "unknown",
+                )
+                return None
+
+            return stage2_bundle
+
+        # 阶段 1 通过(非 personal 或 plan == free) — 走原退出路径
         browser.close()
 
     if not auth_code:
         logger.error("[Codex] OAuth 登录失败: 未获取到 authorization code")
         return None
 
-    bundle = _exchange_auth_code(auth_code, code_verifier, fallback_email=email)
-    if not bundle:
+    if not stage1_bundle:
         return None
 
     # Personal 模式强校验 plan_type:当子号还挂在 Team workspace(OpenAI 后端 kick 同步延迟 /
     # default workspace 为 Team)时,auth.openai.com 会默认选 Team 颁发 token,拿到 plan_type=team
     # 的 bundle —— 这个 token 绑在 Team account_id 上,一旦子号离开 Team 就作废(refresh 401),
     # 本地却标成 PERSONAL,用户看到的是"可用免费号"但 Codex 跑不动。必须在这里拒收。
+    #
+    # Round 11 hotfix:本函数单次拒收返回 None,由 manager._run_post_register_oauth 外层 5 次重试承担
+    # (W-I9 spec — workspace/select 主路径成功但 callback 拿到 plan!=free 时,需进入外层重试触发
+    # 后端最终一致性,而非立即 fail-fast)。日志级别从 ERROR 调整为 WARNING,因为这不是真正的错误
+    # 而是预期的 retry 触发器。
+    #
+    # Round 11 五轮:阶段 1 plan != free 已在 with 块内被 stage2 fallback 拦截,
+    # 走到这里说明阶段 1 就是 plan == free(或非 personal 路径,无校验)。
     if use_personal:
-        plan = (bundle.get("plan_type") or "").lower()
+        plan = (stage1_bundle.get("plan_type") or "").lower()
         if plan != "free":
-            logger.error(
+            logger.warning(
                 "[Codex] personal 模式拿到 plan_type=%s(期望 free),account_id=%s。"
-                "说明账号仍在 Team workspace,OAuth 默认选了 Team → token 绑 Team 后会随踢出作废。"
-                "拒收本次 bundle,触发上游 oauth_failed 分类。",
+                "本次拒收(返回 None),由外层 5 次重试触发后端最终一致性同步。",
                 plan or "unknown",
-                bundle.get("account_id"),
+                stage1_bundle.get("account_id"),
             )
             return None
 
-    return bundle
+    return stage1_bundle
 
 
 def login_codex_via_session():
@@ -1659,20 +2357,32 @@ def _write_codex_smoke_cache(account_id, result):
             return
 
 
-def cheap_codex_smoke(access_token, account_id=None, *, timeout=15.0, force=False):
+def cheap_codex_smoke(
+    access_token,
+    account_id=None,
+    *,
+    model="gpt-5",
+    max_output_tokens=64,
+    timeout=15.0,
+    force=False,
+):
     """SPEC-2 shared/quota-classification §4.4 — uninitialized_seat 二次验证。
+    Round 11 升级:加 model + max_output_tokens 参数,读完整 SSE 拿真实对话内容。
 
-    对 codex backend 发一个最小推理请求(reasoning.effort=none + max_output_tokens=1 + stream),
-    只读第一帧 SSE 立即关流,不消耗多余 token。
+    对 codex backend 发一个推理请求(reasoning.effort=none + stream),读完整 SSE 帧
+    直到见到 response.completed,拼出 output_text 真实对话内容。
 
     Round 7 FR-D6:24h 去重 cache。account_id 在 24h 内已有 cache 时直接返回,不走网络;
     传 force=True 可绕过 cache(用于强制刷新场景)。
 
     返回 (result, detail):
-        ("alive", None)              — HTTP 200 + 第一帧含 response.created → 真活号
-        ("auth_invalid", reason)     — HTTP 401/403/429 / 4xx 含 quota 关键词 → token/seat 真失效
-        ("uncertain", reason)        — HTTP 5xx / network / timeout / 解析异常 → 保留原状态等下轮
+        ("alive", {model, response_text, raw_event, ...})  — HTTP 200 + response.completed → 真活号
+        ("alive", None) (cache hit only)                    — 24h cache 命中
+        ("auth_invalid", reason_str)  — HTTP 401/403/429 / 4xx 含 quota 关键词 → token/seat 真失效
+        ("uncertain", reason_str)     — HTTP 5xx / network / timeout / 解析异常 → 保留原状态等下轮
         cache 命中时 detail 为 "cache_hit_<原 result>"
+
+    向后兼容:不传 model 时默认 gpt-5;detail 在网络路径下升级为 dict(alive)/str(其他)。
     """
     if not access_token:
         return "auth_invalid", "empty_access_token"
@@ -1698,16 +2408,33 @@ def cheap_codex_smoke(access_token, account_id=None, *, timeout=15.0, force=Fals
                 return cached_result, f"cache_hit_{cached_result}"
 
     # cache miss / force=True — 调网络并写回 cache
-    result, detail = _cheap_codex_smoke_network(access_token, account_id, timeout=timeout)
+    result, detail = _cheap_codex_smoke_network(
+        access_token,
+        account_id,
+        model=model,
+        max_output_tokens=max_output_tokens,
+        timeout=timeout,
+    )
     _write_codex_smoke_cache(account_id, result)
     return result, detail
 
 
-def _cheap_codex_smoke_network(access_token, account_id, *, timeout=15.0):
-    """实际走网络的 cheap_codex_smoke 内部函数(Round 7 FR-D6 拆出)。
+def _cheap_codex_smoke_network(
+    access_token,
+    account_id,
+    *,
+    model="gpt-5",
+    max_output_tokens=64,
+    timeout=15.0,
+):
+    """实际走网络的 cheap_codex_smoke 内部函数(Round 7 FR-D6 拆出 + Round 11 加 model)。
 
     与 cheap_codex_smoke 不同点:不查也不写 cache,直接调 codex backend。
-    返回值语义同 cheap_codex_smoke。
+    Round 11:读完整 SSE 帧累积 output_text,见 response.completed 时返回 dict 含 response_text。
+
+    返回值语义:
+      alive 路径 detail = dict {"model", "response_text", "raw_event", "tokens"}
+      其他路径 detail = str
     """
     import requests
 
@@ -1720,9 +2447,9 @@ def _cheap_codex_smoke_network(access_token, account_id, *, timeout=15.0):
         headers["Chatgpt-Account-Id"] = account_id
 
     payload = {
-        "model": "gpt-5",
+        "model": model,
         "input": "ping",
-        "max_output_tokens": 1,
+        "max_output_tokens": max_output_tokens,
         "stream": True,
         "reasoning": {"effort": "none"},
     }
@@ -1776,14 +2503,45 @@ def _cheap_codex_smoke_network(access_token, account_id, *, timeout=15.0):
                 return "auth_invalid", f"http_{status_code}_quota_hint"
             return "uncertain", f"http_{status_code}"
 
-        # HTTP 200 — 读 SSE 第一帧
+        # HTTP 200 — 读完整 SSE 帧累积 output_text(Round 11)
+        response_text_parts = []
+        seen_created = False
+        completed_event = False
+        output_tokens = None
+        frames_read = 0
         try:
             for line in resp.iter_lines(decode_unicode=True):
                 if not line:
                     continue
+                frames_read += 1
+                # SSE 行通常为 "data: {...}" 或 "event: response.created" 等
+                # 先剥离 "data: " 前缀,失败按原文匹配
+                payload_text = line[6:].strip() if line.startswith("data: ") else line.strip()
                 if "response.created" in line:
-                    return "alive", None
-                # 安全兜底:读取多于 8 行仍未见 response.created 视为 uncertain
+                    seen_created = True
+                if "response.completed" in line:
+                    # 见 completed 帧结束读流
+                    completed_event = True
+                    # 尝试解析 token 数(usage.output_tokens)
+                    try:
+                        ev_obj = json.loads(payload_text)
+                        usage = (ev_obj.get("response") or {}).get("usage") or {}
+                        output_tokens = usage.get("output_tokens")
+                    except Exception:
+                        pass
+                    break
+                # 累积 output_text.delta 帧文本
+                if "response.output_text.delta" in line or "output_text.delta" in line:
+                    try:
+                        ev_obj = json.loads(payload_text)
+                        delta_str = ev_obj.get("delta")
+                        if isinstance(delta_str, str) and delta_str:
+                            response_text_parts.append(delta_str)
+                    except Exception:
+                        pass
+                # 安全兜底:30 帧仍未见 completed,跳出当作 alive(已 reach model)
+                if frames_read >= 30:
+                    break
         except Exception as exc:
             logger.debug("[Codex smoke] iter_lines 异常(uncertain): %s", exc)
             return "uncertain", f"stream:{type(exc).__name__}"
@@ -1793,7 +2551,22 @@ def _cheap_codex_smoke_network(access_token, account_id, *, timeout=15.0):
             except Exception:
                 pass
 
-        return "uncertain", "no_response_created_frame"
+        # 8 行内仍没拿到 response.created 视为 uncertain
+        if not seen_created and frames_read < 8:
+            return "uncertain", "no_response_created_frame"
+        if not seen_created:
+            return "uncertain", "no_response_created_frame"
+
+        response_text = "".join(response_text_parts)
+        raw_event = "response.completed" if completed_event else "no_completed_within_30_frames"
+        detail = {
+            "model": model,
+            "response_text": response_text,
+            "raw_event": raw_event,
+        }
+        if output_tokens is not None:
+            detail["tokens"] = output_tokens
+        return "alive", detail
     finally:
         try:
             resp.close()

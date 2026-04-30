@@ -167,7 +167,12 @@ def test_round8_team_branch_has_master_probe_pre_check():
     team_precheck_idx = src.index("run_post_register_oauth_team_precheck")
     nearby = src[team_precheck_idx:team_precheck_idx + 1500]
     assert "STATUS_AUTH_INVALID" in nearby
-    assert "remove_from_team" in nearby  # 主动 kick 释放席位
+    # Round 11 — kick 逻辑由 _kick_team_seat_after_oauth_failure helper 承担(内部仍调
+    # remove_from_team)。测试改为接受 helper 名字或直接 remove_from_team 调用,语义不变。
+    assert (
+        "_kick_team_seat_after_oauth_failure" in nearby
+        or "remove_from_team" in nearby
+    ), "Team 分支 master degraded 必须主动 kick 释放席位"
 
 
 def test_round8_team_branch_master_probe_uses_master_subscription_degraded_category():

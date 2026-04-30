@@ -8,10 +8,10 @@
 | 名称 | 账号生命周期与配额加固 实施规范 |
 | 主笔 | prd-lifecycle |
 | 时间 | 2026-04-26 |
-| 版本 | **v1.6 (2026-04-28 Round 9 — Account Usability + Retroactive State Correction;引用 state-machine v2.0(8 状态 + GRACE)+ master-subscription-health v1.1(retroactive 5 触发点 + grace 期 + endpoint 守恒);Approach B 决策落地)** |
-| 关联 PRD | [`../prd/prd-2-account-lifecycle.md`](../prd/prd-2-account-lifecycle.md) · [`../prd/prd-5-bug-fix-round.md`](../prd/prd-5-bug-fix-round.md) · [`../prd/prd-6-p2-followup.md`](../prd/prd-6-p2-followup.md) · `.trellis/tasks/04-27-master-team-degrade-oauth-rejoin/prd.md` (Round 8 PRD-7) · **`.trellis/tasks/04-28-account-usability-state-correction/prd.md` (Round 9 task,Approach B + 前端美化)** |
-| 引用 shared spec | [`./shared/plan-type-whitelist.md`](./shared/plan-type-whitelist.md) · [`./shared/quota-classification.md`](./shared/quota-classification.md) · [`./shared/add-phone-detection.md`](./shared/add-phone-detection.md) · [`./shared/account-state-machine.md`](./shared/account-state-machine.md) **v2.0(Round 9 BREAKING — STATUS_DEGRADED_GRACE)** · [`./shared/master-subscription-health.md`](./shared/master-subscription-health.md) **v1.1(Round 9 — §11 retroactive 5 触发点 + §12 grace 期 + §13 endpoint 守恒)** · [`./shared/oauth-workspace-selection.md`](./shared/oauth-workspace-selection.md) (Round 8) |
-| 覆盖 FR | A1~A5 / B1~B4 / C1~C5 / D1~D4 / E1~E4 / F1~F6 / G1~G4 / H1~H3 / **P0 / P1.1~P1.4(Round 6)** / **P2.1 / P2.5 / D6 / D7(Round 7)** / **M1~M4 / W1~W5(Round 8)** / **AC-B1~AC-B8(Round 9 Approach B)** |
+| 版本 | **v1.7.1 (2026-04-28 Round 11 二轮 — Master Grace 真 healthy 修复 + 实时探活 + OAuth 失败同步 KICK;引用 state-machine v2.1.1(转移矩阵 +OAuth 失败 KICK)+ master-subscription-health v1.4(§15 OAuth 连续失败 backoff)+ oauth-workspace-selection v1.1(§10 upstream-style consent loop helper 港口)+ realtime-probe v1.0;Approach A 决策落地)** |
+| 关联 PRD | [`../prd/prd-2-account-lifecycle.md`](../prd/prd-2-account-lifecycle.md) · [`../prd/prd-5-bug-fix-round.md`](../prd/prd-5-bug-fix-round.md) · [`../prd/prd-6-p2-followup.md`](../prd/prd-6-p2-followup.md) · `.trellis/tasks/04-27-master-team-degrade-oauth-rejoin/prd.md` (Round 8 PRD-7) · `.trellis/tasks/04-28-account-usability-state-correction/prd.md` (Round 9 task,Approach B + 前端美化) · **`.trellis/tasks/04-28-round11-master-resub-models-validate/prd.md` (Round 11 task,Approach A — master_health subscription_grace + 实时探活)** |
+| 引用 shared spec | [`./shared/plan-type-whitelist.md`](./shared/plan-type-whitelist.md) · [`./shared/quota-classification.md`](./shared/quota-classification.md) · [`./shared/add-phone-detection.md`](./shared/add-phone-detection.md) · [`./shared/account-state-machine.md`](./shared/account-state-machine.md) **v2.1.1(Round 11 二轮 — §4.1 转移矩阵 +OAuth 失败 KICK 4 行)** · [`./shared/master-subscription-health.md`](./shared/master-subscription-health.md) **v1.4(Round 11 二轮 — §15 OAuth 连续失败 backoff)** · [`./shared/oauth-workspace-selection.md`](./shared/oauth-workspace-selection.md) **v1.1(Round 11 二轮 — §10 upstream-style consent loop helper 港口)** · **[`./shared/realtime-probe.md`](./shared/realtime-probe.md) v1.0(Round 11 — 子号 + 母号实时探活)** |
+| 覆盖 FR | A1~A5 / B1~B4 / C1~C5 / D1~D4 / E1~E4 / F1~F6 / G1~G4 / H1~H3 / **P0 / P1.1~P1.4(Round 6)** / **P2.1 / P2.5 / D6 / D7(Round 7)** / **M1~M4 / W1~W5(Round 8)** / **AC-B1~AC-B8(Round 9 Approach B)** / **Round 11 AC1~AC9** |
 
 ---
 
@@ -1075,6 +1075,8 @@ async function removeAccount(email: string) {
 | M-T4 | `api.py:get_admin_diagnose`(`/api/admin/diagnose` 现有 4-probe 旁挂) | 返回 `master_subscription_state` 字段;支持 `?force_refresh=1` |
 | M-T5 | `manager.py:cmd_reconcile` 入口 | reconcile 仅做"扫描不动作",日志告警 + 不执行 KICK / state flip(M-I10 不变量) |
 
+**Round 11 v1.7 — fail-fast 触发条件补充**:M-T1 / M-T2 / M-T3 的 fail-fast 仅在 `healthy == False` 时触发。Round 11 master-subscription-health v1.2 §14 引入 `subscription_grace`(healthy=True)新状态后,grace 期内 master_health 返回 `(True, "subscription_grace")` → `not healthy` 为 False → **自动跳过 fail-fast**,不需修改 api.py / manager.py 任何代码(M-I3 v1.2 形式 — `healthy=True ⇔ reason ∈ ("active", "subscription_grace")`)。具体决策矩阵详见 master-subscription-health v1.2 §14.2。
+
 **register_failures.json schema 影响**:新增 category `master_subscription_degraded`(spec-2 v1.5 RegisterFailureRecord enum 扩)。
 
 **accounts.json 影响**:不新增账号字段;新增 `accounts/.master_health_cache.json` 缓存文件(schema_version + cache by master account_id),5 min TTL,与 `accounts.json` 同 file-lock。
@@ -1082,6 +1084,141 @@ async function removeAccount(email: string) {
 **详见**:[`./shared/master-subscription-health.md`](./shared/master-subscription-health.md)(完整三层探针 / 6 reason 枚举 / 5 误判缓解 / 10 不变量 M-I1~I10 / 单元测试 fixture)。
 
 **与 §3.4.7 的串联**:M-T1 / M-T2 healthy=False → 不进 OAuth → 不调 §3.4.7 workspace/select;M-T1 healthy=True → 进 OAuth → §3.4.7 显式选 personal → callback。两者前后串联,master health 是 personal 流程的前置门控。
+
+### 3.8 OAuth 失败时同步 KICK Team workspace 席位(Round 11 二轮 — M-MA-helper)
+
+**位置**:`src/autoteam/manager.py:1556-1588` 函数 `_kick_team_seat_after_oauth_failure(email, *, reason)`;接入点 5 处 `_run_post_register_oauth` 函数体 OAuth 失败位点(`manager.py:1873/1898/1905/1938/2014`)。
+
+#### Scope / Trigger
+
+任何 `_run_post_register_oauth` Team 分支的 OAuth 失败位点,只要走 STATUS_AUTH_INVALID 路径(子号已成功 invite 入 Team workspace,无法再 delete_account),都必须**同步**调用 `_kick_team_seat_after_oauth_failure(email, reason)`,把 workspace 席位释放,而不是等 reconcile 5min 后异步清理。
+
+5 触发位点(line 号准确):
+
+| # | 文件:行号 | 失败原因常量 | reason 实参 |
+|---|---|---|---|
+| MA-1 | `manager.py:1873` | master 母号订阅 cancelled(fail-fast)| `"master_degraded"` |
+| MA-2 | `manager.py:1898` | OAuth 阶段触发 add-phone(`RegisterBlocked.is_phone=True`)| `"register_blocked_phone"` |
+| MA-3 | `manager.py:1905` | unexpected RegisterBlocked(非 phone)| `"register_blocked_unexpected"` |
+| MA-4 | `manager.py:1938` | bundle plan_type 不在白名单(`plan_supported=False`)| `"plan_unsupported"` |
+| MA-5 | `manager.py:2014` | OAuth bundle 缺失(`login_codex_via_browser` 返回 None — 最常见路径)| `"bundle_missing"` |
+
+#### Signatures
+
+```python
+# src/autoteam/manager.py:1556
+def _kick_team_seat_after_oauth_failure(email: str, *, reason: str) -> None:
+    """OAuth 失败时同步 KICK ws,消除 'workspace 有 + 本地 auth 缺失' 残废延迟。
+
+    Args:
+        email: 失败子号 email
+        reason: 失败原因短文案(写入 log 让事后排查能定位失败位点)
+    Returns:
+        None — 异常时只 logger.warning 不传播(reconcile 兜底)
+    """
+```
+
+#### Contracts
+
+| 维度 | 行为 |
+|---|---|
+| 输入 | `email: str`(必须有效非空),`reason: str`(短文案,见上 5 个枚举)|
+| 行为序列 | 1) 实例化 `ChatGPTTeamAPI()` → 2) `cleanup_api.start()` → 3) `remove_from_team(cleanup_api, email, return_status=True)` → 4) `cleanup_api.stop()` |
+| 副作用 | workspace 中 `email` 子号被 KICK(若主号 admin session 有效);写一条 `[注册] OAuth 失败(<reason>) → kick Team 残留席位 <email> status=<kick_status>` log |
+| 异常处理 | 任何步骤抛异常 → 外层 `except Exception` 吞掉 + `logger.warning("[注册] OAuth 失败(%s) 后 kick %s 抛异常(留给下次对账): %s", ...)`;`stop()` 在 `finally` 内,即使 `remove_from_team` 抛异常仍执行 |
+| 不变量 | 不传播任何异常到调用方(避免 KICK 失败覆盖 OAuth 失败的 main `update_account(status=AUTH_INVALID)` 状态写入)|
+| reconcile 兜底 | 即使 KICK 失败,reconcile 5min 后会再次扫到 "workspace 有 + 本地 auth_invalid" 残废态 → 重试 KICK,不会永久残留 |
+
+#### Validation & Error Matrix
+
+| 异常路径 | 处理 | 期望最终状态 |
+|---|---|---|
+| `ChatGPTTeamAPI()` 构造抛(罕见,内部 import 失败)| 外层 `except Exception` 吞,`logger.warning` | KICK 未发生,reconcile 5min 后兜底 |
+| `cleanup_api.start()` 抛(主号 session 失效)| 同上 | 同上 |
+| `remove_from_team` 抛(网络 / 5xx / token revoked)| 同上,`stop()` 在 `finally` 仍执行 | 同上 |
+| `remove_from_team` 返回 `"failed"`(404 / 403,席位早不存在)| 不抛,记 `kick_status=failed` info log | 视为已处理 |
+| `cleanup_api.stop()` 抛(罕见)| 内层 `try/except Exception: pass` 吞 | 不影响主流程 |
+
+#### Good / Base / Bad Cases
+
+**Good case**(MA-5 bundle_missing,helper 完整成功):
+1. `_run_post_register_oauth` Team 分支 → `login_codex_via_browser` 返回 None
+2. `update_account(email, status=AUTH_INVALID, workspace_account_id=master_aid)` 落盘
+3. `_kick_team_seat_after_oauth_failure(email, reason="bundle_missing")` → KICK 成功
+4. workspace 中 `email` 即时移除 → 不污染下一轮 `fetch_team_state`
+
+**Base case**(MA-1 master_degraded,helper 静默失败由 reconcile 兜底):
+1. master 母号订阅 cancel → `is_master_subscription_healthy` 返回 `(False, "subscription_cancelled", ...)`
+2. `update_account(email, status=AUTH_INVALID)` 落盘
+3. helper 内 `cleanup_api.start()` 因 master session 也 401 抛 → `logger.warning` 不传播
+4. 5 min 后 reconcile 扫到该子号(workspace 有 + auth_invalid)→ 再次 KICK
+
+**Bad case**(KICK 后 OAuth 流程其它 update_account 仍能成功):
+- 假设 helper 抛了 RuntimeError,但 helper 内吞掉 → 调用方 `_run_post_register_oauth` 继续走 `_record_outcome` + `return None`(MA-2/3/4)或 `return email`(MA-5)
+- **关键防御**:helper 异常**不能**覆盖 main flow 的 status update —— 所以必须吞异常,不传播
+
+#### Tests Required
+
+测试文件:`tests/unit/test_round11_oauth_failure_kick_ws.py`(5 cases)
+
+| Case | 文件:测试名 | 关键断言 |
+|---|---|---|
+| MA-T1 helper 调用契约 | `TestKickHelperContract.test_kick_helper_calls_remove_from_team_with_email` | `mock_remove.call_args[0][1] == "fail@x.com"` + `kwargs["return_status"] is True`;`api.start()` + `api.stop()` 都被调 |
+| MA-T2 helper 吞异常 | `TestKickHelperContract.test_kick_helper_swallows_exceptions` | `remove_from_team` 抛 `RuntimeError("net err")` → helper 调用不抛;`stop()` 仍因 `finally` 被调 |
+| MA-T3 reason 写入 warning | `TestKickHelperContract.test_kick_helper_logs_reason_in_warning` | `ChatGPTTeamAPI()` 构造抛 `ConnectionError` → warning log 含 reason 字符串 + email |
+| MA-T4 bundle_missing 触发位点 | `TestRunPostRegisterOauthKicksWs.test_run_post_register_oauth_bundle_missing_kicks_ws` | helper 被 mock 调用 1 次,`kwargs["reason"] == "bundle_missing"`;状态终态 = AUTH_INVALID;`return == email`(`team_auth_missing` outcome)|
+| MA-T5 plan_unsupported 触发位点 | `TestRunPostRegisterOauthKicksWs.test_run_post_register_oauth_plan_unsupported_kicks_ws` | helper 被 mock 调用 1 次,`kwargs["reason"] == "plan_unsupported"`;状态终态 = AUTH_INVALID;`return is None`(`plan_unsupported` outcome) |
+
+#### Wrong vs Correct
+
+**Wrong example**(裸 `update_account` 不 KICK):
+
+```python
+# manager.py:1938 之前(若误用此模式):
+update_account(email, status=STATUS_AUTH_INVALID, ...)
+# ❌ 没调 helper → workspace 残留 5 min 才被 reconcile 清理
+# 此期间该 email 仍在 workspace 占席位,fetch_team_state 拿到 X 条
+# 但本地 auth_invalid → sync_account_states 误判混乱
+return None
+```
+
+**Correct example**(配对调用 update_account + helper):
+
+```python
+# manager.py:1937-1940:
+update_account(
+    email,
+    status=STATUS_AUTH_INVALID,
+    seat_type="codex",
+    auth_file=auth_file,
+    plan_type_raw=bundle.get("plan_type_raw"),
+    workspace_account_id=get_chatgpt_account_id() or None,
+)
+_kick_team_seat_after_oauth_failure(email, reason="plan_unsupported")  # ✅ 同步 KICK
+_record_outcome("plan_unsupported", plan=bundle_plan)
+return None
+```
+
+#### 不变量(M-MA-helper)
+
+> **M-MA-helper(强制)**:任何走 `STATUS_AUTH_INVALID` 路径的 OAuth 失败位点(尤其是 Team 分支已成功 invite 但 OAuth 失败)必须配对调用:
+>
+>   `update_account(status=AUTH_INVALID, ...)` → `_kick_team_seat_after_oauth_failure(email, reason="<位点名>")`
+>
+> helper 异常吞掉只 `logger.warning`,**不传播** → reconcile 5min 后兜底重试。
+>
+> 等价**禁止**:
+>   - 裸 `update_account(status=AUTH_INVALID)` 不调 helper
+>   - 在 helper 内 `raise` 异常 / 让异常传播到调用方
+>   - 在 helper 调用前不先 `update_account` 写状态(顺序错误会导致状态写漏)
+>
+> 等价**允许**:
+>   - helper 在已知失败场景静默失败(如主号 session 失效) → reconcile 兜底
+>   - 同一 email 多次调用 helper(remove_from_team 对席位不存在返 `"failed"`,幂等)
+>
+> 与 spec-2 §3.7 master health fail-fast 互补:fail-fast 在 OAuth 入口阻塞;§3.8 helper 在 OAuth 失败收尾同步释放席位。
+
+**详见**:[`./shared/account-state-machine.md`](./shared/account-state-machine.md) **v2.1.1** §4.1(转移矩阵新增 4 行 PENDING → AUTH_INVALID(ws kicked 同步))/ `tests/unit/test_round11_oauth_failure_kick_ws.py`(5 cases)。
 
 ---
 
@@ -1466,3 +1603,5 @@ Phase 6 (灰度上线)
 | v1.4 | 2026-04-26 Round 7 P2 follow-up | (1) §3.4.1 PREFERRED_SEAT_TYPE 命名归一化:主名 `default`(默认) / `codex`,加 `chatgpt` 转移期别名(setter 接受并 normalize 为 default,getter 永不返 chatgpt);(2) §3.4.6 加 quota check 24h 去重接入说明(Round 7 FR-D6,详见 quota-classification §4.4 + I9);(3) §3.5.3 加 task["error"] 关键字契约(phone_required / register_blocked 字符串子串匹配,前端 api.js 模板);(4) 引用方加 PRD-6;关联 `prompts/0426/prd/prd-6-p2-followup.md` §5.1 / §5.6 / §5.7 |
 | v1.5 | 2026-04-27 Round 8 master-team-degrade-oauth-rejoin | (1) 元数据引用 shared spec 加 `master-subscription-health.md` + `oauth-workspace-selection.md` 两份新 shared,关联 PRD 加 Round 8 PRD-7,覆盖 FR 加 M1~M4 / W1~W5;(2) §1 文件清单追加 Round 8 14 个文件(含 4 个新 shared/test fixture);(3) §3.4.5 末尾加注 — `manager.py:1554-1556 time.sleep(8)` 同 round 8 删除,完整理由见 `oauth-workspace-selection.md §4.3` + W-I7 不变量;(4) 新增 §3.4.7 OAuth Personal Workspace 显式选择 — `ensure_personal_workspace_selected` 编排 / 3 失败分类(`oauth_workspace_select_no_personal` / `oauth_workspace_select_endpoint_error` / `oauth_plan_drift_persistent`)/ Team 路径不调 / 5 次重试外层在 manager;(5) 新增 §3.7 Master 母号订阅健康度探针 — 5 触发位点 M-T1~T5(personal/Team OAuth 入口、`/api/tasks/fill` 503、`/api/admin/diagnose` 扩、cmd_reconcile 入口),5min cache 文件 `accounts/.master_health_cache.json`,与 §3.4.7 串联(master health 是 personal 流程前置门控);(6) §4.1 新增 `accounts/.master_health_cache.json` schema 描述;(7) §4.3 RegisterFailureRecord enum 加 4 个 Round 8 category;(8) 关联 `.trellis/tasks/04-27-master-team-degrade-oauth-rejoin/research/{master-subscription-probe,oauth-personal-selection,sticky-rejoin-mechanism}.md` 三份研究;Approach A 决策原文见 PRD §"Decision (ADR-lite)" |
 | **v1.6** | **2026-04-28 Round 9 account-usability-state-correction(Approach B)** | (1) 元数据引用 shared spec bump:`account-state-machine.md` v2.0(BREAKING — STATUS_DEGRADED_GRACE 8 状态)+ `master-subscription-health.md` v1.1(§11 retroactive 5 触发点 + §12 grace 期 + §13 endpoint 守恒);关联 PRD 加 Round 9 task `04-28-account-usability-state-correction`;覆盖 FR 加 AC-B1~AC-B8。(2) 新增 §3.4.8 Grace 期处理路径 — 8 子节(helper 抽象 / 5 触发点接入 RT-1~RT-5 + RT-6 既有 / grace_until JWT 解析接入 / GRACE 状态机接入 / fill-team M-T3 补全 / master-health endpoint 守恒 / 数据契约影响 / 与 §3.7 / §3.4.7 串联 / 单元测试期望 ≥10 case);(3) Approach B 决策原文与 ADR-lite 见 Round 9 task PRD `Decision (ADR-lite)`;(4) **回归影响**:state-machine v2.0 是 BREAKING,round-1~8 测试 mock / 前端 status 字符串集合需扫 8 处(详见 state-machine v2.0 changelog 列表)— backend-implementer Stage 2a 实施期需在 PR 内一并修复,不允许遗留 round-1~8 测试因状态机扩展失败;(5) **未改动**:Round 8 既有 §3.4.7 / §3.7 / §3.5 / §3.6 / §4 / §5 / §6 / §7 全部保持,仅 §3.4.8 增量;§5/§6/§7 实施期通过引用 v2.0 / v1.1 联动覆盖,无需在本 spec 重复展开 |
+| **v1.7** | **2026-04-28 Round 11 round11-master-resub-models-validate(Approach A)** | (1) 元数据引用 shared spec bump:`account-state-machine.md` v2.1(母号 × 子号联动)+ `master-subscription-health.md` v1.2(§14 subscription_grace healthy=True 状态)+ 新增 `realtime-probe.md` v1.0(子号 + 母号实时探活);关联 PRD 加 Round 11 task `04-28-round11-master-resub-models-validate`;覆盖 FR 加 Round 11 AC1~AC9。(2) **§3.7 fail-fast 触发条件补充** — Round 11 新加备注:fail-fast 仅在 `healthy == False` 时触发,subscription_grace healthy=True 自动放行(M-I3 v1.2 形式 — `healthy=True ⇔ reason ∈ ("active", "subscription_grace")`);**api.py / manager.py 入口零改动**(grace 期内 not healthy=False → 自动跳过 503)。(3) Approach A 决策原文(为何不改 fail-fast 入口加白名单 + 改 master_health.healthy 双枚 reason)见 Round 11 task PRD `Decision (ADR-lite)`。(4) **未改动**:Round 8/9 既有 §3.4.7 / §3.7 触发位点矩阵 / §3.5 / §3.6 / §4 / §5 / §6 / §7 全部保持。Round 11 实施期分为 backend(master_health.py grace 判定 + 新 endpoint)+ frontend(useStatus.js severity 路由 + Banner 文案 + Dashboard 探活按钮 + spec 升级)两路并行,不变更 spec-2 既有结构。 |
+| **v1.7.1** | **2026-04-28 Round 11 二轮 — OAuth 失败同步 KICK 收尾** | (1) 元数据版本 v1.7 → v1.7.1;引用 shared spec bump:`account-state-machine.md` v2.1 → v2.1.1(§4.1 转移矩阵新增 4 行 OAuth 失败 → AUTH_INVALID(ws kicked))+ `master-subscription-health.md` v1.2 → v1.4(§15 OAuth 连续失败 backoff 8h 冷却)+ `oauth-workspace-selection.md` v1.0 → v1.1(§10 upstream-style consent loop helper 港口)。(2) **新增 §3.8 OAuth 失败时同步 KICK Team workspace 席位** — 7 section 完整覆盖(Scope / Signatures / Contracts / Error Matrix / Good-Base-Bad / Tests Required / Wrong-vs-Correct);5 触发位点矩阵(MA-1~MA-5,line 号准确),配套 helper signature `_kick_team_seat_after_oauth_failure(email, *, reason)`(`manager.py:1556`),5 个测试 case(`tests/unit/test_round11_oauth_failure_kick_ws.py`)。(3) **新不变量 M-MA-helper** — 任何走 STATUS_AUTH_INVALID 路径的 OAuth 失败位点必须配对 `update_account(status=AUTH_INVALID)` + `_kick_team_seat_after_oauth_failure(email, reason)`;helper 异常吞掉只 warning 不传播(reconcile 5min 兜底);禁止裸 update_account 不 KICK。(4) **修复目的**:消除 "workspace 有 + 本地 auth 缺失" 残废态等 reconcile 5min 异步清理的延迟,把 KICK 改为 OAuth 失败同步执行;配合 master-subscription-health v1.4 §15 OAuth 连续失败 backoff(避免无谓循环堆 18+ zombie)。(5) **未改动**:Round 8/9/11 既有 §3.4.7 / §3.7 / §4 / §5 / §6 / §7 内容全部保持,仅 §3.8 增量。 |

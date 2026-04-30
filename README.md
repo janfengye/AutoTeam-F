@@ -29,12 +29,20 @@
 
 > **免责声明**：本项目仅供学习和研究用途。使用本工具可能违反 OpenAI 的服务条款。使用者需自行承担账号封禁、IP 限制等后果。
 
+> **⚠️ 重要更新（2026-04-30）：免费号自动注册路径当前已被 OpenAI 后端阻断**
+>
+> Round 11 真号自验证实：OpenAI 已调整 personal/free workspace 的选择与 plan 下发逻辑。旧路径"邀请进 Team → 主号 kick → personal OAuth → 拿 `plan_type=free`"在 5 次外层重试 + 主动 POST `/api/accounts/workspace/select` + session_token 注入跳过 /log-in 三层加固后**仍无法稳定拿到 free plan**：bundle 总是回落到 `plan_type=team`，`default_workspace_id` 也不再切回 Personal。
+>
+> 影响：下表标 🆕 的 **🆓 生产免费号（Personal）** 整条链路当前**事实失效**，点击"生成免费号"会跑完整套流程但最终 5 次全部 plan_drift，账号被标 STANDBY 留池（无 token 损失）。**Team 子号注册 / 轮转 / 巡检 / OAuth 等其他全部能力不受影响。**
+>
+> 底层钩子保留：`oauth_workspace.py` / `_run_post_register_oauth` 5 次重试 + session_token 注入 + plan_drift 累计的代码全部留底，等 OpenAI 再次调整或社区给出新绕过路径时直接复用。详见 `CHANGELOG.md` 与 `prompts/0426/verify/round11-review-report.md`。
+
 ## 特性
 
 | | 功能 | 描述 |
 |---|---|---|
 | 📧 | **自动注册** | 临时邮箱(`cf_temp_email` 或 `maillab` 双后端,SetupPage 4 步状态机指引切换 + 协议指纹嗅探防错配)+ Playwright 自动注册 |
-| 🆓 | **生产免费号** 🆕 | 批量注册 → 主号踢出 → Personal OAuth，一条龙 |
+| 🆓 | **生产免费号** 🆕 ⚠️暂不可用 | 批量注册 → 主号踢出 → Personal OAuth，一条龙（**2026-04-30 起被 OpenAI workspace 路径变更阻断**，详见上方警告） |
 | 🔐 | **Codex OAuth** | 自动登录 Codex，Team / Personal 双模式 |
 | 🔑 | **手动 OAuth 导入** | localhost 自动回调，失败可手动粘贴 |
 | 🔄 | **智能轮转** | 额度不足自动移出，旧号恢复后优先复用 |

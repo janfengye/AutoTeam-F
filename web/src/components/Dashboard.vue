@@ -140,6 +140,15 @@
                     @click="loginAccount(acc.email)">
                     {{ loginLabel(acc) }}
                   </AtButton>
+                  <!-- Round 11:子号"立即探活"按钮(spec realtime-probe.md v1.0 §4) -->
+                  <AtButton v-if="canProbe(acc)"
+                    variant="secondary" size="sm"
+                    :loading="actionEmail === acc.email && actionType === 'probe'"
+                    :disabled="actionDisabled || (actionEmail === acc.email && actionType !== 'probe')"
+                    @click="probeAccount(acc.email)"
+                    title="立即调 cheap_codex_smoke + check_codex_quota,绕过 30min 节流">
+                    立即探活
+                  </AtButton>
                   <AtButton v-if="!acc.is_main_account && acc.status === 'active'"
                     variant="secondary" size="sm"
                     :loading="actionEmail === acc.email && actionType === 'kick'"
@@ -487,6 +496,14 @@ function canLogin(acc) {
   if (acc.status === 'degraded_grace') return false // grace 期内仍可用,无需补登录
   return true
 }
+// Round 11 realtime-probe.md v1.0 §4 — 仅对持有 auth_file 的子号显示"立即探活"
+// (主号有自己的"立即重测"按钮在 MasterHealthBanner;orphan/pending 无 token 探不动)
+function canProbe(acc) {
+  if (acc.is_main_account) return false
+  if (!acc.auth_file) return false
+  if (acc.status === 'pending' || acc.status === 'orphan') return false
+  return true
+}
 function loginLabel(acc) {
   if (acc.status === 'personal' || acc.status === 'auth_invalid' || acc.status === 'orphan') return '补登录'
   return '登录'
@@ -501,6 +518,35 @@ async function loginAccount(email) {
     emit('refresh')
   } catch (e) {
     toast.error('提交登录任务失败', e.message)
+  } finally {
+    actionEmail.value = ''; actionType.value = ''
+  }
+}
+
+// Round 11 realtime-probe.md v1.0 — 子号实时探活
+// 调 POST /api/accounts/{email}/probe (force_codex_smoke=true)
+// 副作用:后端落 last_quota_check_at,绕过 30min 节流;不修改 status (RT-I1)
+async function probeAccount(email) {
+  if (actionDisabled.value) return
+  actionEmail.value = email; actionType.value = 'probe'
+  try {
+    const result = await api.probeAccount(email, true)
+    // 后端 spec RT-I2:probe 永不抛 5xx,smoke_result ∈ {alive, auth_invalid, uncertain}
+    const smoke = result?.smoke_result || result?.last_smoke_result || '-'
+    const lastCheck = result?.last_quota_check_at
+    const checkedAt = lastCheck
+      ? new Date(lastCheck * 1000).toLocaleTimeString()
+      : '刚刚'
+    if (smoke === 'alive') {
+      toast.success('探活成功', `${email} · ${checkedAt} · alive`)
+    } else if (smoke === 'auth_invalid') {
+      toast.warn('探活完成 · token 失效', `${email} · ${checkedAt} · auth_invalid`)
+    } else {
+      toast.info('探活完成', `${email} · ${checkedAt} · ${smoke}`)
+    }
+    emit('refresh')
+  } catch (e) {
+    toast.error('探活失败', e.message)
   } finally {
     actionEmail.value = ''; actionType.value = ''
   }

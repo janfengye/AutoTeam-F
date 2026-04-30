@@ -82,7 +82,7 @@
 
 <script setup>
 import { computed } from 'vue'
-import { formatGraceRemain, graceUrgencyClass } from '../composables/useStatus.js'
+import { formatGraceRemain, graceUrgencyClass, masterHealthSeverity } from '../composables/useStatus.js'
 
 const props = defineProps({
   masterHealth: { type: Object, default: null },
@@ -91,28 +91,15 @@ const props = defineProps({
 })
 defineEmits(['refresh'])
 
-// reason → severity 映射 (F3 PRD)
-//   subscription_cancelled (with grace) → warning (yellow → orange,degraded)
-//   subscription_cancelled (no grace)   → critical (red)
+// reason → severity 映射 (F3 PRD,Round 11 加 subscription_grace)
+// spec:master-subscription-health.md v1.2 §14
+//   subscription_grace                    → warning (healthy=True,但 grace 期内,黄色 + 倒计时)
+//   subscription_cancelled (with grace)   → warning (旧兼容,子号 grace_until 仍未过期)
+//   subscription_cancelled (no grace)     → critical (red)
 //   workspace_missing / role_not_owner / auth_invalid → critical
-//   network_error                       → info (gray, stale data)
-//   active                              → ok (green,微提示;visible=false)
-const severity = computed(() => {
-  const m = props.masterHealth
-  if (!m) return 'hidden'
-  if (m.healthy === true || m.reason === 'active') return 'hidden'
-  const r = m.reason
-  if (r === 'subscription_cancelled') {
-    // 有 grace 期 → degraded;否则 → cancelled critical
-    if (props.minGraceUntil && props.minGraceUntil * 1000 > Date.now()) return 'warning'
-    return 'critical'
-  }
-  if (r === 'workspace_missing' || r === 'role_not_owner' || r === 'auth_invalid') {
-    return 'critical'
-  }
-  if (r === 'network_error') return 'info'
-  return 'critical'
-})
+//   network_error                          → info (gray, stale data)
+//   active                                 → ok (green,微提示;visible=false)
+const severity = computed(() => masterHealthSeverity(props.masterHealth, props.minGraceUntil))
 
 const visible = computed(() => severity.value !== 'hidden')
 
@@ -120,6 +107,8 @@ const title = computed(() => {
   const r = props.masterHealth?.reason
   switch (severity.value) {
     case 'warning':
+      // Round 11:subscription_grace 是 healthy=True 状态,文案区分于旧 subscription_cancelled+grace
+      if (r === 'subscription_grace') return '母号订阅在 grace 期 · 仍可正常使用'
       return '母号订阅 grace 期 · 期限内仍可使用'
     case 'critical':
       if (r === 'subscription_cancelled') return '母号订阅已 cancel · 请续费或切换母号'
@@ -138,6 +127,10 @@ const description = computed(() => {
   const r = props.masterHealth?.reason
   switch (severity.value) {
     case 'warning':
+      // Round 11:subscription_grace healthy=True,新 invite 仍能拿 plan_type=team
+      if (r === 'subscription_grace') {
+        return 'eligible_for_auto_reactivation=true 但订阅未到期,新 invite 仍能拿 plan_type=team。倒计时到期后自动转 cancelled,请提前续费或切换母号。'
+      }
       return 'master 母号已 cancel_at_period_end,grace 期内子号 wham 仍 200 plan=team。fill 池不增量,但用户可继续消耗已有 quota。倒计时见右上角。'
     case 'critical':
       if (r === 'subscription_cancelled') return 'eligible_for_auto_reactivation=true,新 invite 必拿 plan_type=free。请续订或更换母号,fill-personal 入口已 503 拒绝。'
@@ -174,11 +167,19 @@ const lastProbed = computed(() => {
 
 const cached = computed(() => props.masterHealth?.evidence?.cache_hit === true)
 
+// Round 11:subscription_grace 的倒计时优先用 evidence.grace_until (master JWT 解析结果),
+// 否则 fallback 到 minGraceUntil (子号 grace_until 派生)。
+const effectiveGraceUntil = computed(() => {
+  const evGrace = props.masterHealth?.evidence?.grace_until
+  if (typeof evGrace === 'number' && evGrace > 0) return evGrace
+  return props.minGraceUntil
+})
+
 const graceCountdown = computed(() => {
   if (severity.value !== 'warning') return ''
-  return formatGraceRemain(props.minGraceUntil) || ''
+  return formatGraceRemain(effectiveGraceUntil.value) || ''
 })
-const graceCountdownColor = computed(() => graceUrgencyClass(props.minGraceUntil))
+const graceCountdownColor = computed(() => graceUrgencyClass(effectiveGraceUntil.value))
 
 // 配色三档
 const tone = computed(() => {

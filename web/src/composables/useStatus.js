@@ -174,6 +174,44 @@ export function graceUrgencyClass(graceUntil) {
   return 'text-amber-300'
 }
 
+// ── master health reason → severity 映射 (Round 11) ──
+// spec:master-subscription-health.md v1.2 §14
+//
+// 输入:
+//   reason         — master_health endpoint 返回的 reason 字段
+//   masterHealth   — 完整 masterHealth 对象 (可选,提供 healthy / evidence.grace_until)
+//   minGraceUntil  — 任意子号最早的 grace_until epoch (Round 9 派生,旧路径兜底)
+// 输出:
+//   'hidden'   — 不渲染 banner (active / subscription_grace healthy 时通常 hidden 或自定义)
+//   'warning'  — 黄色提示 (subscription_grace 母号 healthy=True 但 grace 期内,见 M-I14)
+//   'info'     — 灰色 (network_error / stale)
+//   'critical' — 红色 (subscription_cancelled / workspace_missing / role_not_owner / auth_invalid)
+//
+// Round 11 关键改动:
+//   - 新增 reason='subscription_grace' → 'warning' (healthy=True 但仍提示倒计时)
+//   - 旧路径 (subscription_cancelled + minGraceUntil 仍未过期) 继续兼容显示 warning
+export function masterHealthSeverity(masterHealth, minGraceUntil = null) {
+  const m = masterHealth
+  if (!m) return 'hidden'
+  // Round 11:subscription_grace 是 healthy=True 的新状态,但 banner 仍显 warning + 倒计时
+  if (m.reason === 'subscription_grace') return 'warning'
+  // active / 其它 healthy 状态隐藏 banner
+  if (m.healthy === true || m.reason === 'active') return 'hidden'
+  const r = m.reason
+  if (r === 'subscription_cancelled') {
+    // 旧兼容路径:cancelled + 子号有 grace_until 仍显 warning
+    const evGrace = m.evidence?.grace_until
+    if (evGrace && evGrace * 1000 > Date.now()) return 'warning'
+    if (minGraceUntil && minGraceUntil * 1000 > Date.now()) return 'warning'
+    return 'critical'
+  }
+  if (r === 'workspace_missing' || r === 'role_not_owner' || r === 'auth_invalid') {
+    return 'critical'
+  }
+  if (r === 'network_error') return 'info'
+  return 'critical'
+}
+
 // 配额数值与颜色 (Dashboard 复用)
 export function quotaRemainingPct(qi, type = 'primary') {
   if (!qi) return null

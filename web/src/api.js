@@ -111,6 +111,18 @@ export const api = {
     'GET', `/admin/master-health${forceRefresh ? '?force_refresh=1' : ''}`,
   ),
 
+  // Round 11 — realtime-probe.md v1.0 §2:子号实时探活 + 模型清单
+  // POST /api/accounts/{email}/probe — 强制刷新单个子号的可用性 (cheap_codex_smoke + check_codex_quota)
+  // 副作用:落 last_quota_check_at,绕过 sync_account_states 30min 节流
+  probeAccount: (email, forceCodexSmoke = true) => request(
+    'POST', `/accounts/${encodeURIComponent(email)}/probe`,
+    { force_codex_smoke: forceCodexSmoke },
+  ),
+  // GET /api/accounts/{email}/models — 用 access_token 调 /backend-api/models 拿可用模型列表
+  getAccountModels: (email) => request(
+    'GET', `/accounts/${encodeURIComponent(email)}/models`,
+  ),
+
   getTeamMembers: () => request('GET', '/team/members'),
   removeTeamMember: (payload) => request('POST', '/team/members/remove', payload),
   getLogs: (limit = 100, since = 0) => request('GET', `/logs?limit=${limit}&since=${since}`),

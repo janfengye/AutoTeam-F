@@ -144,6 +144,16 @@ function percent(v) {
 const masterTone = computed(() => {
   const m = props.masterHealth
   const r = m?.reason
+  // Round 11:subscription_grace = healthy=True 但 grace 期内,渲染橙色提示 (而非 healthy 绿色)
+  if (r === 'subscription_grace') {
+    return {
+      bg: 'linear-gradient(135deg, rgba(251, 146, 60, 0.14), rgba(244, 63, 94, 0.10))',
+      border: 'border-orange-500/30',
+      iconWrap: 'bg-orange-500/15',
+      iconFill: 'rgb(253, 186, 116)',
+      text: 'text-orange-200',
+    }
+  }
   if (!m || m.healthy === true || r === 'active') {
     return {
       bg: 'linear-gradient(135deg, rgba(16, 185, 129, 0.10), rgba(20, 184, 166, 0.05))',
@@ -183,6 +193,8 @@ const masterTone = computed(() => {
 const masterTitle = computed(() => {
   const m = props.masterHealth
   if (!m) return '未探测'
+  // Round 11:subscription_grace healthy=True,显示 "Grace 期内"
+  if (m.reason === 'subscription_grace') return 'Grace 期内'
   if (m.healthy === true || m.reason === 'active') return 'Healthy'
   if (m.reason === 'subscription_cancelled') {
     if (props.minGraceUntil && props.minGraceUntil * 1000 > Date.now()) return 'Grace 期内'
@@ -198,6 +210,13 @@ const masterTitle = computed(() => {
 const masterSubtitle = computed(() => {
   const m = props.masterHealth
   if (!m) return '尚未拉取 / 设置 → 探测'
+  // Round 11:subscription_grace 优先用 evidence.grace_until 显示倒计时
+  if (m.reason === 'subscription_grace') {
+    const evGrace = m.evidence?.grace_until
+    const target = (typeof evGrace === 'number' && evGrace > 0) ? evGrace : props.minGraceUntil
+    const r = formatGraceRemain(target)
+    return r ? `grace 剩 ${r}` : '订阅 grace 期'
+  }
   if (m.healthy === true || m.reason === 'active') return '订阅 active'
   if (m.reason === 'subscription_cancelled' && props.minGraceUntil) {
     const r = formatGraceRemain(props.minGraceUntil)

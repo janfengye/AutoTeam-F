@@ -1825,6 +1825,208 @@ def delete_accounts_batch(params: DeleteBatchParams):
         _playwright_lock.release()
 
 
+# ---------------------------------------------------------------------------
+# Round 11 — 子号实时探活 + 模型列表(用户 Q3 痛点)
+# ---------------------------------------------------------------------------
+
+
+class ProbeAccountParams(BaseModel):
+    """`/api/accounts/{email}/probe` 请求体。"""
+
+    force_codex_smoke: bool = True
+
+
+@app.post("/api/accounts/{email}/probe")
+def post_account_probe(email: str, params: ProbeAccountParams = ProbeAccountParams()):
+    """Round 11 AC5 — 子号实时探活:并行 check_codex_quota + cheap_codex_smoke。
+
+    用 access_token 直接探,不进队列,不抢 Playwright 锁(纯 HTTP 请求)。
+    落 last_quota_check_at + last_quota,返回 status_before / status_after。
+    """
+    from autoteam.accounts import find_account, load_accounts, update_account
+    from autoteam.codex_auth import cheap_codex_smoke, check_codex_quota
+
+    email = email.strip().lower()
+    if _is_main_account_email(email):
+        raise HTTPException(status_code=400, detail="主号不属于子号探活对象,请用 /api/admin/master-health")
+
+    accounts = load_accounts()
+    acc = find_account(accounts, email)
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    auth_file = acc.get("auth_file")
+    if not auth_file or not Path(auth_file).exists():
+        raise HTTPException(status_code=422, detail={
+            "error": "auth_file_missing",
+            "message": "账号无可用 auth_file,无法探活",
+        })
+
+    try:
+        auth_data = json.loads(Path(auth_file).read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail={
+            "error": "auth_file_unreadable",
+            "message": f"auth_file 解析失败: {type(exc).__name__}",
+        })
+
+    access_token = auth_data.get("access_token") or (auth_data.get("tokens") or {}).get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=422, detail={
+            "error": "access_token_missing",
+            "message": "auth_file 中缺 access_token,无法探活",
+        })
+
+    account_id = (
+        auth_data.get("account_id")
+        or (auth_data.get("tokens") or {}).get("account_id")
+        or acc.get("workspace_account_id")
+    )
+
+    status_before = acc.get("status")
+
+    # 并行不强求,顺序也行 — quota 后跑 smoke
+    try:
+        quota_status, quota_info = check_codex_quota(access_token, account_id=account_id)
+    except Exception as exc:
+        logger.warning("[probe %s] check_codex_quota 异常: %s", email, exc)
+        quota_status, quota_info = "network_error", None
+
+    try:
+        smoke_result, smoke_detail = cheap_codex_smoke(
+            access_token,
+            account_id=account_id,
+            force=bool(params.force_codex_smoke),
+        )
+    except Exception as exc:
+        logger.warning("[probe %s] cheap_codex_smoke 异常: %s", email, exc)
+        smoke_result, smoke_detail = "uncertain", f"exception:{type(exc).__name__}"
+
+    # 落 last_quota_check_at;quota_info 是 quota 快照才落
+    update_fields = {"last_quota_check_at": time.time()}
+    if quota_status == "ok" and isinstance(quota_info, dict):
+        update_fields["last_quota"] = quota_info
+    try:
+        update_account(email, **update_fields)
+    except Exception as exc:
+        logger.warning("[probe %s] update_account 失败: %s", email, exc)
+
+    # 重新读最新状态
+    accounts2 = load_accounts()
+    acc2 = find_account(accounts2, email) or acc
+
+    return {
+        "email": email,
+        "status_before": status_before,
+        "status_after": acc2.get("status"),
+        "quota_status": quota_status,
+        "quota_info": quota_info if isinstance(quota_info, dict) else None,
+        "smoke_result": smoke_result,
+        "smoke_detail": smoke_detail,
+        "last_quota_check_at": update_fields["last_quota_check_at"],
+    }
+
+
+@app.get("/api/accounts/{email}/models")
+def get_account_models(email: str):
+    """Round 11 AC7 — 用 access_token 调 /backend-api/models 拿可用模型列表。
+
+    返回 {email, plan_type, models: [{slug, name, description, ...}, ...]}
+    401/403 → 401 + auth_invalid;timeout → 503;其他 → 502。
+    """
+    import requests
+
+    from autoteam.accounts import find_account, load_accounts
+
+    email = email.strip().lower()
+    accounts = load_accounts()
+    acc = find_account(accounts, email)
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    auth_file = acc.get("auth_file")
+    if not auth_file or not Path(auth_file).exists():
+        raise HTTPException(status_code=422, detail={
+            "error": "auth_file_missing",
+            "message": "账号无可用 auth_file",
+        })
+
+    try:
+        auth_data = json.loads(Path(auth_file).read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail={
+            "error": "auth_file_unreadable",
+            "message": f"auth_file 解析失败: {type(exc).__name__}",
+        })
+
+    access_token = auth_data.get("access_token") or (auth_data.get("tokens") or {}).get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=422, detail={
+            "error": "access_token_missing",
+        })
+
+    account_id = (
+        auth_data.get("account_id")
+        or (auth_data.get("tokens") or {}).get("account_id")
+        or acc.get("workspace_account_id")
+    )
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+    if account_id:
+        headers["Chatgpt-Account-Id"] = account_id
+
+    try:
+        resp = requests.get(
+            "https://chatgpt.com/backend-api/models",
+            headers=headers,
+            timeout=10.0,
+        )
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=503, detail={"error": "timeout"})
+    except requests.exceptions.RequestException as exc:
+        raise HTTPException(status_code=502, detail={
+            "error": "network_error",
+            "message": f"{type(exc).__name__}",
+        })
+
+    if resp.status_code in (401, 403):
+        raise HTTPException(status_code=401, detail={
+            "error": "auth_invalid",
+            "http_status": resp.status_code,
+        })
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail={
+            "error": f"upstream_status_{resp.status_code}",
+            "body_preview": (resp.text or "")[:200],
+        })
+
+    try:
+        body = resp.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={
+            "error": "json_parse_error",
+            "message": f"{type(exc).__name__}",
+        })
+
+    models = body.get("models") if isinstance(body, dict) else None
+    if not isinstance(models, list):
+        models = []
+
+    plan_type = None
+    if isinstance(body, dict):
+        plan_type = body.get("plan_type") or body.get("category") or None
+
+    return {
+        "email": email,
+        "plan_type": plan_type,
+        "models": models,
+        "raw_keys": list(body.keys()) if isinstance(body, dict) else [],
+    }
+
+
 @app.post("/api/accounts/{email}/kick")
 def post_kick_account(email: str):
     """将账号从 Team 中移出，状态变为 standby"""
@@ -2654,6 +2856,42 @@ def _auto_check_loop():
                     # 冷却期内仍然继续做"低额度替换"(下面的 low_accounts 逻辑),
                     # 只是不触发全量 cmd_rotate
                 else:
+                    # Round 11 — OAuth 连续失败 backoff:
+                    # 最近 2 小时内 master workspace 累积 ≥3 个 auth_invalid 账号 → fill 已稳定失败,
+                    # 延长有效冷却到 4 小时,避免每 30 分钟无脑循环浪费 cloudmail 邮箱 + 累积僵尸账号。
+                    # 触发条件用 status=auth_invalid + workspace_account_id=master 简单可靠,
+                    # 不依赖具体 OAuth 失败原因(根因可能是 ChatGPT consent 页面变化或 master 订阅问题)。
+                    backoff_triggered = False
+                    try:
+                        from autoteam.accounts import STATUS_AUTH_INVALID
+                        from autoteam.admin_state import get_chatgpt_account_id
+
+                        master_aid = get_chatgpt_account_id() or ""
+                        recent_window = 2 * 3600  # 2 小时
+                        recent_failures = [
+                            a for a in accounts
+                            if a.get("status") == STATUS_AUTH_INVALID
+                            and (a.get("workspace_account_id") or "") == master_aid
+                            and (a.get("created_at") or 0) >= now_ts - recent_window
+                        ]
+                        if len(recent_failures) >= 3:
+                            # 强制延长冷却,记 last_trigger_ts 让下次巡检也走 cooldown 分支
+                            _auto_fill_last_trigger_ts = now_ts - _AUTO_FILL_COOLDOWN_SECONDS + 4 * 3600
+                            logger.warning(
+                                "[巡检] active=%d < %d 但近 2h 累积 %d 个 OAuth 失败账号 → "
+                                "backoff 生效,延长冷却到 4h(避免无谓循环)。"
+                                "请检查 codex_auth consent 页面或 master 订阅",
+                                len(active),
+                                TEAM_SUB_ACCOUNT_HARD_CAP,
+                                len(recent_failures),
+                            )
+                            backoff_triggered = True
+                    except Exception as exc:
+                        logger.warning("[巡检] OAuth backoff 检查异常: %s,按原逻辑继续", exc)
+
+                    if backoff_triggered:
+                        continue
+
                     if not _playwright_lock.acquire(blocking=False):
                         logger.info(
                             "[巡检] active=%d < %d 但有任务在跑,本轮先跳过自动补位",

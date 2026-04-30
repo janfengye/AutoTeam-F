@@ -208,7 +208,7 @@ def main() -> int:
     # 读落盘 JSON
     with Path(auth_file_path).open("r", encoding="utf-8") as f:
         auth_data = json.load(f)
-    print(f"\n[Step 3] 落盘 codex-main-*.json 内容:")
+    print("\n[Step 3] 落盘 codex-main-*.json 内容:")
     print(json.dumps(auth_data, indent=2))
 
     # ============================================================
@@ -256,7 +256,7 @@ def main() -> int:
         else:
             print(f"  [I3] PASS — id_token JWT exp={exp}")
     else:
-        print(f"  [I3] PASS — id_token 字段存在但为空字符串(允许)")
+        print("  [I3] PASS — id_token 字段存在但为空字符串(允许)")
 
     # I4: account_id / email / plan_type 字段齐全
     # 注:_write_auth_file 不写 plan_type 字段(它只在 bundle 内传递),所以 plan_type 看 result.plan_type
@@ -289,7 +289,7 @@ def main() -> int:
         failures.append(f"I5 — cheap_codex_smoke 返回非法 result={smoke_result}")
     else:
         print(f"  [I5] PASS — cheap_codex_smoke 接口可用,返回 ({smoke_result}, {smoke_detail})")
-        print(f"        (mock token 不会真 200,本指标只验证接口契约;真实验证由用户手动跑)")
+        print("        (mock token 不会真 200,本指标只验证接口契约;真实验证由用户手动跑)")
 
     # I6: 使用 refresh_token 调一次刷新接口 (auth.openai.com/oauth/token grant_type=refresh_token)
     # —— Check Agent 无法做真实网络调用,改为验证 refresh_access_token 函数可调用
@@ -303,7 +303,7 @@ def main() -> int:
                 new_token = codex_auth.refresh_access_token(refresh_token)
                 # mock 返回的 access_token 在 fake_token_response 内
                 assert new_token, "refresh_access_token 必须返回非空"
-                print(f"  [I6] PASS — refresh_access_token 接口可调用,返回 token (mock)")
+                print("  [I6] PASS — refresh_access_token 接口可调用,返回 token (mock)")
             except Exception as exc:
                 failures.append(f"I6 — refresh_access_token 调用异常: {exc}")
     else:

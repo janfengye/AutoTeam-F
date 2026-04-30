@@ -1275,14 +1275,37 @@ class ChatGPTTeamAPI:
             return None
 
     def _api_fetch(self, method, path, body=None):
-        headers_js = {
+        raw_headers = {
             "Content-Type": "application/json",
             "chatgpt-account-id": self.account_id,
             "oai-device-id": self.oai_device_id,
             "oai-language": "en-US",
         }
         if self.access_token:
-            headers_js["authorization"] = f"Bearer {self.access_token}"
+            raw_headers["authorization"] = f"Bearer {self.access_token}"
+
+        # Round 11 patch — fetch RequestInit headers 必须 ISO-8859-1 (Latin1)。
+        # 任何 None / bytes / 含 unicode 的 value 都 sanitize,避免 Browser fetch 抛
+        # "String contains non ISO-8859-1 code point"。
+        # 见 prompts/issues1.md / Round 11 task PRD。
+        headers_js = {}
+        for k, v in raw_headers.items():
+            if v is None:
+                # null header value 直接 skip(避免传 "None" 字符串到 fetch)
+                continue
+            if isinstance(v, bytes):
+                v = v.decode("ascii", errors="replace")
+            else:
+                v = str(v)
+            sanitized = v.encode("latin-1", errors="replace").decode("latin-1")
+            if sanitized != v:
+                logger.warning(
+                    "[ChatGPT] _api_fetch header %s 含非 ISO-8859-1 字符已被替换: %r -> %r",
+                    k,
+                    v[:60],
+                    sanitized[:60],
+                )
+            headers_js[k] = sanitized
 
         js_code = """async ([method, url, headers, body]) => {
             try {

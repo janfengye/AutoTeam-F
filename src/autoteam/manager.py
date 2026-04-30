@@ -74,6 +74,13 @@ logger = logging.getLogger(__name__)
 
 MAIL_TIMEOUT = int(os.environ.get("MAIL_TIMEOUT", "180"))
 
+# Round 11 二轮收尾 — OAuth 子进程默认超时(秒)。任何 subprocess 包裹 login_codex_via_browser
+# (probe 脚本 / 异步 worker / CLI 工具) 必须用此常量,不再硬编码 60s。
+# 实测 P95 < 180s(参考 P1 报告 fd3b5ccae1 实测 71.3s headless OAuth 完成),
+# 200s 为 safety margin。生产路径(_run_post_register_oauth)在主线程内同步执行,
+# 由 _pw_executor.run 默认 300s 包裹,不走本常量。
+OAUTH_SUBPROCESS_TIMEOUT_S = int(os.environ.get("OAUTH_SUBPROCESS_TIMEOUT_S", "200"))
+
 
 # Round 7 P2.5 — 把 wham/usage 原始 rate_limit 子树序列化为字符串,
 # 供 record_failure(no_quota_assigned, raw_rate_limit=...) 落 register_failures.json,
@@ -1553,7 +1560,49 @@ def remove_from_team(chatgpt_api, email, *, return_status=False, lookup_retries=
         return "failed" if return_status else False
 
 
-def _run_post_register_oauth(email, password, mail_client, leave_workspace=False, out_outcome=None):
+def _kick_team_seat_after_oauth_failure(email: str, *, reason: str) -> None:
+    """OAuth 失败时同步 KICK ws,消除"workspace 有 + 本地 auth 缺失"残废延迟。
+
+    Round 11 — 之前 OAuth 失败只标本地 status=AUTH_INVALID,workspace 中的 Team 席位
+    要等 reconcile 5min 后异步清理。本 helper 在每个失败位点同步 KICK,把延迟降到 0。
+
+    Args:
+        email: 失败子号 email
+        reason: 失败原因短文案(如 "register_blocked_phone" / "plan_unsupported" /
+                "bundle_missing"),写进 log 让事后排查能定位失败位点。
+
+    异常处理:任何异常吞掉只 logger.warning(reconcile 兜底),不让 KICK 失败传播到
+    OAuth 失败处理流(避免 update_account 之后的状态不一致)。
+    """
+    try:
+        cleanup_api = ChatGPTTeamAPI()
+        try:
+            cleanup_api.start()
+            kick_status = remove_from_team(cleanup_api, email, return_status=True)
+            logger.info(
+                "[注册] OAuth 失败(%s) → kick Team 残留席位 %s status=%s",
+                reason, email, kick_status,
+            )
+        finally:
+            try:
+                cleanup_api.stop()
+            except Exception:
+                pass
+    except Exception as kick_exc:
+        logger.warning(
+            "[注册] OAuth 失败(%s) 后 kick %s 抛异常(留给下次对账): %s",
+            reason, email, kick_exc,
+        )
+
+
+def _run_post_register_oauth(
+    email,
+    password,
+    mail_client,
+    leave_workspace=False,
+    out_outcome=None,
+    chatgpt_session_token=None,
+):
     """
     注册（加入 Team）成功后统一的收尾流程：
     - leave_workspace=False: 直接跑 Team 模式 Codex OAuth，状态置为 ACTIVE
@@ -1561,6 +1610,8 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
 
     返回 email 表示账号已入账号池；None 表示流程失败。
     out_outcome: 可选 dict，函数内会写入 `{status, email, reason, ...}` 供上游统计/汇总。
+    chatgpt_session_token: 注册阶段从 chatgpt.com 抽出的 __Secure-next-auth.session-token,
+                           personal OAuth 时注入到 auth.openai.com 跳过 /log-in 卡死。
     """
 
     def _record_outcome(status, **extra):
@@ -1665,8 +1716,17 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
                     time.sleep(sleep_secs)
 
             # SPEC-2 §3.1.3 — personal 分支 catch RegisterBlocked + plan_supported 检查
+            # Round 11 四轮 — 把注册阶段的 chatgpt.com session_token 透给 OAuth,
+            # 让 login_codex_via_browser 注入 auth.openai.com cookie,跳过 /log-in 表单
+            # (实测刚踢出 Team 的新号在 /log-in 页 Continue 按钮变灰禁用,无法登录)。
             try:
-                bundle = login_codex_via_browser(email, password, mail_client=mail_client, use_personal=True)
+                bundle = login_codex_via_browser(
+                    email,
+                    password,
+                    mail_client=mail_client,
+                    use_personal=True,
+                    chatgpt_session_token=chatgpt_session_token,
+                )
             except RegisterBlocked as blocked:
                 # add-phone / duplicate 等异常是 terminal,不重试
                 if blocked.is_phone:
@@ -1697,10 +1757,24 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
                 return None
 
             if not bundle:
-                # bundle 没拿到 — 这是 oauth 路径 abort(workspace_select 失败 / 网络错误),不重试,直接 fail
-                logger.error("[注册] %s personal OAuth 第 %d/%d 次未返回 bundle,放弃重试",
-                             email, attempt + 1, max_retries)
-                break
+                # Round 11 hotfix — bundle=None 可能原因:
+                # 1. workspace_select 完全失败(auth_code 缺失)— codex_auth.py:1023-1025
+                # 2. plan_type != free 被 codex_auth 拒收 — codex_auth.py:1037-1045
+                # 两种都属于后端最终一致性滞后,W-I9 spec 要求外层 5 次重试,而非 break。
+                # 旧实现 break 在第 1 次 bundle=None 时直接放弃 → 实测发现:codex_auth 拒收 plan=team
+                # 的 bundle 时(第 1 batch)永远没机会触发"5 次重试触发后端最终一致性"。
+                logger.warning(
+                    "[注册] %s personal OAuth 第 %d/%d 次未返回 bundle,继续重试(等后端最终一致性同步)",
+                    email, attempt + 1, max_retries,
+                )
+                plan_drift_history.append({
+                    "attempt": attempt + 1,
+                    "plan_type": "unknown",
+                    "plan_type_raw": None,
+                    "account_id": None,
+                    "reason": "bundle_none",  # 区分 plan_drift 和 bundle_none
+                })
+                continue
 
             bundle_plan = (bundle.get("plan_type") or "").lower()
             if bundle_plan == "free":
@@ -1835,22 +1909,7 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
             status=STATUS_AUTH_INVALID,
             workspace_account_id=get_chatgpt_account_id() or None,
         )
-        try:
-            cleanup_api = ChatGPTTeamAPI()
-            try:
-                cleanup_api.start()
-                kick_status = remove_from_team(cleanup_api, email, return_status=True)
-                logger.info(
-                    "[注册] master degraded → kick Team 残留席位 %s status=%s",
-                    email, kick_status,
-                )
-            finally:
-                try:
-                    cleanup_api.stop()
-                except Exception:
-                    pass
-        except Exception as kick_exc:
-            logger.warning("[注册] master degraded 后 kick %s 抛异常(留给下次对账): %s", email, kick_exc)
+        _kick_team_seat_after_oauth_failure(email, reason="master_degraded")
         _record_outcome("master_degraded", reason="master subscription cancelled (Team)")
         return None
 
@@ -1875,12 +1934,14 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
                 status=STATUS_AUTH_INVALID,
                 workspace_account_id=get_chatgpt_account_id() or None,
             )
+            _kick_team_seat_after_oauth_failure(email, reason="register_blocked_phone")
             _record_outcome("oauth_phone_blocked", reason="OAuth 阶段触发 add-phone")
             return None
         record_failure(email, "exception", f"Team OAuth RegisterBlocked: {blocked.reason}",
                        stage="run_post_register_oauth_team")
         update_account(email, status=STATUS_AUTH_INVALID,
                        workspace_account_id=get_chatgpt_account_id() or None)
+        _kick_team_seat_after_oauth_failure(email, reason="register_blocked_unexpected")
         _record_outcome("oauth_failed", reason=f"unexpected RegisterBlocked: {blocked.reason}")
         return None
 
@@ -1913,6 +1974,7 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
                 plan_type_raw=bundle.get("plan_type_raw"),
                 workspace_account_id=get_chatgpt_account_id() or None,
             )
+            _kick_team_seat_after_oauth_failure(email, reason="plan_unsupported")
             _record_outcome("plan_unsupported", plan=bundle_plan)
             return None
 
@@ -1981,11 +2043,15 @@ def _run_post_register_oauth(email, password, mail_client, leave_workspace=False
             _record_outcome("quota_issue", plan=bundle_plan, status=update_fields["status"])
             return None
 
-    # 部分成功：账号已入 Team(席位被占用)但 auth_file 缺失,需要用户手动"补登录"。
-    # 上游 cmd_fill 依 `if email: produced+=1` 按席位计数,所以这里仍返回 email;
-    # outcome 打 team_auth_missing 让汇总能显示"这批里有 X 个需要补登录"。
-    update_account(email, status=STATUS_ACTIVE, workspace_account_id=get_chatgpt_account_id() or None)
-    logger.warning("[注册] 账号已加入 Team 但 Codex 登录失败,需要补登录: %s", email)
+    # Round 11 — OAuth bundle 缺失分支,与同函数其他失败路径保持 status 一致(都是 AUTH_INVALID)。
+    # 之前误用 STATUS_ACTIVE 让 auth_file 缺失的"半残账号"被 active 计数器忽略(api.py:_auto_check_loop
+    # 过滤 auth_file 存在),导致 cmd_rotate 每 30 分钟重复触发 fill 累积僵尸账号。
+    # 改 STATUS_AUTH_INVALID 后 reconcile 会按 auth_invalid 接管(KICK Team workspace + 清本地)。
+    # 上游 cmd_fill 仍依 `if email: produced+=1` 按席位计数,所以这里仍返回 email(语义不变);
+    # outcome 仍打 team_auth_missing 让汇总能显示"这批里有 X 个需要补登录"。
+    update_account(email, status=STATUS_AUTH_INVALID, workspace_account_id=get_chatgpt_account_id() or None)
+    _kick_team_seat_after_oauth_failure(email, reason="bundle_missing")
+    logger.warning("[注册] 账号已加入 Team 但 Codex 登录失败,标 AUTH_INVALID 待 reconcile: %s", email)
     _record_outcome("team_auth_missing", reason="已入 Team 席位但 Codex OAuth 未返回 bundle,需要补登录")
     return email
 
@@ -2545,11 +2611,11 @@ def _register_direct_once(mail_client, email, password, cloudmail_account_id=Non
         if email_step == "google":
             logger.warning("[直接注册] 邮箱步骤误跳转到 Google 登录页")
             browser.close()
-            return False
+            return False, None
         if email_step == "unknown":
             logger.warning("[直接注册] 未识别到邮箱步骤 | URL: %s | body=%s", page.url, _page_excerpt(page))
             browser.close()
-            return False
+            return False, None
 
         try:
             for attempt in range(3):
@@ -2607,11 +2673,11 @@ def _register_direct_once(mail_client, email, password, cloudmail_account_id=Non
         if current_step == "google":
             logger.warning("[直接注册] 邮箱步骤仍停留在 Google 登录页")
             browser.close()
-            return False
+            return False, None
         if current_step == "email":
             logger.warning("[直接注册] 邮箱步骤未推进 | URL: %s | body=%s", page.url, _page_excerpt(page))
             browser.close()
-            return False
+            return False, None
 
         try:
             assert_not_blocked(page, "email_submit")
@@ -2674,11 +2740,11 @@ def _register_direct_once(mail_client, email, password, cloudmail_account_id=Non
         if current_step == "google":
             logger.warning("[直接注册] 密码步骤仍停留在 Google 登录页")
             browser.close()
-            return False
+            return False, None
         if current_step == "email":
             logger.warning("[直接注册] 提交密码前流程回退到邮箱页 | URL: %s | body=%s", page.url, _page_excerpt(page))
             browser.close()
-            return False
+            return False, None
 
         try:
             assert_not_blocked(page, "password_submit")
@@ -2719,7 +2785,7 @@ def _register_direct_once(mail_client, email, password, cloudmail_account_id=Non
             else:
                 logger.error("[直接注册] 未收到验证码")
                 browser.close()
-                return False
+                return False, None
 
         _safe_invite_screenshot(page, "direct_05_after_code.png")
         logger.info("[直接注册] 当前 URL: %s", page.url)
@@ -2759,8 +2825,46 @@ def _register_direct_once(mail_client, email, password, cloudmail_account_id=Non
         else:
             logger.warning("[直接注册] 注册可能未完成，URL: %s", current_url)
 
+        # Round 11 四轮 — 注册成功后从 chatgpt.com context 抽 __Secure-next-auth.session-token,
+        # 透给后续 personal OAuth 用,跳过 auth.openai.com /log-in 页(实测刚踢出 Team 的新号
+        # 在 /log-in 页 Continue 按钮变灰 → 卡死)。SessionCodexAuthFlow._inject_auth_cookies
+        # 是同样的注入模式(主号专用),这里把模式扩展给 personal 子号。
+        session_token = _extract_session_token_from_context(context) if success else None
+
         browser.close()
-        return success
+        return success, session_token
+
+
+def _extract_session_token_from_context(context):
+    """从 Playwright BrowserContext 的 cookies 里抽 __Secure-next-auth.session-token。
+
+    chatgpt.com 大 token 会被切成 .0 / .1 chunked 形式写入,需按 suffix 排序拼回。
+    返回拼接后的 session_token(str)或 None。
+    """
+    try:
+        cookies = context.cookies()
+    except Exception as exc:
+        logger.warning("[直接注册] 抽 session_token 时读取 cookies 异常: %s", exc)
+        return None
+
+    session_parts = {}
+    session_token = None
+    for cookie in cookies:
+        name = cookie.get("name", "")
+        if name == "__Secure-next-auth.session-token":
+            session_token = cookie.get("value", "")
+        elif name.startswith("__Secure-next-auth.session-token."):
+            suffix = name.rsplit(".", 1)[-1]
+            session_parts[suffix] = cookie.get("value", "")
+
+    if not session_token and session_parts:
+        session_token = "".join(session_parts[k] for k in sorted(session_parts))
+
+    if session_token:
+        logger.info("[直接注册] 已抽出 session_token (len=%d) 用于 personal OAuth 注入", len(session_token))
+    else:
+        logger.warning("[直接注册] cookies 中未发现 __Secure-next-auth.session-token,personal OAuth 仍走 /log-in")
+    return session_token or None
 
 
 def create_account_direct(mail_client, *, leave_workspace=False, out_outcome=None):
@@ -2800,6 +2904,7 @@ def create_account_direct(mail_client, *, leave_workspace=False, out_outcome=Non
 
     # 注册失败（非 duplicate）最多重试 3 次；duplicate 额外独立上限，防止 CloudMail 异常导致无限换邮箱
     success = False
+    session_token = None  # Round 11 四轮 — 注册成功后从 chatgpt.com 抽出来,透给 personal OAuth 跳过 /log-in
     MAX_REGISTER_ATTEMPTS = 3
     MAX_DUPLICATE_SWAPS = 5
     register_attempts = 0
@@ -2814,7 +2919,9 @@ def create_account_direct(mail_client, *, leave_workspace=False, out_outcome=Non
             MAX_DUPLICATE_SWAPS,
         )
         try:
-            success = _register_direct_once(mail_client, email, password, cloudmail_account_id=account_id)
+            success, session_token = _register_direct_once(
+                mail_client, email, password, cloudmail_account_id=account_id
+            )
         except RegisterBlocked as blocked:
             logger.error("[直接注册] %s 被阻断: %s", email, blocked)
             if blocked.is_phone:
@@ -2854,6 +2961,7 @@ def create_account_direct(mail_client, *, leave_workspace=False, out_outcome=Non
                 continue
             # 其他阻断按普通失败处理
             success = False
+            session_token = None
         except Exception as exc:
             # Playwright 崩溃 / 网络异常等:不清理邮箱会让 CloudMail 积压,必须补一刀 discard 再抛。
             logger.error(
@@ -2913,6 +3021,7 @@ def create_account_direct(mail_client, *, leave_workspace=False, out_outcome=Non
         mail_client,
         leave_workspace=leave_workspace,
         out_outcome=out_outcome,
+        chatgpt_session_token=session_token,
     )
 
 

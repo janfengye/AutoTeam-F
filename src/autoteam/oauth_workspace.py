@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -255,28 +256,181 @@ _WORKSPACE_PAGE_HINT_TEXTS = (
 )
 
 
+# Round 11 — 与 cnitlrt/AutoTeam upstream codex_auth.py:236-274 对齐(保持 upstream 原名以便后续 diff)
+_WORKSPACE_PAGE_HINTS = (
+    "choose a workspace",
+    "select a workspace",
+    "launch a workspace",
+    "workspace",
+    "personal workspace",
+    "personal account",
+    "选择一个工作空间",
+    "选择工作空间",
+)
+_WORKSPACE_IGNORE_LABELS = {
+    "choose a workspace",
+    "select a workspace",
+    "workspace",
+    "terms of use",
+    "privacy policy",
+    "continue",
+    "继续",
+    "allow",
+    "log in",
+    "cancel",
+    "back",
+    "resend email",
+    "use password",
+    "continue with password",
+    "log in with a one-time code",
+    "login with a one-time code",
+    "one-time code",
+    "email code",
+}
+_WORKSPACE_IGNORE_SUBSTRINGS = (
+    "new organization",
+    "finish setting up",
+    "set up on the next page",
+    "one-time code",
+    "email code",
+    "continue with password",
+    "use password",
+)
+
+
+def _is_workspace_ignored_label(text: str) -> bool:
+    """判断 candidate label 是否应被忽略(噪声 button / 模板提示等)。
+
+    与 upstream codex_auth.py:364-368 1:1 对齐。
+    """
+    lowered = str(text or "").strip().lower()
+    if lowered in _WORKSPACE_IGNORE_LABELS:
+        return True
+    return any(token in lowered for token in _WORKSPACE_IGNORE_SUBSTRINGS)
+
+
 def _is_workspace_selection_page(page) -> bool:
+    """检测 page 是否在 workspace 选择页。
+
+    与 upstream codex_auth.py:371-384 对齐:URL 含 workspace 直接返回 True;
+    否则按 body 文本计算 hint hit 数 — organization URL 需 ≥ 2 hits,普通 URL 也需 ≥ 2 hits
+    或包含 "launch a workspace" 兜底。
+
+    保持与 force_select_personal_via_ui 兼容:personal flow goto auth.openai.com/workspace
+    后 URL 必含 "workspace",直接命中第一个分支。
+    """
     try:
         url = (page.url or "").lower()
-        if "/workspace" in url or "workspace/select" in url:
-            return True
-        if "consent" in url:
-            return True
-        # body 文案多语言匹配
-        text = ""
-        try:
-            text = page.inner_text("body", timeout=1500)
-        except Exception:
-            try:
-                text = page.content()[:3000]
-            except Exception:
-                text = ""
-        text_low = (text or "").lower()
-        for hint in _WORKSPACE_PAGE_HINT_TEXTS:
-            if hint in text_low or hint in text:
-                return True
     except Exception:
+        url = ""
+    if "workspace" in url:
+        return True
+
+    try:
+        body = page.locator("body").inner_text(timeout=1200).lower()
+    except Exception:
+        body = ""
+
+    hint_hits = sum(1 for hint in _WORKSPACE_PAGE_HINTS if hint in body)
+    if "organization" in url:
+        return hint_hits >= 2
+    return hint_hits >= 2 or "launch a workspace" in body
+
+
+def _workspace_label_candidates(page):
+    """枚举 workspace 选择页中所有可点击候选 label(文本不为噪声 + 长度合理)。
+
+    与 upstream codex_auth.py:387-421 1:1 对齐。
+    """
+    if not _is_workspace_selection_page(page):
+        return []
+
+    selectors = (
+        "button",
+        "a",
+        '[role="button"]',
+        '[role="option"]',
+        '[aria-selected="true"]',
+        '[aria-selected="false"]',
+        "[data-state]",
+        "li",
+        "label",
+        "div",
+    )
+    seen = set()
+    candidates = []
+    for selector in selectors:
+        try:
+            for loc in page.locator(selector).all():
+                try:
+                    if not loc.is_visible(timeout=100):
+                        continue
+                    text = re.sub(r"\s+", " ", loc.inner_text(timeout=200)).strip()
+                except Exception:
+                    continue
+                lowered = text.lower()
+                if not text or lowered in seen or len(text) > 80 or _is_workspace_ignored_label(lowered):
+                    continue
+                seen.add(lowered)
+                candidates.append((text, loc))
+        except Exception:
+            continue
+    return candidates
+
+
+def _click_workspace_locator(loc) -> bool:
+    """点击 locator,首选普通 click,失败则 force=True 重试一次。
+
+    与 upstream codex_auth.py:424-433 1:1 对齐。
+    """
+    try:
+        loc.click(timeout=3000)
+        return True
+    except Exception:
+        try:
+            loc.click(force=True, timeout=3000)
+            return True
+        except Exception:
+            return False
+
+
+def _select_team_workspace(page, workspace_name: str) -> bool:
+    """在 workspace 选择页找匹配 workspace_name 的 label 点击。
+
+    与 upstream codex_auth.py:436-468 1:1 对齐。
+    Returns True 表示成功点击;False 表示未找到 / 全部点击失败。
+    """
+    preferred_name = str(workspace_name or "").strip()
+    if not preferred_name:
         return False
+
+    preferred_name_lower = preferred_name.lower()
+    for text, loc in _workspace_label_candidates(page):
+        if text.strip().lower() != preferred_name_lower:
+            continue
+        if not _click_workspace_locator(loc):
+            continue
+        logger.info("[Codex] 选择 Team workspace: %s", text)
+        time.sleep(3)
+        return True
+
+    # fallback: 某些页面里的 workspace 项是普通 div / span 包裹文本,不带 button/option role
+    for selector in (
+        f'text="{preferred_name}"',
+        f"text=/{re.escape(preferred_name)}/i",
+    ):
+        try:
+            loc = page.locator(selector).first
+            if not loc.is_visible(timeout=500):
+                continue
+            if not _click_workspace_locator(loc):
+                continue
+            logger.info("[Codex] 选择 Team workspace: %s", preferred_name)
+            time.sleep(3)
+            return True
+        except Exception:
+            continue
+
     return False
 
 
@@ -350,6 +504,7 @@ def ensure_personal_workspace_selected(
     *,
     consent_url: str,
     max_retries: int = 5,
+    skip_ui_fallback_on_empty: bool = False,
 ) -> tuple[bool, str, dict]:
     """Personal OAuth 主流程 — 三层兜底(W-I1 / W-I2)。
 
@@ -364,6 +519,13 @@ def ensure_personal_workspace_selected(
       3. select_oauth_workspace 主路径 → 200/302 → success=True
       4. 主路径失败 → force_select_personal_via_ui → 点 Personal → success=True
       5. 都失败 → return OAUTH_WS_ENDPOINT_ERROR
+
+    Round 11 三轮新增 skip_ui_fallback_on_empty:刚踢出 Team 的新号 OAuth backend
+    `oai-oauth-session.workspaces=[]`(server-side 状态),/workspace UI 显示
+    "Workspaces not found in client auth session" → goto 该页会让浏览器停在错误页,
+    阻塞外层 consent loop。codex_auth.py 调用方传 True 让本函数在这种状态下不再
+    goto /workspace,直接 fail-fast 返回。consent loop 会在 auth_url 自然运行,
+    OAuth backend 用 default workspace 颁 token,plan_type 由外层校验/重试兜底。
 
     备注:5 次 OAuth retry 由外层 _run_post_register_oauth 承担,本函数单次调用即返回结论。
           OAUTH_PLAN_DRIFT_PERSISTENT 由外层在 5 次后写入,本函数从不返回。
@@ -394,13 +556,26 @@ def ensure_personal_workspace_selected(
     evidence["workspaces_redacted"] = _redact_workspaces(workspaces)
 
     if not isinstance(workspaces, list) or not workspaces:
-        # session 解出来了但 workspaces 空 — fallback
+        # session 解出来了但 workspaces 空 — Round 11 三轮:
+        # 刚踢出 Team 的新号在 OpenAI server-side 端 oai-oauth-session.workspaces=[],
+        # /workspace UI 显示 "Workspaces not found in client auth session" 错误页。
+        # goto /workspace 会让浏览器停在错误页 → consent loop 找不到按钮 → bundle=None。
+        # skip_ui_fallback_on_empty=True 时直接 fail-fast,让 consent loop 自然运行。
+        evidence["primary"] = {"phase": "skipped_empty_workspaces"}
+        if skip_ui_fallback_on_empty:
+            logger.warning(
+                "[oauth_ws] oai-oauth-session 不含 workspaces[],"
+                "skip_ui_fallback_on_empty=True 跳过 UI fallback,"
+                "由外层 consent loop + plan_type 校验兜底"
+            )
+            evidence["fallback"] = {"phase": "skipped_by_caller_request"}
+            return False, OAUTH_WS_ENDPOINT_ERROR, evidence
+
         logger.warning("[oauth_ws] oai-oauth-session 不含 workspaces[],走 UI fallback")
         try:
             ok, fb_ev = force_select_personal_via_ui(page)
         except Exception as exc:
             ok, fb_ev = False, {"exception": type(exc).__name__}
-        evidence["primary"] = {"phase": "skipped_empty_workspaces"}
         evidence["fallback"] = fb_ev
         if ok:
             return True, "", evidence

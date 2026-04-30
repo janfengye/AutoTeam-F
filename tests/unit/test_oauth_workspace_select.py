@@ -403,3 +403,81 @@ def test_no_time_sleep_8_in_manager_personal_branch():
     # 不应有可执行的 time.sleep(8) — Round 8 删了这个旧的"等 default unset"魔法等待
     assert not re.search(r"^\s*time\.sleep\(8\)", code_only, re.MULTILINE)
     assert "Round 8" in src  # 说明已应用 Round 8 改造
+
+
+def test_ensure_personal_skip_ui_fallback_on_empty_workspaces():
+    """Round 11 三轮 — skip_ui_fallback_on_empty=True 时,空 workspaces[] 不调用 UI fallback。
+
+    场景:刚踢出 Team 的新号,oai-oauth-session.workspaces=[](server-side 状态),
+    /workspace UI 显示 "Workspaces not found in client auth session" 错误页。
+    如果调用方传 skip_ui_fallback_on_empty=True,本函数必须直接 fail-fast 不导航,
+    避免浏览器停在错误页阻塞外层 consent loop。
+
+    断言:
+      - 返回 (False, OAUTH_WS_ENDPOINT_ERROR, evidence)
+      - evidence.primary.phase == "skipped_empty_workspaces"
+      - evidence.fallback.phase == "skipped_by_caller_request"
+      - page.goto_calls 不含 /workspace(没导航)
+    """
+    from autoteam.oauth_workspace import (
+        OAUTH_WS_ENDPOINT_ERROR,
+        ensure_personal_workspace_selected,
+    )
+
+    # 构造 cookie:可解码但 workspaces=[]
+    session_payload = {"workspaces": []}
+    cookie_val = base64.b64encode(json.dumps(session_payload).encode()).decode()
+    page = _FakePage(
+        cookies=[{"name": "oai-oauth-session", "value": cookie_val}],
+        url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+    )
+
+    ok, fail_cat, evidence = ensure_personal_workspace_selected(
+        page,
+        consent_url="https://auth.openai.com/oauth/authorize?client_id=codex",
+        skip_ui_fallback_on_empty=True,
+    )
+
+    assert ok is False, "空 workspaces[] + skip_ui_fallback_on_empty=True 必须 fail"
+    assert fail_cat == OAUTH_WS_ENDPOINT_ERROR
+    assert evidence["primary"]["phase"] == "skipped_empty_workspaces"
+    assert evidence["fallback"]["phase"] == "skipped_by_caller_request", (
+        "fallback.phase 必须明示是 caller 请求跳过(skipped_by_caller_request),"
+        "不应是 force_select_personal_via_ui 的实际 phase"
+    )
+    # 关键:不应该导航到 /workspace UI
+    assert not any("workspace" in url for url in page.goto_calls), (
+        f"skip_ui_fallback_on_empty=True 时不应 goto /workspace,"
+        f"但实际 goto_calls={page.goto_calls}"
+    )
+
+
+def test_ensure_personal_default_still_falls_back_on_empty_workspaces():
+    """Round 11 三轮 — skip_ui_fallback_on_empty 默认 False,保留旧行为(走 UI fallback)。
+
+    本测试守住默认参数语义,防止未来误改默认值导致非 codex_auth 调用方行为偏移。
+    """
+    from autoteam.oauth_workspace import ensure_personal_workspace_selected
+
+    session_payload = {"workspaces": []}
+    cookie_val = base64.b64encode(json.dumps(session_payload).encode()).decode()
+    page = _FakePage(
+        cookies=[{"name": "oai-oauth-session", "value": cookie_val}],
+        url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+    )
+
+    # 默认参数 — 不传 skip_ui_fallback_on_empty
+    ok, _fail_cat, evidence = ensure_personal_workspace_selected(
+        page,
+        consent_url="https://auth.openai.com/oauth/authorize?client_id=codex",
+    )
+
+    # 默认应该走 UI fallback(_FakePage 不会真的找到 personal button → 失败)
+    assert evidence["primary"]["phase"] == "skipped_empty_workspaces"
+    # fallback 应该被尝试(phase 不是 skipped_by_caller_request)
+    fb_phase = evidence.get("fallback", {}).get("phase", "")
+    assert fb_phase != "skipped_by_caller_request", (
+        "默认参数不应该跳过 fallback,fallback.phase 应该是实际尝试的状态"
+    )
+    # ok 是 False 因为 _FakePage 没有真正的 Personal button
+    assert ok is False

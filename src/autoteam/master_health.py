@@ -1,15 +1,20 @@
-"""Master 母号 ChatGPT Team 订阅健康度探针 — L1 fail-fast。
+"""Master 母号 ChatGPT Team 订阅健康度探针 — L1 fail-fast + grace 期 healthy。
 
-详见 SPEC `prompts/0426/spec/shared/master-subscription-health.md` v1.0(2026-04-27 Round 8)。
+详见 SPEC `prompts/0426/spec/shared/master-subscription-health.md` v1.2(2026-04-28 Round 11)。
 
-根因:母号 Team 订阅 cancel(eligible_for_auto_reactivation=true)时,workspace 实体仍在
-       但子号 invite 后必拿 plan_type=free。本模块在 fill 任务起点先验证母号订阅健康度,
-       不健康即 fail-fast,避免浪费 OAuth 周期。
+根因(Round 8):母号 Team 订阅 cancel(eligible_for_auto_reactivation=true)时,workspace
+       实体仍在但子号 invite 后必拿 plan_type=free。本模块在 fill 任务起点先验证母号订阅
+       健康度,不健康即 fail-fast,避免浪费 OAuth 周期。
+修订(Round 11):用户实证 cancel_at_period_end=true 时 ChatGPT 网页 team 权限**仍然有效**
+       (grace 期内权益不变,新 invite 仍能拿 plan_type=team)。Round 8 假设 "eligible 必拿 free"
+       是错的,引入 subscription_grace 状态:`eligible=true` + JWT chatgpt_subscription_active_until
+       未到期时,返回 (healthy=True, reason="subscription_grace") — fail-fast 入口对 healthy=True
+       自动放行,UI banner 渲染 warning 而非 critical。
 
-不变量(M-I1~I10):
+不变量(M-I1~I12):
   - is_master_subscription_healthy 永不抛异常(任何 Exception → network_error)
   - auth_invalid 与 network_error 严格区分(401/403 是 auth_invalid 唯一来源)
-  - healthy ⇔ reason == "active"(双向蕴含)
+  - healthy ⇔ reason ∈ {"active", "subscription_grace"}(Round 11 扩展双向蕴含)
   - cache 命中**不**发起 HTTP
   - eligible_for_auto_reactivation 严格 `is True` 比对(不 truthy)
   - 落盘 evidence 不含敏感字段
@@ -34,7 +39,7 @@ ACCOUNTS_DIR = PROJECT_ROOT / "accounts"
 CACHE_FILE = ACCOUNTS_DIR / ".master_health_cache.json"
 CACHE_FILE_MODE = 0o666
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2  # Round 11 重发布:旧 cache(v1)未启用 chatgpt_api access_token 解 grace_until,统一作废
 DEFAULT_CACHE_TTL = 300.0  # 5 min
 DEFAULT_PROBE_TIMEOUT = 10.0
 
@@ -139,8 +144,58 @@ def _build_evidence(
     return ev
 
 
-def _classify_l1(items: list, account_id: str) -> tuple[bool, str, dict]:
-    """L1 主探针 — 在 /backend-api/accounts items[] 中找目标 account_id 并分类。"""
+def _load_admin_id_token(chatgpt_api=None) -> str | None:
+    """Round 11 — 加载用于解 grace_until 的 JWT token。
+
+    优先级(Round 11 修订):
+      1. chatgpt_api.access_token(ChatGPT web JWT,/api/auth/session 拿到,含
+         chatgpt_subscription_active_until claim)— 走 web session 路径的用户主路径
+      2. accounts/codex-main-*.json 最近修改文件的 id_token(走 OAuth 重登路径的兜底)
+      3. None
+
+    永不抛异常(M-I1)。
+    """
+    # 1. ChatGPT web access_token(用户登录态对应的 JWT)
+    if chatgpt_api is not None:
+        try:
+            tok = getattr(chatgpt_api, "access_token", None)
+            if tok and isinstance(tok, str):
+                return tok
+        except Exception:
+            pass
+    # 2. codex-main-*.json id_token(OAuth 路径)
+    try:
+        if not ACCOUNTS_DIR.exists():
+            return None
+        candidates = sorted(
+            ACCOUNTS_DIR.glob("codex-main-*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for path in candidates:
+            try:
+                _, id_token = _read_access_token_from_auth_file(path)
+                if id_token:
+                    return id_token
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+def _classify_l1(
+    items: list,
+    account_id: str,
+    *,
+    id_token: str | None = None,
+) -> tuple[bool, str, dict]:
+    """L1 主探针 — 在 /backend-api/accounts items[] 中找目标 account_id 并分类。
+
+    Round 11:`eligible_for_auto_reactivation=true` 时先解 admin id_token JWT 拿
+    chatgpt_subscription_active_until,若仍在 grace 期内返回 (True, "subscription_grace", ...)
+    healthy=True;过期或 JWT 缺失保持 Round 8 (False, "subscription_cancelled", ...) 行为。
+    """
     target = None
     for item in items or []:
         if isinstance(item, dict) and str(item.get("id") or "") == account_id:
@@ -162,9 +217,32 @@ def _classify_l1(items: list, account_id: str) -> tuple[bool, str, dict]:
 
     # spec M-I7 — 严格 is True
     if target.get("eligible_for_auto_reactivation") is True:
+        # Round 11 — grace 期判定:JWT chatgpt_subscription_active_until 仍未过期 → healthy=True
+        grace_until = extract_grace_until_from_jwt(id_token) if id_token else None
+        if grace_until and grace_until > time.time():
+            return True, "subscription_grace", {
+                "current_user_role": role,
+                "raw_item": target,
+                "grace_until": grace_until,
+                "grace_remain_seconds": grace_until - time.time(),
+            }
+        # Round 11 二轮 — grace_until 解不出(web session JWT 路径,只含 chatgpt_plan_type
+        # 而无 chatgpt_subscription_active_until):用 chatgpt_plan_type fallback
+        # 当前权益仍为付费层 → 视为 grace 期内 healthy=True
+        plan_type = extract_plan_type_from_jwt(id_token) if id_token else None
+        _PAID_PLAN_TYPES = ("team", "business", "enterprise", "edu")
+        if plan_type in _PAID_PLAN_TYPES:
+            return True, "subscription_grace", {
+                "current_user_role": role,
+                "raw_item": target,
+                "grace_until": grace_until,  # 可能 None,前端不显示倒计时
+                "plan_type_jwt": plan_type,  # 区分 grace 来源(诊断用)
+            }
         return False, "subscription_cancelled", {
             "current_user_role": role,
             "raw_item": target,
+            "grace_until": grace_until,  # 可能 None / 已过期
+            "plan_type_jwt": plan_type,  # 可能 "free" / None
         }
 
     return True, "active", {
@@ -251,8 +329,19 @@ def is_master_subscription_healthy(
             if 0 <= age < cache_ttl:
                 healthy = bool(entry.get("healthy"))
                 reason = str(entry.get("reason") or "")
-                # M-I3 守卫
-                if (healthy and reason == "active") or (not healthy and reason and reason != "active"):
+                # M-I3 守卫(Round 11):healthy ⇔ reason ∈ {"active", "subscription_grace"}
+                healthy_reasons = ("active", "subscription_grace")
+                guard_ok = (
+                    (healthy and reason in healthy_reasons)
+                    or (not healthy and reason and reason not in healthy_reasons)
+                )
+                if not guard_ok:
+                    logger.warning(
+                        "[master_health] cache 项违反 M-I3 不变量:healthy=%s reason=%r,"
+                        "丢弃 cache 走 L1 实测",
+                        healthy, reason,
+                    )
+                if guard_ok:
                     raw_ev = entry.get("evidence") or {}
                     ev = _build_evidence(
                         account_id=account_id,
@@ -266,6 +355,18 @@ def is_master_subscription_healthy(
                         cache_age_seconds=age,
                         probed_at=probed_at,
                     )
+                    # Round 11 — grace 期 evidence 还原 grace_until / grace_remain_seconds
+                    grace_until = raw_ev.get("grace_until")
+                    if grace_until is not None:
+                        ev["grace_until"] = grace_until
+                        try:
+                            ev["grace_remain_seconds"] = float(grace_until) - time.time()
+                        except Exception:
+                            ev["grace_remain_seconds"] = None
+                    # Round 11 二轮 — plan_type_jwt 也要还原(诊断字段)
+                    plan_type_jwt = raw_ev.get("plan_type_jwt")
+                    if plan_type_jwt is not None:
+                        ev["plan_type_jwt"] = plan_type_jwt
                     return healthy, reason, ev
 
     # 3. L1 主探针
@@ -318,7 +419,9 @@ def is_master_subscription_healthy(
     if not isinstance(items, list):
         items = []
 
-    healthy, reason, l1_extras = _classify_l1(items, account_id)
+    # Round 11 — 加载 admin id_token 给 _classify_l1 解 grace_until
+    id_token = _load_admin_id_token(chatgpt_api)
+    healthy, reason, l1_extras = _classify_l1(items, account_id, id_token=id_token)
     raw_target = l1_extras.get("raw_item")
 
     # 4. L3 副判定(可选)— 仅当 L1 active 但缺 eligible 字段
@@ -344,19 +447,33 @@ def is_master_subscription_healthy(
             current_user_role=l1_extras.get("current_user_role"),
             plan_field=l1_extras.get("plan_field"),
         )
+        # Round 11 — grace 期 + cancelled 路径都把 grace_until 透到 evidence
+        grace_until = l1_extras.get("grace_until")
+        if grace_until is not None:
+            evidence["grace_until"] = grace_until
+            if reason == "subscription_grace":
+                try:
+                    evidence["grace_remain_seconds"] = float(grace_until) - time.time()
+                except Exception:
+                    evidence["grace_remain_seconds"] = None
+        # Round 11 二轮 — plan_type_jwt 透到 evidence(grace fallback / cancelled 路径都用)
+        plan_type_jwt = l1_extras.get("plan_type_jwt")
+        if plan_type_jwt is not None:
+            evidence["plan_type_jwt"] = plan_type_jwt
 
-    # M-I3 守卫
+    # M-I3 守卫(Round 11):healthy ⇔ reason ∈ {"active", "subscription_grace"}
     healthy = bool(healthy)
-    if healthy and reason != "active":
-        # 路径错误,降级为 network_error 防止 healthy 不一致
+    healthy_reasons = ("active", "subscription_grace")
+    if healthy and reason not in healthy_reasons:
         logger.error(
             "[master_health] M-I3 守卫触发:healthy=True 但 reason=%s,降级 network_error",
             reason,
         )
         return False, "network_error", evidence
-    if (not healthy) and reason == "active":
+    if (not healthy) and reason in healthy_reasons:
         logger.error(
-            "[master_health] M-I3 守卫触发:healthy=False 但 reason=active,降级 network_error",
+            "[master_health] M-I3 守卫触发:healthy=False 但 reason=%s,降级 network_error",
+            reason,
         )
         return False, "network_error", evidence
 
@@ -373,6 +490,11 @@ def is_master_subscription_healthy(
                     "plan_field": evidence.get("plan_field"),
                     "detail": evidence.get("detail"),
                     "items_count": evidence.get("items_count"),
+                    # Round 11 — grace_until 持久化(grace_remain_seconds 不持久化,
+                    # 命中 cache 时按 now-time 重算)
+                    "grace_until": evidence.get("grace_until"),
+                    # Round 11 二轮 — plan_type_jwt 持久化(诊断字段,不参与判定)
+                    "plan_type_jwt": evidence.get("plan_type_jwt"),
                 }
                 # 删除值为 None 的键
                 persist_ev = {k: v for k, v in persist_ev.items() if v is not None}
@@ -430,6 +552,35 @@ def extract_grace_until_from_jwt(token):
             return datetime.fromisoformat(normalized).timestamp()
     except Exception:
         return None
+    return None
+
+
+def extract_plan_type_from_jwt(token):
+    """从 access_token / id_token JWT payload 解析 chatgpt_plan_type → 字符串。
+
+    Round 11 二轮修复:ChatGPT web access_token 不含 chatgpt_subscription_active_until
+    claim,但含 chatgpt_plan_type 表示当前权益层级。grace 期内此字段仍为 "team" 等付费层。
+
+    返回:
+        小写字符串(如 "team", "free", "business")— 字段存在
+        None — token 缺失 / 字段缺失 / 解析失败(永不抛)
+    """
+    if not token or not isinstance(token, str):
+        return None
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    payload_b64 = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+    try:
+        import base64
+
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception:
+        return None
+    auth_claims = payload.get("https://api.openai.com/auth") or {}
+    raw = auth_claims.get("chatgpt_plan_type")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip().lower()
     return None
 
 
@@ -551,9 +702,9 @@ def _apply_master_degraded_classification(
 
     now_ts = time.time()
 
-    # 3. 路径分流
-    if healthy and reason == "active":
-        # 撤回路径:GRACE → ACTIVE(母号续费)
+    # 3. 路径分流(Round 11):healthy 包括 active + subscription_grace 都走撤回 GRACE → ACTIVE
+    if healthy and reason in ("active", "subscription_grace"):
+        # 撤回路径:GRACE → ACTIVE(母号续费 / 仍在 grace 期内权益有效)
         try:
             for acc in load_accounts():
                 if acc.get("status") != STATUS_DEGRADED_GRACE:
@@ -579,10 +730,12 @@ def _apply_master_degraded_classification(
             out["errors"].append({"stage": "load_for_revert", "error": str(exc)})
         if out["reverted_active"]:
             logger.info(
-                "[retroactive] master 已恢复 active,GRACE → ACTIVE 撤回 %d 个",
+                "[retroactive] master %s,GRACE → ACTIVE 撤回 %d 个",
+                reason,
                 len(out["reverted_active"]),
             )
         else:
+            # Round 11 — skipped_reason 命名兼容 Round 9(active)+ Round 11(grace)
             out["skipped_reason"] = "master_active_no_grace_candidates"
         return out
 
