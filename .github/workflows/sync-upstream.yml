@@ -1,0 +1,73 @@
+name: Sync upstream (keep upstream deletions local)
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.event.repository.fork == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Discover upstream
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          upstream_repo="$(gh api repos/$REPO --jq '.parent.full_name // empty')"
+          if [ -z "$upstream_repo" ]; then
+            echo "has_upstream=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          upstream_branch="$(gh api repos/$upstream_repo --jq '.default_branch')"
+          echo "has_upstream=true" >> "$GITHUB_OUTPUT"
+          echo "repo=$upstream_repo" >> "$GITHUB_OUTPUT"
+          echo "branch=$upstream_branch" >> "$GITHUB_OUTPUT"
+
+      - name: Stop if no upstream
+        if: steps.upstream.outputs.has_upstream != 'true'
+        run: echo "No upstream parent configured."
+
+      - name: Fetch upstream snapshot
+        if: steps.upstream.outputs.has_upstream == 'true'
+        run: |
+          git remote add upstream "https://github.com/${{ steps.upstream.outputs.repo }}.git"
+          git fetch upstream "${{ steps.upstream.outputs.branch }}" --depth=1
+          rm -rf /tmp/upstream-sync
+          mkdir -p /tmp/upstream-sync
+          git archive --format=tar "upstream/${{ steps.upstream.outputs.branch }}" | tar -xf - -C /tmp/upstream-sync
+
+      - name: Overlay upstream changes without deletions
+        if: steps.upstream.outputs.has_upstream == 'true'
+        run: |
+          rsync -a /tmp/upstream-sync/ ./
+          if git diff --quiet; then
+            echo "No upstream additions or modifications to sync."
+            exit 0
+          fi
+          git add -A
+          git commit -m "chore: sync upstream (keep deletions local)"
+
+      - name: Push changes
+        if: steps.upstream.outputs.has_upstream == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "HEAD:${{ github.event.repository.default_branch }}"
