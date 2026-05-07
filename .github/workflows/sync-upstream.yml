@@ -57,7 +57,7 @@ jobs:
       - name: Overlay upstream changes without deletions
         if: steps.upstream.outputs.has_upstream == 'true'
         run: |
-          rsync -a /tmp/upstream-sync/ ./
+          rsync -a --exclude='.github/workflows/' /tmp/upstream-sync/ ./
           if git diff --quiet; then
             echo "No upstream additions or modifications to sync."
             exit 0
